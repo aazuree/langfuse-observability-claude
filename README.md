@@ -23,12 +23,13 @@ cd langfuse-observability
 ```
 
 The setup script:
-1. Generates `.env` with random secrets
-2. Starts Langfuse via Docker Compose (6 services)
-3. Configures the Claude Code `Stop` hook in `~/.claude/settings.json`
+1. Prompts for your admin email and password
+2. Generates `.env` with random secrets (including unique project API keys)
+3. Starts Langfuse via Docker Compose (6 services)
+4. Backs up existing `~/.claude/settings.json` (if present) and configures the `Stop` hook
 
 **Dashboard**: http://localhost:3000
-**Login**: `admin@example.com` / `changeme12345678`
+**Login**: the credentials you entered during setup
 
 ## Prerequisites
 
@@ -83,12 +84,12 @@ The hook script (`langfuse-hook.py`) is invoked by Claude Code after each assist
 
 | Service | Port | Access |
 |---------|------|--------|
-| langfuse-web | 3000 | Public (dashboard + API) |
+| langfuse-web | 3000 | localhost only |
 | langfuse-worker | 3030 | localhost only |
 | postgres | 5432 | localhost only |
 | clickhouse | 8123, 9000 | localhost only |
 | redis | 6379 | localhost only |
-| minio | 9090 | Public (S3 API) |
+| minio | 9090 | localhost only |
 
 ## Operations
 
@@ -106,9 +107,9 @@ docker compose down -v
 docker compose logs langfuse-web -f
 tail -f ~/.claude/langfuse-hook.log
 
-# Query traces
+# Query traces (use the project keys printed during setup)
 curl -s http://localhost:3000/api/public/traces \
-  -u "pk-lf-claude-code:sk-lf-claude-code"
+  -u "YOUR_PUBLIC_KEY:YOUR_SECRET_KEY"
 ```
 
 ## Hook Configuration
@@ -123,7 +124,7 @@ The Stop hook in `~/.claude/settings.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "LANGFUSE_PUBLIC_KEY=pk-lf-claude-code LANGFUSE_SECRET_KEY=sk-lf-claude-code python3 /path/to/langfuse-hook.py"
+            "command": "LANGFUSE_PUBLIC_KEY=<your-pk> LANGFUSE_SECRET_KEY=<your-sk> python3 /path/to/langfuse-hook.py"
           }
         ]
       }
@@ -132,17 +133,28 @@ The Stop hook in `~/.claude/settings.json`:
 }
 ```
 
-Update the path to match where you cloned the repo.
+Replace `<your-pk>` and `<your-sk>` with the project keys printed during `./setup.sh`, and update the path to match where you cloned the repo.
 
 ## Cost Estimation
 
 Set `REPORT_API_EQUIVALENT_COST = True` in `langfuse-hook.py` (default) to report what each turn would cost at Anthropic API rates. Useful for tracking usage even on a Pro subscription where the actual marginal cost is $0.
+
+## Security
+
+- All ports are bound to `127.0.0.1` (localhost only) — not accessible from the network
+- Secrets (database passwords, API keys, encryption keys) are randomly generated per installation
+- Admin credentials are set interactively during setup — no hardcoded defaults
+- The hook script redacts common secret patterns (API keys, tokens, private keys, passwords) before sending data to Langfuse
+- Session IDs are sanitized to prevent path traversal
+- Log files are automatically rotated at 10 MB
+- Existing `~/.claude/settings.json` is backed up before modification
 
 ## Gotchas
 
 - **Langfuse init vars**: `LANGFUSE_INIT_USER_EMAIL` must be valid email format, `LANGFUSE_INIT_PROJECT_NAME` must not have spaces. Validation errors are generic with no detail.
 - **First login**: If the browser shows an error, try an incognito window (stale CSRF tokens).
 - **Hook does not block Claude Code**: runs asynchronously; if Langfuse is down, errors go to `~/.claude/langfuse-hook.log`.
+- **Secret redaction**: The hook redacts common patterns but cannot catch all secrets. Avoid pasting raw credentials into Claude Code prompts.
 
 ## Why Not LiteLLM Proxy?
 

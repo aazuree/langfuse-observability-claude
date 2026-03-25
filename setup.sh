@@ -13,13 +13,47 @@ echo ""
 if [ -f "$ENV_FILE" ]; then
     echo "[skip] .env already exists. Delete it and re-run to regenerate."
 else
+    # Prompt for admin credentials
+    echo "[setup] Configure your Langfuse admin account."
+    echo ""
+
+    read -rp "  Admin email: " ADMIN_EMAIL
+    if [ -z "$ADMIN_EMAIL" ]; then
+        echo "Error: email cannot be empty."
+        exit 1
+    fi
+
+    read -rp "  Admin name [Admin]: " ADMIN_NAME
+    ADMIN_NAME="${ADMIN_NAME:-Admin}"
+
+    while true; do
+        read -rsp "  Admin password (min 12 chars): " ADMIN_PASSWORD
+        echo ""
+        if [ "${#ADMIN_PASSWORD}" -lt 12 ]; then
+            echo "  Password must be at least 12 characters. Try again."
+            continue
+        fi
+        read -rsp "  Confirm password: " ADMIN_PASSWORD_CONFIRM
+        echo ""
+        if [ "$ADMIN_PASSWORD" != "$ADMIN_PASSWORD_CONFIRM" ]; then
+            echo "  Passwords do not match. Try again."
+            continue
+        fi
+        break
+    done
+
+    echo ""
     echo "[gen]  Generating .env with random secrets..."
 
-    SECRET_1=$(openssl rand -hex 32)
-    SECRET_2=$(openssl rand -hex 16)
+    NEXTAUTH_SECRET=$(openssl rand -hex 32)
+    ENCRYPTION_KEY=$(openssl rand -hex 32)
+    SALT=$(openssl rand -hex 16)
     PG_PASS=$(openssl rand -hex 16)
     CH_PASS=$(openssl rand -hex 16)
+    REDIS_PASS=$(openssl rand -hex 16)
     MINIO_PASS=$(openssl rand -hex 16)
+    PROJECT_PK="pk-lf-$(openssl rand -hex 12)"
+    PROJECT_SK="sk-lf-$(openssl rand -hex 12)"
 
     cat > "$ENV_FILE" <<EOF
 # Langfuse Self-Hosted Configuration
@@ -27,9 +61,9 @@ else
 
 # === Langfuse Core ===
 NEXTAUTH_URL=http://localhost:3000
-NEXTAUTH_SECRET=$SECRET_1
-ENCRYPTION_KEY=$SECRET_1
-SALT=$SECRET_2
+NEXTAUTH_SECRET=$NEXTAUTH_SECRET
+ENCRYPTION_KEY=$ENCRYPTION_KEY
+SALT=$SALT
 
 # === PostgreSQL ===
 POSTGRES_USER=postgres
@@ -42,7 +76,7 @@ CLICKHOUSE_USER=clickhouse
 CLICKHOUSE_PASSWORD=$CH_PASS
 
 # === Redis ===
-REDIS_AUTH=$CH_PASS
+REDIS_AUTH=$REDIS_PASS
 
 # === MinIO (S3-compatible storage) ===
 MINIO_ROOT_USER=minio
@@ -57,14 +91,19 @@ LANGFUSE_INIT_ORG_ID=my-org
 LANGFUSE_INIT_ORG_NAME=MyOrg
 LANGFUSE_INIT_PROJECT_ID=claude-code
 LANGFUSE_INIT_PROJECT_NAME=ClaudeCode
-LANGFUSE_INIT_PROJECT_PUBLIC_KEY=pk-lf-claude-code
-LANGFUSE_INIT_PROJECT_SECRET_KEY=sk-lf-claude-code
-LANGFUSE_INIT_USER_EMAIL=admin@example.com
-LANGFUSE_INIT_USER_NAME=Admin
-LANGFUSE_INIT_USER_PASSWORD=changeme12345678
+LANGFUSE_INIT_PROJECT_PUBLIC_KEY=$PROJECT_PK
+LANGFUSE_INIT_PROJECT_SECRET_KEY=$PROJECT_SK
+LANGFUSE_INIT_USER_EMAIL=$ADMIN_EMAIL
+LANGFUSE_INIT_USER_NAME=$ADMIN_NAME
+LANGFUSE_INIT_USER_PASSWORD=$ADMIN_PASSWORD
 EOF
 
-    echo "       Done. Login: admin@example.com / changeme12345678"
+    echo "       Done."
+    echo "       Login:       $ADMIN_EMAIL"
+    echo "       Public key:  $PROJECT_PK"
+    echo "       Secret key:  $PROJECT_SK"
+    echo ""
+    echo "       Save your project keys — you'll need them for the hook config."
 fi
 
 # 2. Start Langfuse
@@ -87,14 +126,24 @@ for i in $(seq 1 30); do
     sleep 1
 done
 
-# 3. Configure Claude Code hook
+# 3. Read project keys from .env for hook config
+PROJECT_PK=$(grep '^LANGFUSE_INIT_PROJECT_PUBLIC_KEY=' "$ENV_FILE" | cut -d= -f2)
+PROJECT_SK=$(grep '^LANGFUSE_INIT_PROJECT_SECRET_KEY=' "$ENV_FILE" | cut -d= -f2)
+ADMIN_EMAIL_DISPLAY=$(grep '^LANGFUSE_INIT_USER_EMAIL=' "$ENV_FILE" | cut -d= -f2)
+
+# 4. Configure Claude Code hook
 echo ""
 mkdir -p "$HOME/.claude"
+
+HOOK_CMD="LANGFUSE_PUBLIC_KEY=$PROJECT_PK LANGFUSE_SECRET_KEY=$PROJECT_SK python3 $HOOK_SCRIPT"
 
 if [ -f "$CLAUDE_SETTINGS" ]; then
     if grep -q "langfuse-hook.py" "$CLAUDE_SETTINGS" 2>/dev/null; then
         echo "[skip] Claude Code hook already configured in settings.json"
     else
+        BACKUP="$CLAUDE_SETTINGS.backup.$(date +%s)"
+        cp "$CLAUDE_SETTINGS" "$BACKUP"
+        echo "[hook] Backed up existing settings to $BACKUP"
         echo "[hook] Adding Stop hook to $CLAUDE_SETTINGS"
         echo "       You need to manually add the following to your settings.json hooks section:"
         echo ""
@@ -103,7 +152,7 @@ if [ -f "$CLAUDE_SETTINGS" ]; then
         echo '      "hooks": ['
         echo '        {'
         echo '          "type": "command",'
-        echo "          \"command\": \"LANGFUSE_PUBLIC_KEY=pk-lf-claude-code LANGFUSE_SECRET_KEY=sk-lf-claude-code python3 $HOOK_SCRIPT\""
+        echo "          \"command\": \"$HOOK_CMD\""
         echo '        }'
         echo '      ]'
         echo '    }'
@@ -120,7 +169,7 @@ else
         "hooks": [
           {
             "type": "command",
-            "command": "LANGFUSE_PUBLIC_KEY=pk-lf-claude-code LANGFUSE_SECRET_KEY=sk-lf-claude-code python3 $HOOK_SCRIPT"
+            "command": "$HOOK_CMD"
           }
         ]
       }
@@ -135,7 +184,7 @@ echo ""
 echo "=== Setup complete ==="
 echo ""
 echo "  Dashboard:  http://localhost:3000"
-echo "  Login:      admin@example.com / changeme12345678"
+echo "  Login:      $ADMIN_EMAIL_DISPLAY"
 echo "  Hook log:   ~/.claude/langfuse-hook.log"
 echo ""
 echo "Start a Claude Code conversation — traces will appear automatically."

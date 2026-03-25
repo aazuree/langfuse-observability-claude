@@ -18,6 +18,7 @@ Environment variables:
 import base64
 import json
 import os
+import re
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -26,8 +27,8 @@ from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 LANGFUSE_HOST = os.environ.get("LANGFUSE_HOST", "http://localhost:3000")
-LANGFUSE_PUBLIC_KEY = os.environ.get("LANGFUSE_PUBLIC_KEY", "pk-lf-claude-code")
-LANGFUSE_SECRET_KEY = os.environ.get("LANGFUSE_SECRET_KEY", "sk-lf-claude-code")
+LANGFUSE_PUBLIC_KEY = os.environ.get("LANGFUSE_PUBLIC_KEY", "")
+LANGFUSE_SECRET_KEY = os.environ.get("LANGFUSE_SECRET_KEY", "")
 INGESTION_URL = f"{LANGFUSE_HOST}/api/public/ingestion"
 
 LOG_FILE = os.path.expanduser("~/.claude/langfuse-hook.log")
@@ -35,6 +36,17 @@ STATE_DIR = os.path.expanduser("~/.claude/langfuse-state")
 
 MAX_TEXT = 10000
 MAX_TOOL_IO = 5000
+MAX_LOG_BYTES = 10 * 1024 * 1024  # 10 MB
+
+SAFE_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+# Patterns to redact from text before sending to Langfuse
+SECRET_PATTERNS = [
+    re.compile(r"(?i)(api[_-]?key|apikey|secret[_-]?key|access[_-]?key|token|password|passwd|credential|auth)[\s]*[=:]\s*['\"]?([^\s'\"]{8,})['\"]?"),
+    re.compile(r"(?i)(sk|pk|api|key|token|secret|password|bearer|ghp|gho|ghu|ghs|ghr|glpat|xox[bposatr]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[-_]?[a-zA-Z0-9/+=]{16,}"),
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"),
+    re.compile(r"(?i)Bearer\s+[a-zA-Z0-9._\-/+=]{20,}"),
+]
 
 # Pro subscription: $0 marginal cost. Set to True to report equivalent API cost instead.
 REPORT_API_EQUIVALENT_COST = True
@@ -42,10 +54,32 @@ REPORT_API_EQUIVALENT_COST = True
 
 def log(msg: str) -> None:
     try:
+        # Rotate log if it exceeds MAX_LOG_BYTES
+        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > MAX_LOG_BYTES:
+            rotated = LOG_FILE + ".1"
+            if os.path.exists(rotated):
+                os.remove(rotated)
+            os.rename(LOG_FILE, rotated)
         with open(LOG_FILE, "a") as f:
             f.write(f"{datetime.now(timezone.utc).isoformat()} {msg}\n")
     except Exception:
         pass
+
+
+def sanitize_id(value: str) -> str:
+    """Sanitize an ID to prevent path traversal. Returns a safe fallback if invalid."""
+    if SAFE_ID_RE.match(value):
+        return value
+    # Fall back to a hash of the value
+    import hashlib
+    return hashlib.sha256(value.encode()).hexdigest()[:32]
+
+
+def redact_secrets(text: str) -> str:
+    """Redact known secret patterns from text."""
+    for pattern in SECRET_PATTERNS:
+        text = pattern.sub("[REDACTED]", text)
+    return text
 
 
 def make_auth_header() -> str:
@@ -340,7 +374,11 @@ def main() -> None:
         log(f"Failed to parse stdin: {e}")
         return
 
-    session_id = hook_input.get("session_id", "unknown")
+    if not LANGFUSE_PUBLIC_KEY or not LANGFUSE_SECRET_KEY:
+        log("LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY must be set")
+        return
+
+    session_id = sanitize_id(hook_input.get("session_id", "unknown"))
     transcript_path = hook_input.get("transcript_path", "")
     cwd = hook_input.get("cwd", "")
 
@@ -394,8 +432,8 @@ def main() -> None:
             "name": "Claude Code Session",
             "sessionId": session_id,
             "userId": os.environ.get("USER", "unknown"),
-            "input": truncate(first_user_input, MAX_TEXT) or None,
-            "output": truncate(last_assistant_output, MAX_TEXT) or None,
+            "input": redact_secrets(truncate(first_user_input, MAX_TEXT)) or None,
+            "output": redact_secrets(truncate(last_assistant_output, MAX_TEXT)) or None,
             "metadata": {
                 "cwd": cwd,
                 "turn_count": len(turns),
@@ -453,10 +491,10 @@ def main() -> None:
         gen_body = {
             "id": gen_id,
             "traceId": trace_id,
-            "name": f"Turn {prev_offset + turn_idx + 1}: {truncate(turn['user_input'], 80)}",
+            "name": f"Turn {prev_offset + turn_idx + 1}: {redact_secrets(truncate(turn['user_input'], 80))}",
             "model": model,
-            "input": truncate(turn["user_input"], MAX_TEXT) or None,
-            "output": truncate(turn["assistant_output"], MAX_TEXT) or None,
+            "input": redact_secrets(truncate(turn["user_input"], MAX_TEXT)) or None,
+            "output": redact_secrets(truncate(turn["assistant_output"], MAX_TEXT)) or None,
             "startTime": start_time,
             "endTime": end_time,
             "completionStartTime": first_token_time,
@@ -494,10 +532,16 @@ def main() -> None:
 
             tool_input = tc["input"]
             tool_input_str = json.dumps(tool_input) if not isinstance(tool_input, str) else tool_input
+            tool_input_str = redact_secrets(tool_input_str)
             if len(tool_input_str) > MAX_TOOL_IO:
                 tool_input = {"_truncated": True, "preview": tool_input_str[:MAX_TOOL_IO]}
+            else:
+                try:
+                    tool_input = json.loads(tool_input_str)
+                except (json.JSONDecodeError, TypeError):
+                    tool_input = tool_input_str
 
-            tool_output = tc["output"]
+            tool_output = redact_secrets(tc["output"])
             if len(tool_output) > MAX_TOOL_IO:
                 tool_output = tool_output[:MAX_TOOL_IO] + "...[truncated]"
 
