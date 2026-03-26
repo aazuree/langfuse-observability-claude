@@ -135,6 +135,21 @@ The Stop hook in `~/.claude/settings.json`:
 
 Replace `<your-pk>` and `<your-sk>` with the project keys printed during `./setup.sh`, and update the path to match where you cloned the repo.
 
+## Re-ingesting Past Sessions
+
+If you set up Langfuse after already using Claude Code, or need to rebuild after a data reset:
+
+```bash
+# Source your project keys from .env
+PK=$(grep '^LANGFUSE_INIT_PROJECT_PUBLIC_KEY=' .env | cut -d= -f2)
+SK=$(grep '^LANGFUSE_INIT_PROJECT_SECRET_KEY=' .env | cut -d= -f2)
+
+# Reprocess all sessions from ~/.claude/projects/
+LANGFUSE_PUBLIC_KEY=$PK LANGFUSE_SECRET_KEY=$SK python3 langfuse-hook.py --reprocess
+```
+
+This finds all transcript files, deletes any existing traces to avoid duplicates, and re-ingests everything from scratch.
+
 ## Cost Estimation
 
 Set `REPORT_API_EQUIVALENT_COST = True` in `langfuse-hook.py` (default) to report what each turn would cost at Anthropic API rates. Useful for tracking usage even on a Pro subscription where the actual marginal cost is $0.

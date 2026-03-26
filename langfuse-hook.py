@@ -125,6 +125,26 @@ def save_state(session_id: str, offset: int) -> None:
     Path(state_file).write_text(str(offset))
 
 
+def extract_slug(transcript_path: str) -> str:
+    """Scan the transcript for the first non-empty slug field."""
+    try:
+        with open(transcript_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    slug = entry.get("slug", "")
+                    if slug:
+                        return slug
+                except json.JSONDecodeError:
+                    continue
+    except Exception:
+        pass
+    return ""
+
+
 def parse_transcript(transcript_path: str, skip_lines: int = 0) -> tuple[list[dict], int]:
     entries = []
     total = 0
@@ -367,29 +387,30 @@ def build_turns(entries: list[dict]) -> list[dict]:
     return turns
 
 
-def main() -> None:
+def extract_cwd(transcript_path: str) -> str:
+    """Scan the transcript for the first non-empty cwd field."""
     try:
-        hook_input = json.load(sys.stdin)
-    except Exception as e:
-        log(f"Failed to parse stdin: {e}")
-        return
+        with open(transcript_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    cwd = entry.get("cwd", "")
+                    if cwd:
+                        return cwd
+                except json.JSONDecodeError:
+                    continue
+    except Exception:
+        pass
+    return ""
 
-    if not LANGFUSE_PUBLIC_KEY or not LANGFUSE_SECRET_KEY:
-        log("LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY must be set")
-        return
 
-    session_id = sanitize_id(hook_input.get("session_id", "unknown"))
-    transcript_path = hook_input.get("transcript_path", "")
-    cwd = hook_input.get("cwd", "")
-
-    if hook_input.get("stop_hook_active", False):
-        return
-
-    if not transcript_path:
-        log("No transcript_path provided")
-        return
-
+def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
+    """Core processing logic for a single session transcript."""
     prev_offset = load_state(session_id)
+    slug = extract_slug(transcript_path)
     entries, total_lines = parse_transcript(transcript_path, skip_lines=prev_offset)
 
     if not entries:
@@ -429,7 +450,7 @@ def main() -> None:
         "body": {
             "id": trace_id,
             "timestamp": now,
-            "name": "Claude Code Session",
+            "name": slug or "Claude Code Session",
             "sessionId": session_id,
             "userId": os.environ.get("USER", "unknown"),
             "input": redact_secrets(truncate(first_user_input, MAX_TEXT)) or None,
@@ -448,7 +469,8 @@ def main() -> None:
 
     # 2. Generation + spans per turn
     for turn_idx, turn in enumerate(turns):
-        turn_id = str(uuid.uuid4())
+        # Deterministic IDs so re-ingestion updates rather than duplicates
+        turn_id = uuid.uuid5(uuid.NAMESPACE_URL, f"{session_id}:turn:{prev_offset + turn_idx}")
         gen_id = f"gen-{turn_id}"
 
         start_time = turn["start_time"]
@@ -576,6 +598,92 @@ def main() -> None:
         f"{len(turns)} turns, {tool_span_count} tool spans, "
         f"{total_tokens} tokens (lines {prev_offset+1}-{total_lines})"
     )
+
+
+def delete_trace(trace_id: str) -> None:
+    """Delete a trace and all its observations from Langfuse."""
+    url = f"{LANGFUSE_HOST}/api/public/traces/{trace_id}"
+    req = Request(
+        url,
+        headers={"Authorization": make_auth_header()},
+        method="DELETE",
+    )
+    try:
+        with urlopen(req, timeout=15):
+            pass
+    except URLError:
+        pass
+
+
+def reprocess_all() -> None:
+    """Find all transcript files and reprocess them from scratch."""
+    if not LANGFUSE_PUBLIC_KEY or not LANGFUSE_SECRET_KEY:
+        print("Error: LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY must be set")
+        return
+
+    projects_dir = Path.home() / ".claude" / "projects"
+    transcripts = sorted(projects_dir.glob("*/*.jsonl"))
+
+    if not transcripts:
+        print("No transcript files found under ~/.claude/projects/")
+        return
+
+    total = len(transcripts)
+    print(f"Found {total} transcript(s) to reprocess.\n")
+
+    for idx, transcript in enumerate(transcripts, 1):
+        session_id = sanitize_id(transcript.stem)
+        slug = extract_slug(str(transcript))
+        cwd = extract_cwd(str(transcript))
+
+        # Delete existing trace to avoid duplicates, then reset state
+        trace_id = f"trace-{session_id}"
+        delete_trace(trace_id)
+        state_file = Path(STATE_DIR) / f"{session_id}.offset"
+        if state_file.exists():
+            state_file.unlink()
+
+        label = f"{session_id}"
+        if slug:
+            label += f" ({slug})"
+        print(f"[{idx}/{total}] {label}")
+
+        try:
+            process_session(session_id, str(transcript), cwd)
+        except Exception as e:
+            print(f"  Error: {e}")
+            log(f"Reprocess error for {session_id}: {e}")
+
+    print(f"\nDone. Reprocessed {total} session(s).")
+
+
+def main() -> None:
+    if len(sys.argv) > 1 and sys.argv[1] == "--reprocess":
+        reprocess_all()
+        return
+
+    try:
+        hook_input = json.load(sys.stdin)
+    except Exception as e:
+        log(f"Failed to parse stdin: {e}")
+        return
+
+    if not LANGFUSE_PUBLIC_KEY or not LANGFUSE_SECRET_KEY:
+        log("LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY must be set")
+        return
+
+    session_id = sanitize_id(hook_input.get("session_id", "unknown"))
+    transcript_path = hook_input.get("transcript_path", "")
+    cwd = hook_input.get("cwd", "")
+
+    if hook_input.get("stop_hook_active", False):
+        return
+
+    if not transcript_path:
+        log("No transcript_path provided")
+        return
+
+    process_session(session_id, transcript_path, cwd)
 
 
 if __name__ == "__main__":
