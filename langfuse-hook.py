@@ -442,14 +442,15 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
             last_assistant_output = t["assistant_output"]
             break
 
+    trace_ts = turns[0].get("start_time") or now
     # 1. Trace
     batch.append({
         "id": f"evt-{uuid.uuid4()}-trace",
-        "timestamp": now,
+        "timestamp": trace_ts,
         "type": "trace-create",
         "body": {
             "id": trace_id,
-            "timestamp": now,
+            "timestamp": trace_ts,
             "name": slug or "Claude Code Session",
             "sessionId": session_id,
             "userId": os.environ.get("USER", "unknown"),
@@ -500,15 +501,38 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
 
         # Cost: $0 for Pro subscription
         turn_cost = 0.0
+        input_cost = 0.0
+        output_cost = 0.0
         if REPORT_API_EQUIVALENT_COST:
-            # Anthropic API equivalent rates for claude-opus-4
-            turn_cost = (
-                usage["input"] * 15.0 / 1_000_000
-                + usage["output"] * 75.0 / 1_000_000
-                + usage["cache_read"] * 1.50 / 1_000_000
-                + usage["cache_creation"] * 18.75 / 1_000_000
+            # Anthropic API equivalent rates ($ per token)
+            # Select pricing tier based on model name
+            m = model.lower()
+            if "haiku" in m:
+                p_in, p_out, p_cr, p_cc = 0.80, 4.00, 0.08, 1.00
+            elif "opus" in m:
+                p_in, p_out, p_cr, p_cc = 15.0, 75.0, 1.50, 18.75
+            else:
+                # Sonnet (default for all sonnet variants)
+                p_in, p_out, p_cr, p_cc = 3.0, 15.0, 0.30, 3.75
+            input_cost = (
+                usage["input"] * p_in / 1_000_000
+                + usage["cache_read"] * p_cr / 1_000_000
+                + usage["cache_creation"] * p_cc / 1_000_000
             )
+            output_cost = usage["output"] * p_out / 1_000_000
+            turn_cost = input_cost + output_cost
         total_cost += turn_cost
+
+        usage_body = {
+            "input": usage["input"],
+            "output": usage["output"],
+            "total": usage["total"],
+            "unit": "TOKENS",
+        }
+        if REPORT_API_EQUIVALENT_COST:
+            usage_body["inputCost"] = input_cost
+            usage_body["outputCost"] = output_cost
+            usage_body["totalCost"] = turn_cost
 
         gen_body = {
             "id": gen_id,
@@ -520,13 +544,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
             "startTime": start_time,
             "endTime": end_time,
             "completionStartTime": first_token_time,
-            "usage": {
-                "input": usage["input"],
-                "output": usage["output"],
-                "total": usage["total"],
-                "unit": "TOKENS",
-            },
-            "totalCost": turn_cost,
+            "usage": usage_body,
             "metadata": {
                 "tools_used": tool_names,
                 "tool_count": len(tool_names),
