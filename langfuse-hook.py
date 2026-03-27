@@ -523,16 +523,23 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
             turn_cost = input_cost + output_cost
         total_cost += turn_cost
 
-        usage_body = {
+        usage_details = {
             "input": usage["input"],
             "output": usage["output"],
             "total": usage["total"],
-            "unit": "TOKENS",
+            "cache_read_input_tokens": usage["cache_read"],
+            "cache_creation_input_tokens": usage["cache_creation"],
         }
+
+        cost_details = {}
         if REPORT_API_EQUIVALENT_COST:
-            usage_body["inputCost"] = input_cost
-            usage_body["outputCost"] = output_cost
-            usage_body["totalCost"] = turn_cost
+            cost_details = {
+                "input": usage["input"] * p_in / 1_000_000,
+                "output": output_cost,
+                "cache_read_input_tokens": usage["cache_read"] * p_cr / 1_000_000,
+                "cache_creation_input_tokens": usage["cache_creation"] * p_cc / 1_000_000,
+                "total": turn_cost,
+            }
 
         gen_body = {
             "id": gen_id,
@@ -544,13 +551,12 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
             "startTime": start_time,
             "endTime": end_time,
             "completionStartTime": first_token_time,
-            "usage": usage_body,
+            "usageDetails": usage_details,
+            "costDetails": cost_details if cost_details else None,
             "metadata": {
                 "tools_used": tool_names,
                 "tool_count": len(tool_names),
                 "api_calls": len(turn["api_call_ids"]),
-                "cache_read_tokens": usage["cache_read"],
-                "cache_creation_tokens": usage["cache_creation"],
             },
         }
 
