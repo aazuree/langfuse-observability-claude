@@ -465,8 +465,92 @@ def run_eval(evaluator: dict, trace_input: str, trace_output: str) -> dict | Non
 
 
 # ---------------------------------------------------------------------------
-# Main (placeholder - Tasks 4-5 will add score posting and the full loop)
+# Score posting
 # ---------------------------------------------------------------------------
+
+def build_score_payload(trace_id: str, evaluator: dict, result: dict) -> dict | None:
+    """Build a Langfuse score payload. Returns None if score is null (skip)."""
+    score = result.get("score")
+    if score is None:
+        return None
+
+    payload = {
+        "traceId": trace_id,
+        "name": evaluator["name"],
+        "dataType": evaluator["data_type"],
+        "comment": result.get("reasoning", ""),
+    }
+
+    if evaluator["data_type"] == "NUMERIC":
+        payload["value"] = float(score)
+    else:
+        payload["value"] = str(score)
+
+    return payload
+
+
+def post_score(payload: dict) -> bool:
+    """Post a single score to Langfuse. Returns True on success.
+
+    Raises ConnectionError if the API is unreachable (connection refused, DNS failure).
+    Returns False for HTTP errors (400, 500, etc.) which are logged and skipped.
+    """
+    url = f"{LANGFUSE_HOST}/api/public/scores"
+    data = json.dumps(payload).encode()
+    req = Request(url, data=data, headers={
+        "Content-Type": "application/json",
+        "Authorization": make_auth_header(),
+    }, method="POST")
+
+    try:
+        with urlopen(req, timeout=15) as resp:
+            log(f"Score posted: {payload['name']}={payload['value']} "
+                f"for {payload['traceId']} ({resp.status})")
+            return True
+    except URLError as e:
+        if hasattr(e, 'code'):
+            # HTTP error (400, 500, etc.) — log and skip this score
+            log(f"HTTP {e.code} posting score {payload['name']} for "
+                f"{payload['traceId']}: {e.reason}")
+            return False
+        # Connection error (refused, DNS, timeout) — fatal
+        raise ConnectionError(
+            f"Langfuse API unreachable: {e}") from e
+
+
+# ---------------------------------------------------------------------------
+# Main evaluation loop
+# ---------------------------------------------------------------------------
+
+
+def evaluate_trace(trace: dict, args: argparse.Namespace) -> int:
+    """Evaluate a single trace with all evaluators. Returns number of scores evaluated."""
+    trace_id = trace["id"]
+    trace_input = trace.get("input", "")
+    trace_output = trace.get("output", "")
+    evaluated = 0
+
+    for evaluator in EVALUATORS:
+        result = run_eval(evaluator, trace_input, trace_output)
+        if not result:
+            continue
+
+        payload = build_score_payload(trace_id, evaluator, result)
+        if not payload:
+            log(f"Skipping {evaluator['name']} for {trace_id}: null score")
+            continue
+
+        if args.dry_run:
+            print(json.dumps(payload, indent=2))
+        else:
+            # post_score raises ConnectionError if API is unreachable (fatal)
+            # Returns False for HTTP errors like 400 (logged, non-fatal)
+            post_score(payload)
+
+        evaluated += 1
+        time.sleep(EVAL_DELAY_SECONDS)
+
+    return evaluated
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -477,7 +561,44 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         return 1
 
-    # Placeholder — Tasks 4-5 fill in the rest
+    log("Starting evaluation run")
+
+    try:
+        traces = get_unscored_traces(args)
+    except URLError as e:
+        log(f"Langfuse API unreachable: {e}")
+        print(f"Error: Langfuse API unreachable: {e}", file=sys.stderr)
+        return 1
+
+    if not traces:
+        log("No unscored traces found")
+        print("No unscored traces found.")
+        return 0
+
+    log(f"Found {len(traces)} traces to evaluate")
+    total_scores = 0
+
+    for trace in traces:
+        trace_id = trace["id"]
+        log(f"Evaluating trace {trace_id}")
+
+        try:
+            evaluated = evaluate_trace(trace, args)
+            total_scores += evaluated
+        except ConnectionError:
+            print("Error: Langfuse API unreachable during scoring",
+                  file=sys.stderr)
+            return 1
+
+        if not args.dry_run:
+            if evaluated > 0:
+                mark_scored(trace_id)
+                log(f"Marked {trace_id} as scored ({evaluated} scores)")
+            else:
+                log(f"No scores for {trace_id} — not marking as scored, will retry next run")
+
+    log(f"Evaluation complete: {len(traces)} traces, {total_scores} scores")
+    print(f"Evaluated {len(traces)} traces, {total_scores} scores.")
     return 0
 
 

@@ -131,3 +131,40 @@ def test_validate_numeric_score():
     assert mod.validate_score(evaluator, 1.5) is False
     assert mod.validate_score(evaluator, -0.1) is False
     assert mod.validate_score(evaluator, None) is True  # null = skip
+
+
+def test_build_score_payload_categorical():
+    mod = _load_module()
+    evaluator = mod.EVALUATORS[0]  # task_completion
+    payload = mod.build_score_payload(
+        "trace-123", evaluator,
+        {"score": "completed", "reasoning": "Done."}
+    )
+    assert payload["traceId"] == "trace-123"
+    assert payload["name"] == "task_completion"
+    assert payload["value"] == "completed"
+    assert payload["dataType"] == "CATEGORICAL"
+    assert payload["comment"] == "Done."
+
+
+def test_build_score_payload_numeric():
+    mod = _load_module()
+    evaluator = mod.EVALUATORS[2]  # code_quality
+    payload = mod.build_score_payload(
+        "trace-456", evaluator,
+        {"score": 0.85, "reasoning": "Good code."}
+    )
+    assert payload["traceId"] == "trace-456"
+    assert payload["name"] == "code_quality"
+    assert payload["value"] == 0.85
+    assert payload["dataType"] == "NUMERIC"
+
+
+def test_build_score_payload_null_returns_none():
+    mod = _load_module()
+    evaluator = mod.EVALUATORS[2]
+    payload = mod.build_score_payload(
+        "trace-789", evaluator,
+        {"score": None, "reasoning": "No code."}
+    )
+    assert payload is None
