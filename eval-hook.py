@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""LLM-as-a-Judge evaluator for Langfuse traces.
+"""LLM-as-a-Judge evaluator for Langfuse traces (observation-level).
 
-Fetches unscored traces from Langfuse, evaluates them using the Claude CLI
-(haiku model for cost efficiency), and posts quality scores back.
+Fetches traces from Langfuse, then evaluates each generation (turn)
+independently using the Claude CLI (haiku model for cost efficiency).
+Scores are linked to specific observations via observationId so they
+appear in the Scores tab of each generation in the Langfuse UI.
+
+Scoring is opt-in via --score flag to control cost.
 
 Evaluators:
   - task_completion   (CATEGORICAL: completed / partial / failed)
-  - tool_appropriateness (CATEGORICAL: appropriate / questionable / inappropriate)
-  - code_quality      (NUMERIC: 0.0 - 1.0)
   - response_quality  (NUMERIC: 0.0 - 1.0)
 
 Environment variables:
@@ -16,11 +18,12 @@ Environment variables:
   LANGFUSE_HOST        - Langfuse base URL (default: http://localhost:3000)
 
 Usage:
-  python3 eval-hook.py                  # Evaluate all unscored traces
-  python3 eval-hook.py --dry-run        # Preview without posting scores
-  python3 eval-hook.py --trace ID       # Evaluate a single trace
-  python3 eval-hook.py --rescore        # Re-evaluate already-scored traces
-  python3 eval-hook.py --limit N        # Process at most N traces
+  python3 eval-hook.py --score              # Evaluate all unscored turns
+  python3 eval-hook.py --score --dry-run    # Preview without posting scores
+  python3 eval-hook.py --score --trace ID   # Evaluate turns in a single trace
+  python3 eval-hook.py --score --rescore    # Re-evaluate already-scored turns
+  python3 eval-hook.py --score --limit N    # Process at most N traces
+  python3 eval-hook.py                      # List unscored traces (no scoring)
 """
 
 from __future__ import annotations
@@ -116,6 +119,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="Process at most N traces.",
     )
+    parser.add_argument(
+        "--score",
+        action="store_true",
+        help="Enable scoring. Without this flag, lists traces but does not evaluate.",
+    )
     return parser.parse_args(argv)
 
 
@@ -187,12 +195,9 @@ def get_unscored_traces(args: argparse.Namespace) -> list[dict]:
         trace = fetch_single_trace(args.trace)
         if trace is None:
             return []
-        if not args.rescore and is_scored(args.trace):
-            log(f"Trace {args.trace} already scored (use --rescore to re-evaluate)")
-            return []
         return [trace]
 
-    # Paginated fetch
+    # Paginated fetch — per-observation dedup happens in evaluate_trace
     traces: list[dict] = []
     page = 1
     max_traces = args.limit or 1000  # safety cap
@@ -206,11 +211,6 @@ def get_unscored_traces(args: argparse.Namespace) -> list[dict]:
             tid = t.get("id", "")
             if not tid:
                 continue
-            if not t.get("input") or not t.get("output"):
-                log(f"Skipping trace {tid}: missing input or output")
-                continue
-            if not args.rescore and is_scored(tid):
-                continue
             traces.append(t)
             if len(traces) >= max_traces:
                 break
@@ -222,6 +222,57 @@ def get_unscored_traces(args: argparse.Namespace) -> list[dict]:
         page += 1
 
     return traces
+
+
+def fetch_generations(trace_id: str) -> list[dict]:
+    """Fetch all GENERATION observations for a trace.
+
+    Returns list of observation dicts from the Langfuse API.
+    Each dict has id, input, output, name, metadata, etc.
+    """
+    url = (
+        f"{LANGFUSE_HOST}/api/public/observations"
+        f"?traceId={trace_id}&type=GENERATION"
+    )
+    req = Request(
+        url,
+        headers={
+            "Authorization": make_auth_header(),
+            "Accept": "application/json",
+        },
+        method="GET",
+    )
+    try:
+        with urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+        return data.get("data", [])
+    except URLError as e:
+        log(f"Failed to fetch observations for {trace_id}: {e}")
+        return []
+
+
+# ---------------------------------------------------------------------------
+# System command detection
+# ---------------------------------------------------------------------------
+
+# Slash commands: /clear, /help, /compact, /review, /cost, etc.
+_SLASH_CMD_RE = re.compile(r"^\s*/")
+
+
+def is_system_command(user_input: str, assistant_output: str) -> bool:
+    """Return True if this turn should be skipped for evaluation.
+
+    Skips slash commands, empty inputs, and turns with no assistant text output
+    (e.g. tool-use-only responses where extract_text_blocks returns empty).
+    """
+    user_text = (user_input or "").strip()
+    if not user_text:
+        return True
+    if not assistant_output or not assistant_output.strip():
+        return True
+    if _SLASH_CMD_RE.match(user_text):
+        return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -249,61 +300,6 @@ EVALUATORS = [
             "verbosity.\n\n"
             "Respond with ONLY a JSON object, no other text:\n"
             '{{"score": "<completed|partial|failed>", "reasoning": '
-            '"<one sentence explanation>"}}'
-        ),
-    },
-    {
-        "name": "tool_appropriateness",
-        "data_type": "CATEGORICAL",
-        "valid_values": ["appropriate", "questionable", "inappropriate"],
-        "template": (
-            "You are evaluating whether an AI coding assistant used appropriate "
-            "tools for the task.\n\n"
-            "## User Request\n{input}\n\n"
-            "## Assistant Response (including tool calls)\n{output}\n\n"
-            "## Criteria\n"
-            '- "appropriate": Tools chosen match the task. Used Read instead of '
-            "cat, Edit instead of sed, Grep instead of grep, etc. No unnecessary "
-            "tool calls.\n"
-            '- "questionable": Some tool choices were suboptimal but not harmful. '
-            "E.g., used Bash where a dedicated tool exists, or made redundant "
-            "calls.\n"
-            '- "inappropriate": Tools were clearly wrong for the task, excessive, '
-            "or harmful. E.g., destructive operations without need, reading files "
-            "never used.\n\n"
-            "Judge the tool SELECTION, not the task outcome.\n\n"
-            "Respond with ONLY a JSON object, no other text:\n"
-            '{{"score": "<appropriate|questionable|inappropriate>", "reasoning": '
-            '"<one sentence explanation>"}}'
-        ),
-    },
-    {
-        "name": "code_quality",
-        "data_type": "NUMERIC",
-        "valid_values": None,  # 0.0-1.0 or null
-        "template": (
-            "You are evaluating the quality of code written by an AI coding "
-            "assistant.\n\n"
-            "## User Request\n{input}\n\n"
-            "## Assistant Response\n{output}\n\n"
-            "## Scoring (0.0 to 1.0)\n"
-            "- 1.0: Code is correct, idiomatic, minimal, handles edge cases "
-            "appropriately, no security issues\n"
-            "- 0.7-0.9: Code works and is reasonable but has minor style or "
-            "efficiency issues\n"
-            "- 0.4-0.6: Code has noticeable problems — unnecessary complexity, "
-            "poor naming, missing obvious cases\n"
-            "- 0.1-0.3: Code has significant issues — bugs, security "
-            "vulnerabilities, fundamentally wrong approach\n"
-            "- 0.0: No code was written when it should have been, or code is "
-            "completely broken\n\n"
-            "If the session involved no code writing, respond with:\n"
-            '{{"score": null, "reasoning": "No code was written in this '
-            'session."}}\n'
-            "The script will skip posting a code_quality score when score is "
-            "null.\n\n"
-            "Respond with ONLY a JSON object, no other text:\n"
-            '{{"score": <float between 0.0 and 1.0>, "reasoning": '
             '"<one sentence explanation>"}}'
         ),
     },
@@ -463,7 +459,12 @@ def run_eval(evaluator: dict, trace_input: str, trace_output: str) -> dict | Non
 # Score posting
 # ---------------------------------------------------------------------------
 
-def build_score_payload(trace_id: str, evaluator: dict, result: dict) -> dict | None:
+def build_score_payload(
+    trace_id: str,
+    evaluator: dict,
+    result: dict,
+    observation_id: str | None = None,
+) -> dict | None:
     """Build a Langfuse score payload. Returns None if score is null (skip)."""
     score = result.get("score")
     if score is None:
@@ -475,6 +476,9 @@ def build_score_payload(trace_id: str, evaluator: dict, result: dict) -> dict | 
         "dataType": evaluator["data_type"],
         "comment": result.get("reasoning", ""),
     }
+
+    if observation_id:
+        payload["observationId"] = observation_id
 
     if evaluator["data_type"] == "NUMERIC":
         payload["value"] = float(score)
@@ -519,31 +523,56 @@ def post_score(payload: dict) -> bool:
 
 
 def evaluate_trace(trace: dict, args: argparse.Namespace) -> int:
-    """Evaluate a single trace with all evaluators. Returns number of scores evaluated."""
+    """Evaluate each generation in a trace independently.
+
+    Per Langfuse best practices, observation-level scoring gives per-turn
+    precision and links scores to specific generations in the UI.
+    Returns total number of scores posted.
+    """
     trace_id = trace["id"]
-    trace_input = trace.get("input", "")
-    trace_output = trace.get("output", "")
+    generations = fetch_generations(trace_id)
     evaluated = 0
 
-    for evaluator in EVALUATORS:
-        result = run_eval(evaluator, trace_input, trace_output)
-        if not result:
+    if not generations:
+        log(f"No generations for trace {trace_id}")
+        return 0
+
+    for gen in generations:
+        obs_id = gen.get("id", "")
+        user_input = gen.get("input", "") or ""
+        assistant_output = gen.get("output", "") or ""
+
+        if not args.rescore and is_scored(obs_id):
             continue
 
-        payload = build_score_payload(trace_id, evaluator, result)
-        if not payload:
-            log(f"Skipping {evaluator['name']} for {trace_id}: null score")
+        if is_system_command(user_input, assistant_output):
+            log(f"Skipping system command: {obs_id}")
             continue
 
-        if args.dry_run:
-            print(json.dumps(payload, indent=2))
-        else:
-            # post_score raises ConnectionError if API is unreachable (fatal)
-            # Returns False for HTTP errors like 400 (logged, non-fatal)
-            post_score(payload)
+        turn_scores = 0
+        for evaluator in EVALUATORS:
+            result = run_eval(evaluator, user_input, assistant_output)
+            if not result:
+                continue
 
-        evaluated += 1
-        time.sleep(EVAL_DELAY_SECONDS)
+            payload = build_score_payload(trace_id, evaluator, result, obs_id)
+            if not payload:
+                log(f"Skipping {evaluator['name']} for {obs_id}: null score")
+                continue
+
+            if args.dry_run:
+                print(json.dumps(payload, indent=2))
+            else:
+                post_score(payload)
+
+            turn_scores += 1
+            time.sleep(EVAL_DELAY_SECONDS)
+
+        if turn_scores > 0 and not args.dry_run:
+            mark_scored(obs_id)
+            log(f"Scored observation {obs_id} ({turn_scores} scores)")
+
+        evaluated += turn_scores
 
     return evaluated
 
@@ -566,11 +595,18 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if not traces:
-        log("No unscored traces found")
-        print("No unscored traces found.")
+        log("No traces found")
+        print("No traces found.")
         return 0
 
-    log(f"Found {len(traces)} traces to evaluate")
+    log(f"Found {len(traces)} traces")
+
+    if not args.score and not args.dry_run:
+        print(f"Found {len(traces)} traces. Use --score to evaluate them.")
+        for t in traces:
+            print(f"  {t['id']}")
+        return 0
+
     total_scores = 0
 
     for trace in traces:
@@ -584,13 +620,6 @@ def main(argv: list[str] | None = None) -> int:
             print("Error: Langfuse API unreachable during scoring",
                   file=sys.stderr)
             return 1
-
-        if not args.dry_run:
-            if evaluated > 0:
-                mark_scored(trace_id)
-                log(f"Marked {trace_id} as scored ({evaluated} scores)")
-            else:
-                log(f"No scores for {trace_id} — not marking as scored, will retry next run")
 
     log(f"Evaluation complete: {len(traces)} traces, {total_scores} scores")
     print(f"Evaluated {len(traces)} traces, {total_scores} scores.")

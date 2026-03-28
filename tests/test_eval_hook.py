@@ -32,6 +32,7 @@ def test_help_flag():
     assert "--rescore" in result.stdout
     assert "--trace" in result.stdout
     assert "--limit" in result.stdout
+    assert "--score" in result.stdout
 
 
 def _load_module(tmp_path=None):
@@ -49,9 +50,9 @@ def _load_module(tmp_path=None):
 def test_is_scored_and_mark_scored(tmp_path):
     """is_scored and mark_scored use marker files correctly."""
     mod = _load_module(tmp_path)
-    assert not mod.is_scored("trace-abc123")
-    mod.mark_scored("trace-abc123")
-    assert mod.is_scored("trace-abc123")
+    assert not mod.is_scored("gen-abc123")
+    mod.mark_scored("gen-abc123")
+    assert mod.is_scored("gen-abc123")
 
 
 def test_parse_eval_response_categorical():
@@ -126,7 +127,7 @@ def test_validate_categorical_score():
 
 def test_validate_numeric_score():
     mod = _load_module()
-    evaluator = mod.EVALUATORS[2]  # code_quality
+    evaluator = mod.EVALUATORS[1]  # response_quality
     assert mod.validate_score(evaluator, 0.85) is True
     assert mod.validate_score(evaluator, 1.5) is False
     assert mod.validate_score(evaluator, -0.1) is False
@@ -149,22 +150,70 @@ def test_build_score_payload_categorical():
 
 def test_build_score_payload_numeric():
     mod = _load_module()
-    evaluator = mod.EVALUATORS[2]  # code_quality
+    evaluator = mod.EVALUATORS[1]  # response_quality
     payload = mod.build_score_payload(
         "trace-456", evaluator,
-        {"score": 0.85, "reasoning": "Good code."}
+        {"score": 0.85, "reasoning": "Good response."}
     )
     assert payload["traceId"] == "trace-456"
-    assert payload["name"] == "code_quality"
+    assert payload["name"] == "response_quality"
     assert payload["value"] == 0.85
     assert payload["dataType"] == "NUMERIC"
 
 
 def test_build_score_payload_null_returns_none():
     mod = _load_module()
-    evaluator = mod.EVALUATORS[2]
+    evaluator = mod.EVALUATORS[1]  # response_quality
     payload = mod.build_score_payload(
         "trace-789", evaluator,
-        {"score": None, "reasoning": "No code."}
+        {"score": None, "reasoning": "N/A."}
     )
     assert payload is None
+
+
+def test_build_score_payload_with_observation_id():
+    mod = _load_module()
+    evaluator = mod.EVALUATORS[0]  # task_completion
+    payload = mod.build_score_payload(
+        "trace-123", evaluator,
+        {"score": "completed", "reasoning": "Done."},
+        observation_id="gen-turn-5",
+    )
+    assert payload["traceId"] == "trace-123"
+    assert payload["observationId"] == "gen-turn-5"
+    assert payload["name"] == "task_completion"
+
+
+def test_build_score_payload_without_observation_id():
+    mod = _load_module()
+    evaluator = mod.EVALUATORS[0]
+    payload = mod.build_score_payload(
+        "trace-123", evaluator,
+        {"score": "completed", "reasoning": "Done."},
+    )
+    assert "observationId" not in payload
+
+
+def test_is_system_command():
+    mod = _load_module()
+    # Slash commands
+    assert mod.is_system_command("/clear", "Cleared.") is True
+    assert mod.is_system_command("/help", "Here is help") is True
+    assert mod.is_system_command("/compact", "Compacted.") is True
+    assert mod.is_system_command("  /review", "Review output") is True
+    # Empty input
+    assert mod.is_system_command("", "something") is True
+    # Empty output (tool-use-only turns)
+    assert mod.is_system_command("fix the bug", "") is True
+    assert mod.is_system_command("fix the bug", "  ") is True
+    # Normal turns
+    assert mod.is_system_command("fix the bug", "Done, fixed it.") is False
+    assert mod.is_system_command("explain this code", "This code does...") is False
+
+
+def test_evaluators_reduced_to_two():
+    """Only task_completion and response_quality should remain."""
+    mod = _load_module()
+    assert len(mod.EVALUATORS) == 2
+    names = [e["name"] for e in mod.EVALUATORS]
+    assert names == ["task_completion", "response_quality"]
