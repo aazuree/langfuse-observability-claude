@@ -5,8 +5,8 @@ Fetches unscored traces from Langfuse, evaluates them using the Claude CLI
 (haiku model for cost efficiency), and posts quality scores back.
 
 Evaluators:
-  - task_completion   (CATEGORICAL: completed / partial / failed / unclear)
-  - tool_appropriateness (CATEGORICAL: appropriate / excessive / insufficient / mixed)
+  - task_completion   (CATEGORICAL: completed / partial / failed)
+  - tool_appropriateness (CATEGORICAL: appropriate / questionable / inappropriate)
   - code_quality      (NUMERIC: 0.0 - 1.0)
   - response_quality  (NUMERIC: 0.0 - 1.0)
 
@@ -46,12 +46,12 @@ LANGFUSE_HOST = os.environ.get("LANGFUSE_HOST", "http://localhost:3000")
 LANGFUSE_PUBLIC_KEY = os.environ.get("LANGFUSE_PUBLIC_KEY", "")
 LANGFUSE_SECRET_KEY = os.environ.get("LANGFUSE_SECRET_KEY", "")
 
-LOG_FILE = os.path.expanduser("~/.claude/eval-hook.log")
+LOG_FILE = os.path.expanduser("~/.claude/langfuse-eval.log")
 STATE_DIR = os.path.expanduser("~/.claude/langfuse-state/eval")
 
 MAX_LOG_BYTES = 10 * 1024 * 1024  # 10 MB
-EVAL_DELAY_SECONDS = 2  # Pause between evaluations to avoid rate limits
-CLI_TIMEOUT_SECONDS = 120  # Timeout for claude CLI invocations
+EVAL_DELAY_SECONDS = 1  # delay between CLI calls
+CLI_TIMEOUT_SECONDS = 30  # timeout for claude CLI invocations
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -144,7 +144,8 @@ def mark_scored(trace_id: str) -> None:
 
 def fetch_traces(page: int = 1, limit: int = 50) -> dict:
     """GET /api/public/traces with pagination."""
-    url = f"{LANGFUSE_HOST}/api/public/traces?page={page}&limit={limit}"
+    url = (f"{LANGFUSE_HOST}/api/public/traces"
+           f"?orderBy=timestamp&order=DESC&limit={limit}&page={page}")
     req = Request(
         url,
         headers={
@@ -210,6 +211,9 @@ def get_unscored_traces(args: argparse.Namespace) -> list[dict]:
             tid = t.get("id", "")
             if not tid:
                 continue
+            if not t.get("input") or not t.get("output"):
+                log(f"Skipping trace {tid}: missing input or output")
+                continue
             if not args.rescore and is_scored(tid):
                 continue
             traces.append(t)
@@ -233,65 +237,103 @@ EVALUATORS = [
     {
         "name": "task_completion",
         "data_type": "CATEGORICAL",
-        "valid_values": ["completed", "partial", "failed", "unclear"],
+        "valid_values": ["completed", "partial", "failed"],
         "template": (
-            "You are an evaluation judge. Assess whether the assistant completed "
-            "the user's requested task.\n\n"
+            "You are evaluating whether an AI coding assistant completed the "
+            "user's requested task.\n\n"
             "## User Request\n{input}\n\n"
             "## Assistant Response\n{output}\n\n"
-            "## Instructions\n"
-            "Evaluate task completion. Choose one of: completed, partial, failed, unclear.\n\n"
-            "Respond with ONLY a JSON object (no other text):\n"
-            '{{\"score\": \"<value>\", \"reasoning\": \"<1-2 sentence explanation>\"}}'
+            "## Criteria\n"
+            '- "completed": The assistant fully addressed what was asked. '
+            "The task is done.\n"
+            '- "partial": The assistant made progress but left parts unfinished, '
+            "asked clarifying questions, or delivered an incomplete solution.\n"
+            '- "failed": The assistant did not accomplish the task, misunderstood '
+            "the request, or went off-track.\n\n"
+            "Focus on whether the OUTCOME matches the REQUEST, not on style or "
+            "verbosity.\n\n"
+            "Respond with ONLY a JSON object, no other text:\n"
+            '{{"score": "<completed|partial|failed>", "reasoning": '
+            '"<one sentence explanation>"}}'
         ),
     },
     {
         "name": "tool_appropriateness",
         "data_type": "CATEGORICAL",
-        "valid_values": ["appropriate", "excessive", "insufficient", "mixed"],
+        "valid_values": ["appropriate", "questionable", "inappropriate"],
         "template": (
-            "You are an evaluation judge. Assess whether the assistant's tool usage "
-            "was appropriate for the task.\n\n"
+            "You are evaluating whether an AI coding assistant used appropriate "
+            "tools for the task.\n\n"
             "## User Request\n{input}\n\n"
-            "## Assistant Response\n{output}\n\n"
-            "## Instructions\n"
-            "Evaluate tool usage appropriateness. Choose one of: appropriate, excessive, "
-            "insufficient, mixed.\n\n"
-            "Respond with ONLY a JSON object (no other text):\n"
-            '{{\"score\": \"<value>\", \"reasoning\": \"<1-2 sentence explanation>\"}}'
+            "## Assistant Response (including tool calls)\n{output}\n\n"
+            "## Criteria\n"
+            '- "appropriate": Tools chosen match the task. Used Read instead of '
+            "cat, Edit instead of sed, Grep instead of grep, etc. No unnecessary "
+            "tool calls.\n"
+            '- "questionable": Some tool choices were suboptimal but not harmful. '
+            "E.g., used Bash where a dedicated tool exists, or made redundant "
+            "calls.\n"
+            '- "inappropriate": Tools were clearly wrong for the task, excessive, '
+            "or harmful. E.g., destructive operations without need, reading files "
+            "never used.\n\n"
+            "Judge the tool SELECTION, not the task outcome.\n\n"
+            "Respond with ONLY a JSON object, no other text:\n"
+            '{{"score": "<appropriate|questionable|inappropriate>", "reasoning": '
+            '"<one sentence explanation>"}}'
         ),
     },
     {
         "name": "code_quality",
         "data_type": "NUMERIC",
-        "valid_values": None,  # 0.0 - 1.0
+        "valid_values": None,  # 0.0-1.0 or null
         "template": (
-            "You are an evaluation judge. Assess the quality of any code written or "
-            "modified in the assistant's response.\n\n"
+            "You are evaluating the quality of code written by an AI coding "
+            "assistant.\n\n"
             "## User Request\n{input}\n\n"
             "## Assistant Response\n{output}\n\n"
-            "## Instructions\n"
-            "Rate code quality from 0.0 (terrible) to 1.0 (excellent). Consider correctness, "
-            "readability, efficiency, and best practices. If no code was written, respond with "
-            "a null score.\n\n"
-            "Respond with ONLY a JSON object (no other text):\n"
-            '{{\"score\": <number or null>, \"reasoning\": \"<1-2 sentence explanation>\"}}'
+            "## Scoring (0.0 to 1.0)\n"
+            "- 1.0: Code is correct, idiomatic, minimal, handles edge cases "
+            "appropriately, no security issues\n"
+            "- 0.7-0.9: Code works and is reasonable but has minor style or "
+            "efficiency issues\n"
+            "- 0.4-0.6: Code has noticeable problems — unnecessary complexity, "
+            "poor naming, missing obvious cases\n"
+            "- 0.1-0.3: Code has significant issues — bugs, security "
+            "vulnerabilities, fundamentally wrong approach\n"
+            "- 0.0: No code was written when it should have been, or code is "
+            "completely broken\n\n"
+            "If the session involved no code writing, respond with:\n"
+            '{{"score": null, "reasoning": "No code was written in this '
+            'session."}}\n'
+            "The script will skip posting a code_quality score when score is "
+            "null.\n\n"
+            "Respond with ONLY a JSON object, no other text:\n"
+            '{{"score": <float between 0.0 and 1.0>, "reasoning": '
+            '"<one sentence explanation>"}}'
         ),
     },
     {
         "name": "response_quality",
         "data_type": "NUMERIC",
-        "valid_values": None,  # 0.0 - 1.0
+        "valid_values": None,  # 0.0-1.0
         "template": (
-            "You are an evaluation judge. Assess the overall quality of the assistant's "
-            "response.\n\n"
+            "You are evaluating the communication quality of an AI coding "
+            "assistant's response.\n\n"
             "## User Request\n{input}\n\n"
             "## Assistant Response\n{output}\n\n"
-            "## Instructions\n"
-            "Rate response quality from 0.0 (terrible) to 1.0 (excellent). Consider accuracy, "
-            "helpfulness, completeness, and clarity.\n\n"
-            "Respond with ONLY a JSON object (no other text):\n"
-            '{{\"score\": <number or null>, \"reasoning\": \"<1-2 sentence explanation>\"}}'
+            "## Scoring (0.0 to 1.0)\n"
+            "- 1.0: Concise, directly addresses the question, well-structured, "
+            "no filler\n"
+            "- 0.7-0.9: Good response with minor verbosity or slight "
+            "misalignment to the question\n"
+            "- 0.4-0.6: Overly verbose, includes unnecessary preamble, or "
+            "partially misses the point\n"
+            "- 0.1-0.3: Rambling, off-topic, or confusing structure\n"
+            "- 0.0: Response is incoherent or completely unhelpful\n\n"
+            "Value directness and relevance over length.\n\n"
+            "Respond with ONLY a JSON object, no other text:\n"
+            '{{"score": <float between 0.0 and 1.0>, "reasoning": '
+            '"<one sentence explanation>"}}'
         ),
     },
 ]
@@ -322,28 +364,33 @@ def parse_eval_response(cli_output: str) -> dict | None:
         log(f"Unexpected CLI output type: {envelope.get('type')}")
         return None
 
-    result_str = envelope.get("result", "")
-    if not isinstance(result_str, str):
-        log(f"Result is not a string: {type(result_str)}")
+    result_text = envelope.get("result", "")
+    if not isinstance(result_text, str):
+        log(f"Result is not a string: {type(result_text)}")
         return None
 
-    # Find JSON object within the result string (may have preamble text)
-    match = JSON_RE.search(result_str)
+    # Try direct parse first
+    try:
+        parsed = json.loads(result_text)
+        if "score" in parsed:
+            return parsed
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # Fall back to regex extraction (handles preamble text before JSON)
+    match = JSON_RE.search(result_text)
     if not match:
-        log(f"No JSON object found in result: {result_str[:200]}")
+        log(f"No JSON found in result: {result_text[:200]}")
         return None
 
     try:
         parsed = json.loads(match.group())
+        if "score" in parsed:
+            return parsed
     except json.JSONDecodeError:
-        log(f"Failed to parse inner JSON: {match.group()[:200]}")
-        return None
+        log(f"Failed to parse extracted JSON: {match.group()[:200]}")
 
-    if "score" not in parsed:
-        log(f"Missing 'score' key in parsed result: {parsed}")
-        return None
-
-    return parsed
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -384,24 +431,19 @@ def run_eval(evaluator: dict, trace_input: str, trace_output: str) -> dict | Non
     """
     prompt = evaluator["template"].format(input=trace_input, output=trace_output)
 
-    cmd = [
-        "haiku",
-        "-p", prompt,
-        "--output-format", "json",
-    ]
-
     try:
         result = subprocess.run(
-            cmd,
+            ["claude", "-p", "--model", "haiku", "--output-format", "json"],
+            input=prompt,
             capture_output=True,
             text=True,
             timeout=CLI_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired:
-        log(f"CLI timeout for evaluator {evaluator['name']}")
+        log(f"CLI timeout for {evaluator['name']}")
         return None
     except FileNotFoundError:
-        log("'haiku' CLI command not found")
+        log("claude CLI not found — is it installed and on PATH?")
         return None
 
     if result.returncode != 0:
@@ -427,20 +469,17 @@ def run_eval(evaluator: dict, trace_input: str, trace_output: str) -> dict | Non
 # ---------------------------------------------------------------------------
 
 
-def main() -> None:
-    args = parse_args()
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
 
     if not LANGFUSE_PUBLIC_KEY or not LANGFUSE_SECRET_KEY:
-        print(
-            "Error: LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY must be set",
-            file=sys.stderr,
-        )
-        sys.exit(1)
+        print("Error: LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY must be set",
+              file=sys.stderr)
+        return 1
 
-    # TODO (Task 4): build_score_payload, post_score
-    # TODO (Task 5): evaluate_trace, main loop over get_unscored_traces(args)
-    log("eval-hook started (placeholder main)")
+    # Placeholder — Tasks 4-5 fill in the rest
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
