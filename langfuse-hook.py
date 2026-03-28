@@ -387,6 +387,30 @@ def build_turns(entries: list[dict]) -> list[dict]:
     return turns
 
 
+def extract_session_metadata(transcript_path: str) -> dict:
+    """Extract session-level metadata from the first user entry in the transcript."""
+    fields = {"cwd": "", "gitBranch": "", "version": "", "entrypoint": ""}
+    try:
+        with open(transcript_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                    if entry.get("type") == "user":
+                        for key in fields:
+                            val = entry.get(key, "")
+                            if val:
+                                fields[key] = str(val)
+                        break
+                except json.JSONDecodeError:
+                    continue
+    except Exception:
+        pass
+    return fields
+
+
 def extract_cwd(transcript_path: str) -> str:
     """Scan the transcript for the first non-empty cwd field."""
     try:
@@ -422,11 +446,27 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
     trace_id = f"trace-{session_id}"
     batch = []
 
+    session_meta = extract_session_metadata(transcript_path)
+
     turns = build_turns(entries)
     if not turns:
         log(f"No turns found in {len(entries)} new entries")
         save_state(session_id, total_lines)
         return
+
+    # Derive repo name from cwd
+    repo_name = os.path.basename(cwd.rstrip("/")) if cwd else ""
+
+    # Collect unique model families used across all turns
+    model_families = set()
+    for t in turns:
+        m = (t.get("model") or "").lower()
+        if "haiku" in m:
+            model_families.add("haiku")
+        elif "opus" in m:
+            model_families.add("opus")
+        elif m and m != "<synthetic>":
+            model_families.add("sonnet")
 
     # Aggregate totals for the trace
     total_tokens = sum(t["usage"]["total"] for t in turns)
@@ -463,8 +503,17 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
                 "total_tokens": total_tokens,
                 "total_input_tokens": total_input,
                 "total_output_tokens": total_output,
+                "git_branch": session_meta.get("gitBranch", ""),
+                "cli_version": session_meta.get("version", ""),
+                "entrypoint": session_meta.get("entrypoint", ""),
+                "repo_name": repo_name,
             },
-            "tags": ["claude-code"],
+            "tags": [t for t in [
+                "claude-code",
+                repo_name or None,
+                *sorted(model_families),
+                session_meta.get("entrypoint") or None,
+            ] if t],
         },
     })
 

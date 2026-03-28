@@ -87,8 +87,44 @@ Pricing is model-aware (per 1M tokens):
 | Sonnet | $3.00 | $15.00 | $0.30 | $3.75 |
 | Haiku | $0.80 | $4.00 | $0.08 | $1.00 |
 
-Cost is passed via `usage.inputCost`/`outputCost`/`totalCost` (not top-level `totalCost` which Langfuse ignores).
 Set `REPORT_API_EQUIVALENT_COST = False` in `langfuse-hook.py` to report $0.
+
+## Tags and Metadata
+
+Each trace is enriched with:
+
+**Tags** (filterable in Langfuse UI):
+- `claude-code` — always present
+- repo/project name — derived from `cwd` (e.g., `langfuse-observability`)
+- model family — `opus`, `sonnet`, or `haiku`
+- entrypoint — `cli` or other launch method
+
+**Metadata** (structured key-value on trace):
+- `git_branch`, `cli_version`, `entrypoint`, `repo_name`, `cwd`
+- `turn_count`, `tool_calls_total`, `total_tokens`, `total_input_tokens`, `total_output_tokens`
+
+Extracted from the first `type: "user"` entry in the JSONL transcript via `extract_session_metadata()`.
+
+## Langfuse API Gotchas
+
+- **Use `usageDetails` + `costDetails`, not `usage` + `totalCost`**. Top-level `totalCost` on `generation-create` is silently ignored by Langfuse v3. Cost must go in `costDetails`; token counts in `usageDetails`.
+- **Explicit costs override auto-calculation**. When both `costDetails` and a matching built-in model exist, Langfuse uses the explicit values.
+- **Built-in model pricing lags new models**. Langfuse v3.73.1 has no pricing for `claude-opus-4-6` or `claude-sonnet-4-6` — only older model IDs like `claude-opus-4-20250514`. This is why we send explicit costs.
+- **Cache tokens are invisible in `usage`**. Only `usageDetails` (flexible map) surfaces `cache_read_input_tokens` and `cache_creation_input_tokens` as separate line items in the UI.
+- **ClickHouse ingestion is async**. Observations may take 5-10s to appear after the ingestion API returns 201.
+
+## Token Anatomy
+
+Most of the cost comes from cache tokens, not input/output. A typical heavy session:
+
+```
+input:           471 tokens    $0.01   (0%)
+output:       49,515 tokens    $3.71  (10%)
+cache_read: 16.1M tokens      $24.21  (63%)   <-- biggest cost driver
+cache_create:  545K tokens     $10.22  (27%)
+```
+
+The `input + output` count in the Langfuse UI can be misleadingly small. Always check `cache_read_input_tokens` in `usageDetails` for the real volume.
 
 ## Important Notes
 
