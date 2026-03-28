@@ -144,8 +144,7 @@ def mark_scored(trace_id: str) -> None:
 
 def fetch_traces(page: int = 1, limit: int = 50) -> dict:
     """GET /api/public/traces with pagination."""
-    url = (f"{LANGFUSE_HOST}/api/public/traces"
-           f"?orderBy=timestamp&order=DESC&limit={limit}&page={page}")
+    url = f"{LANGFUSE_HOST}/api/public/traces?limit={limit}&page={page}"
     req = Request(
         url,
         headers={
@@ -154,12 +153,8 @@ def fetch_traces(page: int = 1, limit: int = 50) -> dict:
         },
         method="GET",
     )
-    try:
-        with urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read().decode())
-    except URLError as e:
-        log(f"Failed to fetch traces (page={page}): {e}")
-        return {}
+    with urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read().decode())
 
 
 def fetch_single_trace(trace_id: str) -> dict | None:
