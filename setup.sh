@@ -42,6 +42,20 @@ else
         break
     done
 
+    # Prompt for scoring (LLM-as-a-Judge)
+    echo ""
+    echo "  ┌─────────────────────────────────────────────────────────────┐"
+    echo "  │  ⚠  LLM-as-a-Judge Scoring (eval-hook.py)                 │"
+    echo "  │                                                             │"
+    echo "  │  Scoring uses Claude Haiku to evaluate each conversation    │"
+    echo "  │  turn. This incurs additional API costs (~\$0.001/turn).    │"
+    echo "  │  You can enable it later by running:                        │"
+    echo "  │    python3 eval-hook.py --score                             │"
+    echo "  └─────────────────────────────────────────────────────────────┘"
+    echo ""
+    read -rp "  Enable LLM-as-a-Judge scoring? [y/N]: " ENABLE_SCORING
+    ENABLE_SCORING="${ENABLE_SCORING:-n}"
+
     echo ""
     echo "[gen]  Generating .env with random secrets..."
 
@@ -100,6 +114,9 @@ LANGFUSE_INIT_PROJECT_SECRET_KEY=__PROJECT_SK__
 LANGFUSE_INIT_USER_EMAIL=__ADMIN_EMAIL__
 LANGFUSE_INIT_USER_NAME=__ADMIN_NAME__
 LANGFUSE_INIT_USER_PASSWORD=__ADMIN_PASSWORD__
+
+# === Scoring (LLM-as-a-Judge) ===
+ENABLE_SCORING=__ENABLE_SCORING__
 ENVEOF
 
     # Substitute placeholders (hex-only values are safe for sed; password uses different delimiter)
@@ -115,6 +132,7 @@ ENVEOF
     sed -i "s|__ADMIN_EMAIL__|$ADMIN_EMAIL|g" "$ENV_FILE"
     sed -i "s|__ADMIN_NAME__|$ADMIN_NAME|g" "$ENV_FILE"
     sed -i "s|__ADMIN_PASSWORD__|$ADMIN_PASSWORD_ESCAPED|g" "$ENV_FILE"
+    sed -i "s|__ENABLE_SCORING__|$ENABLE_SCORING|g" "$ENV_FILE"
 
     echo "       Done."
     echo "       Login:       $ADMIN_EMAIL"
@@ -154,6 +172,11 @@ echo ""
 mkdir -p "$HOME/.claude"
 
 HOOK_CMD="LANGFUSE_PUBLIC_KEY=$PROJECT_PK LANGFUSE_SECRET_KEY=$PROJECT_SK python3 $HOOK_SCRIPT"
+EVAL_SCRIPT="$SCRIPT_DIR/eval-hook.py"
+EVAL_HOOK_CMD="LANGFUSE_PUBLIC_KEY=$PROJECT_PK LANGFUSE_SECRET_KEY=$PROJECT_SK python3 $EVAL_SCRIPT --score"
+
+# Read scoring preference from .env (set during initial setup)
+ENABLE_SCORING=$(grep '^ENABLE_SCORING=' "$ENV_FILE" 2>/dev/null | cut -d= -f2 || echo "n")
 
 if [ -f "$CLAUDE_SETTINGS" ]; then
     if grep -q "langfuse-hook.py" "$CLAUDE_SETTINGS" 2>/dev/null; then
@@ -162,12 +185,23 @@ if [ -f "$CLAUDE_SETTINGS" ]; then
         cp "$CLAUDE_SETTINGS" "$BACKUP"
         python3 -c "
 import json, sys
+enable_scoring = '''$ENABLE_SCORING'''.strip().lower().startswith('y')
 with open('$CLAUDE_SETTINGS') as f:
     settings = json.load(f)
 for hook_group in settings.get('hooks', {}).get('Stop', []):
-    for hook in hook_group.get('hooks', []):
+    hooks = hook_group.get('hooks', [])
+    for hook in hooks:
         if 'langfuse-hook.py' in hook.get('command', ''):
             hook['command'] = '''$HOOK_CMD'''
+        if 'eval-hook.py' in hook.get('command', ''):
+            hook['command'] = '''$EVAL_HOOK_CMD'''
+    # Add eval hook if scoring enabled and not already present
+    has_eval = any('eval-hook.py' in h.get('command', '') for h in hooks)
+    if enable_scoring and not has_eval:
+        hooks.append({'type': 'command', 'command': '''$EVAL_HOOK_CMD'''})
+    # Remove eval hook if scoring disabled
+    if not enable_scoring and has_eval:
+        hook_group['hooks'] = [h for h in hooks if 'eval-hook.py' not in h.get('command', '')]
 with open('$CLAUDE_SETTINGS', 'w') as f:
     json.dump(settings, f, indent=2)
     f.write('\n')
@@ -194,7 +228,30 @@ with open('$CLAUDE_SETTINGS', 'w') as f:
     fi
 else
     echo "[hook] Creating $CLAUDE_SETTINGS with Stop hook..."
-    cat > "$CLAUDE_SETTINGS" <<SETTINGS
+    if [[ "$ENABLE_SCORING" =~ ^[Yy] ]]; then
+        cat > "$CLAUDE_SETTINGS" <<SETTINGS
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$HOOK_CMD"
+          },
+          {
+            "type": "command",
+            "command": "$EVAL_HOOK_CMD"
+          }
+        ]
+      }
+    ]
+  }
+}
+SETTINGS
+        echo "       Created with Stop hook + scoring hook."
+    else
+        cat > "$CLAUDE_SETTINGS" <<SETTINGS
 {
   "hooks": {
     "Stop": [
@@ -210,7 +267,8 @@ else
   }
 }
 SETTINGS
-    echo "       Created with Stop hook."
+        echo "       Created with Stop hook (scoring disabled)."
+    fi
 fi
 
 echo ""
@@ -219,5 +277,11 @@ echo ""
 echo "  Dashboard:  http://localhost:3000"
 echo "  Login:      $ADMIN_EMAIL_DISPLAY"
 echo "  Hook log:   ~/.claude/langfuse-hook.log"
+if [[ "$ENABLE_SCORING" =~ ^[Yy] ]]; then
+    echo "  Scoring:    ENABLED (LLM-as-a-Judge via eval-hook.py)"
+    echo "  Eval log:   ~/.claude/langfuse-eval.log"
+else
+    echo "  Scoring:    DISABLED (enable later: python3 eval-hook.py --score)"
+fi
 echo ""
 echo "Start a Claude Code conversation — traces will appear automatically."
