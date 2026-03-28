@@ -52,10 +52,13 @@ All services bound to `127.0.0.1` only. API key never leaves the machine.
 
 ```
 langfuse-hook.py      # Core hook script (~700 lines) - parses transcripts, sends to Langfuse
+eval-hook.py          # LLM-as-a-Judge evaluator (~250 lines) - evaluates traces via claude CLI
 docker-compose.yml    # Full Langfuse stack (6 services)
 setup.sh              # One-command setup (generates .env, starts services, configures hook)
 .env.example          # Template for environment variables
 .env                  # Generated secrets (gitignored)
+tests/                # Test suite
+  test_eval_hook.py   # Unit tests for eval-hook.py
 ```
 
 ## Code Conventions
@@ -133,3 +136,46 @@ The `input + output` count in the Langfuse UI can be misleadingly small. Always 
 - First Langfuse login may need incognito window (stale CSRF tokens)
 - `setup.sh` backs up existing `~/.claude/settings.json` before modifying hooks
 - All ports are localhost-only by design - do not expose to network
+
+## LLM-as-a-Judge Evaluator (Phase 2)
+
+`eval-hook.py` evaluates trace quality using `claude` CLI with Haiku (Pro subscription).
+
+### Scores
+
+| Score | Type | Values |
+|-------|------|--------|
+| `task_completion` | Categorical | completed, partial, failed |
+| `tool_appropriateness` | Categorical | appropriate, questionable, inappropriate |
+| `code_quality` | Numeric | 0.0–1.0 (null if no code) |
+| `response_quality` | Numeric | 0.0–1.0 |
+
+### Usage
+
+```bash
+# Evaluate all unscored traces
+PK=$(grep '^LANGFUSE_INIT_PROJECT_PUBLIC_KEY=' .env | cut -d= -f2)
+SK=$(grep '^LANGFUSE_INIT_PROJECT_SECRET_KEY=' .env | cut -d= -f2)
+LANGFUSE_PUBLIC_KEY=$PK LANGFUSE_SECRET_KEY=$SK python3 eval-hook.py
+
+# Dry run (print scores, don't post)
+LANGFUSE_PUBLIC_KEY=$PK LANGFUSE_SECRET_KEY=$SK python3 eval-hook.py --dry-run --limit 5
+
+# Evaluate a single trace
+LANGFUSE_PUBLIC_KEY=$PK LANGFUSE_SECRET_KEY=$SK python3 eval-hook.py --trace trace-xxx
+
+# Re-evaluate all traces
+LANGFUSE_PUBLIC_KEY=$PK LANGFUSE_SECRET_KEY=$SK python3 eval-hook.py --rescore
+
+# Cron (every 30 min, max 20 traces)
+*/30 * * * * LANGFUSE_PUBLIC_KEY=pk-xxx LANGFUSE_SECRET_KEY=sk-xxx python3 /path/to/eval-hook.py --limit 20 >> ~/.claude/langfuse-eval.log 2>&1
+```
+
+### Configuration
+
+- `EVAL_DELAY_SECONDS = 1` — delay between CLI calls (top of `eval-hook.py`)
+- `CLI_TIMEOUT_SECONDS = 30` — max wait per CLI call
+- State files: `~/.claude/langfuse-state/eval/<trace-id>.scored`
+- Log: `~/.claude/langfuse-eval.log` (auto-rotates at 10 MB)
+
+Scores appear on traces in the Langfuse dashboard — filter, trend, and aggregate from there.
