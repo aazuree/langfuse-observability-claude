@@ -26,7 +26,7 @@ LANGFUSE_PUBLIC_KEY=$PK LANGFUSE_SECRET_KEY=$SK python3 langfuse-hook.py --repro
 
 - **Dashboard**: http://localhost:3000
 - **Hook log**: `~/.claude/langfuse-hook.log` (auto-rotates at 10 MB)
-- **State files**: `~/.claude/langfuse-state/<session_id>.offset`
+- **State files**: `~/.claude/langfuse-state/<session_id>.offset` (parent), `<session_id>.subagents.json` (subagents)
 
 ## Architecture
 
@@ -59,6 +59,17 @@ setup.sh              # One-command setup (generates .env, starts services, conf
 .env                  # Generated secrets (gitignored)
 tests/                # Test suite
   test_eval_hook.py   # Unit tests for eval-hook.py
+  test_subagent_tracking.py  # Unit tests for subagent cost tracking
+```
+
+## Running Tests
+
+Use `uv` to run tests (handles virtualenv and dependency resolution automatically):
+
+```bash
+uv run pytest tests/ -v              # Run all tests
+uv run pytest tests/test_subagent_tracking.py -v  # Run specific test file
+uv run pytest tests/ -k "discover" -v  # Run tests matching pattern
 ```
 
 ## Code Conventions
@@ -128,6 +139,35 @@ cache_create:  545K tokens     $10.22  (27%)
 ```
 
 The `input + output` count in the Langfuse UI can be misleadingly small. Always check `cache_read_input_tokens` in `usageDetails` for the real volume.
+
+## Subagent Cost Tracking
+
+When Claude Code spawns subagents via the Agent tool, the hook automatically discovers and ingests their transcripts as nested observations under the parent trace.
+
+**How it works:**
+1. Hook detects `Agent` tool_use events in parent assistant messages
+2. Discovers matching subagent transcripts at `<session>/subagents/agent-{id}.jsonl`
+3. Correlates by timestamp proximity (within `SUBAGENT_MATCH_WINDOW_S = 60` seconds)
+4. Ingests subagent turns as generations nested under the Agent tool span
+5. Rolls up per-subagent and total harness cost in trace metadata
+
+**Langfuse hierarchy:**
+```
+Trace (parent session)
+├── Generation (parent turn)
+│   └── Span (Agent tool call)
+│       ├── Generation (subagent turn 1)
+│       │   └── Span (Read tool)
+│       └── Generation (subagent turn 2)
+│           └── Span (Bash tool)
+└── [metadata: subagent_costs summary]
+```
+
+**Exclusions:** `aside_question` subagents are skipped (internal sidechain queries).
+
+**State:** Subagent offsets stored in `~/.claude/langfuse-state/<session_id>.subagents.json` (separate from parent `.offset` for rollback safety).
+
+**Tags:** Traces with subagents get `has-subagents` and `subagents:{count}` tags for dashboard filtering.
 
 ## Important Notes
 

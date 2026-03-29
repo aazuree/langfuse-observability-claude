@@ -40,6 +40,8 @@ MAX_LOG_BYTES = 10 * 1024 * 1024  # 10 MB
 
 SAFE_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
+SUBAGENT_MATCH_WINDOW_S = 60  # Max seconds between Agent tool_use and subagent start
+
 # Patterns to redact from text before sending to Langfuse
 SECRET_PATTERNS = [
     re.compile(r"(?i)(api[_-]?key|apikey|secret[_-]?key|access[_-]?key|token|password|passwd|credential|auth)[\s]*[=:]\s*['\"]?([^\s'\"]{8,})['\"]?"),
@@ -123,6 +125,262 @@ def save_state(session_id: str, offset: int) -> None:
     Path(STATE_DIR).mkdir(parents=True, exist_ok=True)
     state_file = os.path.join(STATE_DIR, f"{session_id}.offset")
     Path(state_file).write_text(str(offset))
+
+
+def load_subagent_state(session_id: str) -> dict:
+    """Load subagent processing state. Returns {} if no state exists."""
+    Path(STATE_DIR).mkdir(parents=True, exist_ok=True)
+    state_file = os.path.join(STATE_DIR, f"{session_id}.subagents.json")
+    try:
+        return json.loads(Path(state_file).read_text())
+    except Exception:
+        return {}
+
+
+def save_subagent_state(session_id: str, state: dict) -> None:
+    """Save subagent processing state."""
+    Path(STATE_DIR).mkdir(parents=True, exist_ok=True)
+    state_file = os.path.join(STATE_DIR, f"{session_id}.subagents.json")
+    Path(state_file).write_text(json.dumps(state))
+
+
+def discover_subagents(
+    transcript_path: str,
+    agent_tool_uses: list,
+) -> list:
+    """Match Agent tool_uses to subagent transcripts by timestamp proximity.
+
+    Args:
+        transcript_path: Path to parent session JSONL (e.g., .../session.jsonl)
+        agent_tool_uses: List of (description, subagent_type, timestamp, content_index)
+
+    Returns:
+        List of (agent_id, subagent_transcript_path, description, subagent_type, tool_use_content_index)
+        Unmatched entries are omitted.
+    """
+    if not agent_tool_uses:
+        return []
+
+    # Derive subagents directory: <transcript without .jsonl>/subagents/
+    base = transcript_path
+    if base.endswith(".jsonl"):
+        base = base[:-6]
+    subagents_dir = os.path.join(base, "subagents")
+
+    if not os.path.isdir(subagents_dir):
+        return []
+
+    # List candidate subagent JSONL files, excluding aside_question
+    candidates = []
+    for fname in os.listdir(subagents_dir):
+        if not fname.startswith("agent-") or not fname.endswith(".jsonl"):
+            continue
+        if fname.startswith("agent-aside_question-"):
+            continue
+        agent_id = fname[len("agent-"):-len(".jsonl")]
+        jsonl_path = os.path.join(subagents_dir, fname)
+
+        # Read first entry timestamp
+        first_ts = None
+        try:
+            with open(jsonl_path) as f:
+                first_line = f.readline().strip()
+                if first_line:
+                    entry = json.loads(first_line)
+                    first_ts = parse_ts(entry.get("timestamp", ""))
+        except Exception:
+            continue
+
+        if first_ts is None:
+            continue
+
+        candidates.append((agent_id, jsonl_path, first_ts))
+
+    if not candidates:
+        return []
+
+    # Sort candidates by start timestamp
+    candidates.sort(key=lambda c: c[2])
+
+    # Sort tool_uses by content_index to preserve dispatch order
+    sorted_tool_uses = sorted(agent_tool_uses, key=lambda t: t[3])
+
+    # Match 1:1 in order: first tool_use gets earliest unmatched subagent
+    matched = []
+    used_candidates = set()
+
+    for desc, sa_type, tu_ts_str, content_idx in sorted_tool_uses:
+        tu_ts = parse_ts(tu_ts_str)
+        if tu_ts is None:
+            continue
+
+        best = None
+        best_diff = None
+        for i, (agent_id, jsonl_path, sa_ts) in enumerate(candidates):
+            if i in used_candidates:
+                continue
+            diff = (sa_ts - tu_ts).total_seconds()
+            if diff < -1:  # Allow 1s clock skew
+                continue
+            if abs(diff) > SUBAGENT_MATCH_WINDOW_S:
+                continue
+            if best_diff is None or diff < best_diff:
+                best = i
+                best_diff = diff
+
+        if best is not None:
+            agent_id, jsonl_path, _ = candidates[best]
+            used_candidates.add(best)
+
+            # Log meta.json info for debugging (not required for matching)
+            meta_path = os.path.join(subagents_dir, f"agent-{agent_id}.meta.json")
+            try:
+                meta = json.loads(Path(meta_path).read_text())
+                meta_desc = meta.get("description", "")
+                meta_type = meta.get("agentType", "")
+                if meta_desc and meta_desc != desc:
+                    log(f"Subagent {agent_id}: meta description '{meta_desc}' != tool_use '{desc}'")
+                log(f"Matched subagent {agent_id} (meta: type={meta_type}, desc={meta_desc})")
+            except Exception:
+                log(f"Matched subagent {agent_id} (no .meta.json)")
+
+            matched.append((agent_id, jsonl_path, desc, sa_type, content_idx))
+
+    return matched
+
+
+def ingest_subagent(
+    agent_id: str,
+    transcript_path: str,
+    parent_span_id: str,
+    trace_id: str,
+    session_id: str,
+    subagent_offset: int,
+    prior_turn_count: int = 0,
+) -> tuple:
+    """Parse a subagent transcript and build Langfuse events.
+
+    Returns: (events, cost_summary, new_offset, new_turn_count, status)
+    """
+    empty_cost = {"agent_id": agent_id, "total_cost": 0, "total_tokens": 0,
+                  "turns": 0, "status": "partial",
+                  "cost_breakdown": {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0}}
+
+    entries, total_lines = parse_transcript(transcript_path, skip_lines=subagent_offset)
+    if not entries:
+        return [], empty_cost, total_lines, prior_turn_count, "partial"
+
+    turns = build_turns(entries)
+    if not turns:
+        return [], empty_cost, total_lines, prior_turn_count, "partial"
+
+    # Determine completeness from last entry
+    status = "partial"
+    for entry in reversed(entries):
+        if entry.get("stop_reason") == "end_turn":
+            status = "complete"
+            break
+        if entry.get("type") == "assistant":
+            break
+
+    now = datetime.now(timezone.utc).isoformat()
+    events = []
+    total_cost = 0.0
+    total_tokens = 0
+    cost_breakdown = {"input": 0.0, "output": 0.0, "cache_read": 0.0, "cache_creation": 0.0}
+
+    for turn_idx, turn in enumerate(turns):
+        gen_id = f"gen-subagent-{agent_id}-{prior_turn_count + turn_idx}"
+        start_time = turn["start_time"]
+        end_time = turn["end_time"]
+        usage = turn["usage"]
+        model = turn.get("model", "claude-sonnet-4-6") or "claude-sonnet-4-6"
+
+        turn_cost, input_cost, output_cost, cost_details = calculate_turn_cost(usage, model)
+
+        total_cost += turn_cost
+        total_tokens += usage["total"]
+        if cost_details:
+            cost_breakdown["input"] += cost_details.get("input", 0)
+            cost_breakdown["output"] += cost_details.get("output", 0)
+            cost_breakdown["cache_read"] += cost_details.get("cache_read_input_tokens", 0)
+            cost_breakdown["cache_creation"] += cost_details.get("cache_creation_input_tokens", 0)
+
+        usage_details = {
+            "input": usage["input"], "output": usage["output"], "total": usage["total"],
+            "cache_read_input_tokens": usage["cache_read"],
+            "cache_creation_input_tokens": usage["cache_creation"],
+        }
+
+        events.append({
+            "id": f"evt-{gen_id}",
+            "timestamp": start_time or now,
+            "type": "generation-create",
+            "body": {
+                "id": gen_id,
+                "traceId": trace_id,
+                "parentObservationId": parent_span_id,
+                "name": f"Subagent Turn {turn_idx + 1}: {redact_secrets(truncate(turn['user_input'], 80))}",
+                "model": model,
+                "input": redact_secrets(truncate(turn["user_input"], MAX_TEXT)) or None,
+                "output": redact_secrets(truncate(turn["assistant_output"], MAX_TEXT)) or None,
+                "startTime": start_time,
+                "endTime": end_time,
+                "usageDetails": usage_details,
+                "costDetails": cost_details if cost_details else None,
+                "metadata": {
+                    "subagent_id": agent_id,
+                    "tools_used": [tc["name"] for tc in turn["tool_calls"]],
+                    "tool_count": len(turn["tool_calls"]),
+                },
+            },
+        })
+
+        for tc_idx, tc in enumerate(turn["tool_calls"]):
+            span_id = f"span-subagent-{agent_id}-{prior_turn_count + turn_idx}-{tc_idx}"
+            tool_input = tc["input"]
+            tool_input_str = json.dumps(tool_input) if not isinstance(tool_input, str) else tool_input
+            tool_input_str = redact_secrets(tool_input_str)
+            if len(tool_input_str) > MAX_TOOL_IO:
+                tool_input = {"_truncated": True, "preview": tool_input_str[:MAX_TOOL_IO]}
+            else:
+                try:
+                    tool_input = json.loads(tool_input_str)
+                except (json.JSONDecodeError, TypeError):
+                    tool_input = tool_input_str
+            tool_output = redact_secrets(tc["output"])
+            if len(tool_output) > MAX_TOOL_IO:
+                tool_output = tool_output[:MAX_TOOL_IO] + "...[truncated]"
+            span_start = tc.get("start_time", start_time)
+            span_end = tc.get("end_time", span_start)
+
+            events.append({
+                "id": f"evt-{span_id}",
+                "timestamp": span_start or now,
+                "type": "span-create",
+                "body": {
+                    "id": span_id,
+                    "traceId": trace_id,
+                    "parentObservationId": gen_id,
+                    "name": tc["name"],
+                    "startTime": span_start,
+                    "endTime": span_end,
+                    "input": tool_input,
+                    "output": tool_output or None,
+                    "metadata": {"tool_use_id": tc["id"], "subagent_id": agent_id},
+                },
+            })
+
+    new_turn_count = prior_turn_count + len(turns)
+    cost_summary = {
+        "agent_id": agent_id,
+        "total_cost": round(total_cost, 6),
+        "total_tokens": total_tokens,
+        "turns": new_turn_count,
+        "status": status,
+        "cost_breakdown": {k: round(v, 6) for k, v in cost_breakdown.items()},
+    }
+    return events, cost_summary, total_lines, new_turn_count, status
 
 
 def extract_slug(transcript_path: str) -> str:
@@ -431,6 +689,40 @@ def extract_cwd(transcript_path: str) -> str:
     return ""
 
 
+def calculate_turn_cost(usage: dict, model: str) -> tuple:
+    """Calculate cost for a turn's token usage.
+
+    Returns: (turn_cost, input_cost, output_cost, cost_details)
+    """
+    if not REPORT_API_EQUIVALENT_COST:
+        return 0.0, 0.0, 0.0, {}
+
+    m = model.lower()
+    if "haiku" in m:
+        p_in, p_out, p_cr, p_cc = 0.80, 4.00, 0.08, 1.00
+    elif "opus" in m:
+        p_in, p_out, p_cr, p_cc = 15.0, 75.0, 1.50, 18.75
+    else:
+        p_in, p_out, p_cr, p_cc = 3.0, 15.0, 0.30, 3.75
+
+    input_cost = (
+        usage["input"] * p_in / 1_000_000
+        + usage["cache_read"] * p_cr / 1_000_000
+        + usage["cache_creation"] * p_cc / 1_000_000
+    )
+    output_cost = usage["output"] * p_out / 1_000_000
+    turn_cost = input_cost + output_cost
+
+    cost_details = {
+        "input": usage["input"] * p_in / 1_000_000,
+        "output": output_cost,
+        "cache_read_input_tokens": usage["cache_read"] * p_cr / 1_000_000,
+        "cache_creation_input_tokens": usage["cache_creation"] * p_cc / 1_000_000,
+        "total": turn_cost,
+    }
+    return turn_cost, input_cost, output_cost, cost_details
+
+
 def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
     """Core processing logic for a single session transcript."""
     prev_offset = load_state(session_id)
@@ -474,6 +766,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
     total_output = sum(t["usage"]["output"] for t in turns)
     total_tool_calls = sum(len(t["tool_calls"]) for t in turns)
     total_cost = 0.0
+    subagent_cost_summaries = []
 
     first_user_input = turns[0]["user_input"] if turns else ""
     last_assistant_output = ""
@@ -549,27 +842,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
                 end_time = computed_end.isoformat()
 
         # Cost: $0 for Pro subscription
-        turn_cost = 0.0
-        input_cost = 0.0
-        output_cost = 0.0
-        if REPORT_API_EQUIVALENT_COST:
-            # Anthropic API equivalent rates ($ per token)
-            # Select pricing tier based on model name
-            m = model.lower()
-            if "haiku" in m:
-                p_in, p_out, p_cr, p_cc = 0.80, 4.00, 0.08, 1.00
-            elif "opus" in m:
-                p_in, p_out, p_cr, p_cc = 15.0, 75.0, 1.50, 18.75
-            else:
-                # Sonnet (default for all sonnet variants)
-                p_in, p_out, p_cr, p_cc = 3.0, 15.0, 0.30, 3.75
-            input_cost = (
-                usage["input"] * p_in / 1_000_000
-                + usage["cache_read"] * p_cr / 1_000_000
-                + usage["cache_creation"] * p_cc / 1_000_000
-            )
-            output_cost = usage["output"] * p_out / 1_000_000
-            turn_cost = input_cost + output_cost
+        turn_cost, input_cost, output_cost, cost_details = calculate_turn_cost(usage, model)
         total_cost += turn_cost
 
         usage_details = {
@@ -579,16 +852,6 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
             "cache_read_input_tokens": usage["cache_read"],
             "cache_creation_input_tokens": usage["cache_creation"],
         }
-
-        cost_details = {}
-        if REPORT_API_EQUIVALENT_COST:
-            cost_details = {
-                "input": usage["input"] * p_in / 1_000_000,
-                "output": output_cost,
-                "cache_read_input_tokens": usage["cache_read"] * p_cr / 1_000_000,
-                "cache_creation_input_tokens": usage["cache_creation"] * p_cc / 1_000_000,
-                "total": turn_cost,
-            }
 
         gen_body = {
             "id": gen_id,
@@ -622,6 +885,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
         })
 
         # 3. Span per tool call
+        agent_tool_uses_this_turn = []
         for tc_idx, tc in enumerate(turn["tool_calls"]):
             span_id = f"span-{turn_id}-{tc_idx}"
 
@@ -661,6 +925,72 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
                     },
                 },
             })
+
+            # Track Agent tool_uses for subagent correlation
+            if tc["name"] == "Agent":
+                tc_input = tc.get("input", {})
+                if isinstance(tc_input, dict):
+                    agent_tool_uses_this_turn.append((
+                        tc_input.get("description", "unknown"),
+                        tc_input.get("subagent_type", "unknown"),
+                        tc.get("start_time", start_time),
+                        tc_idx,
+                    ))
+
+        # Discover and ingest subagents for this turn
+        if agent_tool_uses_this_turn:
+            sa_state = load_subagent_state(session_id)
+            matches = discover_subagents(transcript_path, agent_tool_uses_this_turn)
+            for sa_id, sa_path, sa_desc, sa_type, sa_tc_idx in matches:
+                sa_prev_offset = sa_state.get(sa_id, {}).get("offset", 0)
+                sa_prior_turns = sa_state.get(sa_id, {}).get("turn_count", 0)
+                sa_parent_span = f"span-{turn_id}-{sa_tc_idx}"
+
+                sa_events, sa_cost, sa_new_offset, sa_new_tc, sa_status = ingest_subagent(
+                    agent_id=sa_id,
+                    transcript_path=sa_path,
+                    parent_span_id=sa_parent_span,
+                    trace_id=trace_id,
+                    session_id=session_id,
+                    subagent_offset=sa_prev_offset,
+                    prior_turn_count=sa_prior_turns,
+                )
+                batch.extend(sa_events)
+                sa_state[sa_id] = {"offset": sa_new_offset, "turn_count": sa_new_tc, "status": sa_status}
+
+                # Enrich Agent tool span metadata
+                for evt in batch:
+                    if evt["type"] == "span-create" and evt["body"]["id"] == sa_parent_span:
+                        evt["body"].setdefault("metadata", {}).update({
+                            "subagent_id": sa_id,
+                            "subagent_type": sa_type,
+                            "subagent_description": sa_desc,
+                            "subagent_cost": sa_cost["total_cost"],
+                            "subagent_tokens": sa_cost["total_tokens"],
+                            "subagent_status": sa_status,
+                        })
+                        break
+
+                subagent_cost_summaries.append({
+                    **sa_cost, "description": sa_desc, "subagent_type": sa_type,
+                })
+
+            save_subagent_state(session_id, sa_state)
+
+    # Add subagent cost summary to trace
+    if subagent_cost_summaries:
+        total_subagent_cost = sum(s["total_cost"] for s in subagent_cost_summaries)
+        for evt in batch:
+            if evt["type"] == "trace-create":
+                evt["body"]["metadata"]["subagent_costs"] = {
+                    "agents": subagent_cost_summaries,
+                    "total_subagent_cost": round(total_subagent_cost, 6),
+                    "parent_cost": round(total_cost, 6),
+                    "harness_total_cost": round(total_cost + total_subagent_cost, 6),
+                }
+                evt["body"]["tags"].append("has-subagents")
+                evt["body"]["tags"].append(f"subagents:{len(subagent_cost_summaries)}")
+                break
 
     send_to_langfuse(batch)
     save_state(session_id, total_lines)
@@ -715,6 +1045,9 @@ def reprocess_all() -> None:
         state_file = Path(STATE_DIR) / f"{session_id}.offset"
         if state_file.exists():
             state_file.unlink()
+        sa_state_file = Path(STATE_DIR) / f"{session_id}.subagents.json"
+        if sa_state_file.exists():
+            sa_state_file.unlink()
 
         label = f"{session_id}"
         if slug:
