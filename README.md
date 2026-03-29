@@ -8,11 +8,14 @@ Self-hosted Langfuse that captures every Claude Code interaction via the `Stop` 
 |------|---------------|
 | User prompts & assistant responses | Generation (per turn) |
 | Tool calls (Bash, Read, Edit, Write, Grep...) | Span (with input + output) |
+| Subagent invocations (Agent tool) | Nested generations + spans |
 | Token usage (input/output/cache read/cache write) | Generation usage |
 | Latency (per turn, per tool call) | startTime/endTime |
 | Time to first token | completionStartTime |
-| Cost estimate (Anthropic API equivalent rates) | totalCost |
+| Cost estimate (Anthropic API equivalent rates) | costDetails |
+| Per-subagent and total harness cost | Trace metadata |
 | Session grouping | Trace per session |
+| LLM-as-a-Judge evaluation | Scores (per observation) |
 
 ## Quick Start
 
@@ -63,9 +66,13 @@ langfuse-hook.py  ──POST──>  Langfuse API (localhost:3000)
 langfuse-observability/
 ├── docker-compose.yml     # Langfuse stack (6 services)
 ├── langfuse-hook.py       # Stop hook: transcript -> Langfuse ingestion
+├── eval-hook.py           # LLM-as-a-Judge evaluator (optional scoring)
 ├── setup.sh               # One-command setup (secrets, docker, hook config)
 ├── .env.example           # Template (safe to commit)
 ├── .env                   # Actual secrets (gitignored)
+├── tests/
+│   ├── test_eval_hook.py          # Unit tests for eval-hook
+│   └── test_subagent_tracking.py  # Unit tests for subagent cost tracking
 └── README.md
 ```
 
@@ -79,6 +86,7 @@ The hook script (`langfuse-hook.py`) is invoked by Claude Code after each assist
 4. **Token deduplication** — assistant messages with the same `message.id` are streaming updates; takes the last for final usage
 5. **Timing** — uses message timestamps for latency, `turn_duration` entries for total turn time, first assistant timestamp for TTFT
 6. **Cost** — computes equivalent Anthropic API cost from token counts (configurable via `REPORT_API_EQUIVALENT_COST` flag)
+7. **Subagent tracking** — discovers subagent transcripts (from Agent tool invocations) via timestamp correlation, ingests them as nested observations, and rolls up per-subagent cost in trace metadata
 
 ## Services
 
@@ -149,6 +157,35 @@ LANGFUSE_PUBLIC_KEY=$PK LANGFUSE_SECRET_KEY=$SK python3 langfuse-hook.py --repro
 ```
 
 This finds all transcript files, deletes any existing traces to avoid duplicates, and re-ingests everything from scratch.
+
+## Subagent Cost Tracking
+
+When Claude Code spawns subagents via the Agent tool, the hook automatically discovers their transcripts at `<session>/subagents/agent-{id}.jsonl`, correlates them by timestamp, and ingests them as nested generations/spans under the parent Agent tool span.
+
+Traces with subagents get `has-subagents` and `subagents:{count}` tags, and trace metadata includes a `subagent_costs` summary with per-agent cost breakdowns and total harness cost.
+
+## LLM-as-a-Judge Evaluation
+
+`eval-hook.py` scores each generation using Claude CLI (Haiku tier). Runs on-demand, not as part of the Stop hook:
+
+```bash
+PK=$(grep '^LANGFUSE_INIT_PROJECT_PUBLIC_KEY=' .env | cut -d= -f2)
+SK=$(grep '^LANGFUSE_INIT_PROJECT_SECRET_KEY=' .env | cut -d= -f2)
+
+# List unscored traces (safe, no LLM calls)
+LANGFUSE_PUBLIC_KEY=$PK LANGFUSE_SECRET_KEY=$SK python3 eval-hook.py
+
+# Score all unscored turns
+LANGFUSE_PUBLIC_KEY=$PK LANGFUSE_SECRET_KEY=$SK python3 eval-hook.py --score
+```
+
+Scores: `task_completion` (categorical) and `response_quality` (0.0-1.0), linked to individual observations.
+
+## Running Tests
+
+```bash
+uv run pytest tests/ -v
+```
 
 ## Cost Estimation
 
