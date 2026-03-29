@@ -3,6 +3,11 @@
 Self-hosted observability that captures Claude Code CLI interactions via the `Stop` hook.
 Sends prompts, responses, tool calls, tokens, latency, and cost to a local Langfuse instance.
 
+## Repository Rules
+
+- **No personal information in committed files.** Never include absolute paths containing usernames (e.g. `/home/<user>/...`), real email addresses, or other personally identifiable information in any file that will be committed. Use generic placeholders like `<REPO_ROOT>`, `/path/to/...`, or `~` instead.
+- **`docs/` is gitignored.** Plans and specs live locally only — never commit or track files under `docs/`.
+
 ## Quick Reference
 
 ```bash
