@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  file-checks:
+    name: File restrictions
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Block sensitive file extensions
+        run: |
+          BLOCKED_EXTENSIONS="\.key$|\.pem$|\.p12$|\.pfx$|\.jks$|\.sqlite$|\.sqlite3$|\.credentials$|\.secret$"
+          FOUND=$(git diff --name-only --diff-filter=ACM ${{ github.event_name == 'pull_request' && 'origin/main...HEAD' || 'HEAD~1..HEAD' }} | grep -iE "$BLOCKED_EXTENSIONS" || true)
+          if [ -n "$FOUND" ]; then
+            echo "::error::Sensitive files detected:"
+            echo "$FOUND"
+            exit 1
+          fi
+          echo "No sensitive files found."
+
+      - name: Check file sizes (max 5MB)
+        run: |
+          MAX_SIZE=5242880
+          LARGE=""
+          for f in $(git diff --name-only --diff-filter=ACM ${{ github.event_name == 'pull_request' && 'origin/main...HEAD' || 'HEAD~1..HEAD' }}); do
+            if [ -f "$f" ]; then
+              SIZE=$(stat --format=%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null)
+              if [ "$SIZE" -gt "$MAX_SIZE" ]; then
+                LARGE="$LARGE\n  $f ($(numfmt --to=iec $SIZE))"
+              fi
+            fi
+          done
+          if [ -n "$LARGE" ]; then
+            echo "::error::Files exceed 5MB limit:$LARGE"
+            exit 1
+          fi
+          echo "All files under 5MB."
+
+  tests:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Run tests
+        run: uv run pytest tests/ -v

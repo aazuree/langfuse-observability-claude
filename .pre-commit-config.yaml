@@ -1,0 +1,23 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: check-added-large-files
+        args: ['--maxkb=5120']
+      - id: detect-private-key
+      - id: check-merge-conflict
+      - id: check-yaml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+
+  - repo: local
+    hooks:
+      - id: block-sensitive-extensions
+        name: Block sensitive file extensions
+        entry: >-
+          bash -c 'for f in "$@"; do case "$f" in
+          *.env|*.key|*.pem|*.p12|*.pfx|*.sqlite|*.sqlite3|*.credentials|*.secret)
+          echo "BLOCKED: $f"; exit 1;; esac; done' --
+        language: system
+        always_run: true
+        pass_filenames: true

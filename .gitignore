@@ -3,3 +3,31 @@ __pycache__/
 .venv/
 .pytest_cache/
 docs/
+
+# Secrets and credentials
+*.key
+*.pem
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.credentials
+*.secret
+credentials.json
+service-account*.json
+
+# Databases
+*.sqlite
+*.sqlite3
+*.db
+
+# Large binary files
+*.zip
+*.tar.gz
+*.tgz
+*.rar
+*.7z
+
+# OS files
+.DS_Store
+Thumbs.db
