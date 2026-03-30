@@ -823,6 +823,66 @@ def classify_task_completed(turns: list[dict]) -> bool:
     return True
 
 
+def build_hook_score_events(
+    trace_id: str,
+    session_id: str,
+    prev_offset: int,
+    first_user_input: str,
+    turns: list[dict],
+) -> list[dict]:
+    """Build score-create events for the ingestion batch.
+
+    Returns 3 events: session_type (CATEGORICAL), token_efficiency (NUMERIC),
+    task_completed (BOOLEAN as int 0/1).
+    """
+    now = datetime.now(timezone.utc).isoformat()
+
+    session_type = classify_session_type(first_user_input)
+    token_eff = calculate_token_efficiency(turns)
+    completed = classify_task_completed(turns)
+
+    scores = [
+        {
+            "name": "session_type",
+            "dataType": "CATEGORICAL",
+            "value": session_type,
+        },
+        {
+            "name": "token_efficiency",
+            "dataType": "NUMERIC",
+            "value": token_eff,
+        },
+        {
+            "name": "task_completed",
+            "dataType": "BOOLEAN",
+            "value": 1 if completed else 0,
+        },
+    ]
+
+    events = []
+    for score in scores:
+        # Deterministic ID for idempotent re-ingestion
+        score_id = str(uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"{session_id}:{prev_offset}:score:{score['name']}",
+        ))
+        events.append({
+            "id": f"evt-{score_id}",
+            "timestamp": now,
+            "type": "score-create",
+            "body": {
+                "id": f"score-{score_id}",
+                "traceId": trace_id,
+                "name": score["name"],
+                "dataType": score["dataType"],
+                "value": score["value"],
+                "source": "API",
+            },
+        })
+
+    return events
+
+
 def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
     """Core processing logic for a single session transcript."""
     prev_offset = load_state(session_id)
@@ -1091,6 +1151,16 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
                 evt["body"]["tags"].append("has-subagents")
                 evt["body"]["tags"].append(f"subagents:{len(subagent_cost_summaries)}")
                 break
+
+    # Hook-level scores (trace-level)
+    score_events = build_hook_score_events(
+        trace_id=trace_id,
+        session_id=session_id,
+        prev_offset=prev_offset,
+        first_user_input=first_user_input,
+        turns=turns,
+    )
+    batch.extend(score_events)
 
     send_to_langfuse(batch)
     save_state(session_id, total_lines)

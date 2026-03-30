@@ -189,3 +189,87 @@ def test_task_completed_tool_error_not_last():
         },
     ]
     assert hook.classify_task_completed(turns) is True
+
+
+# --- build_hook_score_events ---
+
+def test_build_hook_score_events_returns_three_events():
+    """Should produce exactly 3 score-create events."""
+    events = hook.build_hook_score_events(
+        trace_id="trace-abc",
+        session_id="abc",
+        prev_offset=0,
+        first_user_input="fix the login bug",
+        turns=[{"usage": {"input": 100, "output": 200, "total": 300,
+                           "cache_read": 0, "cache_creation": 0},
+                "assistant_output": "Done, fixed the bug.",
+                "tool_calls": []}],
+    )
+    assert len(events) == 3
+    names = {e["body"]["name"] for e in events}
+    assert names == {"session_type", "token_efficiency", "task_completed"}
+
+
+def test_build_hook_score_events_types():
+    """Verify data types and values for each score."""
+    events = hook.build_hook_score_events(
+        trace_id="trace-xyz",
+        session_id="xyz",
+        prev_offset=0,
+        first_user_input="explain the auth module",
+        turns=[{"usage": {"input": 500, "output": 500, "total": 1000,
+                           "cache_read": 0, "cache_creation": 0},
+                "assistant_output": "The auth module works by...",
+                "tool_calls": []}],
+    )
+    by_name = {e["body"]["name"]: e for e in events}
+
+    # session_type
+    st = by_name["session_type"]
+    assert st["type"] == "score-create"
+    assert st["body"]["dataType"] == "CATEGORICAL"
+    assert st["body"]["value"] == "research"
+    assert st["body"]["traceId"] == "trace-xyz"
+
+    # token_efficiency
+    te = by_name["token_efficiency"]
+    assert te["body"]["dataType"] == "NUMERIC"
+    assert te["body"]["value"] == 0.5
+
+    # task_completed
+    tc = by_name["task_completed"]
+    assert tc["body"]["dataType"] == "BOOLEAN"
+    assert tc["body"]["value"] == 1  # True -> 1
+
+
+def test_build_hook_score_events_deterministic_ids():
+    """Same inputs should produce same event IDs (idempotent re-ingestion)."""
+    args = dict(
+        trace_id="trace-abc", session_id="abc", prev_offset=0,
+        first_user_input="hello",
+        turns=[{"usage": {"input": 0, "output": 100, "total": 100,
+                           "cache_read": 0, "cache_creation": 0},
+                "assistant_output": "Hi!",
+                "tool_calls": []}],
+    )
+    events_a = hook.build_hook_score_events(**args)
+    events_b = hook.build_hook_score_events(**args)
+    ids_a = [e["id"] for e in events_a]
+    ids_b = [e["id"] for e in events_b]
+    assert ids_a == ids_b
+
+
+def test_build_hook_score_events_task_completed_false():
+    """task_completed should be 0 (False) when last turn has failure."""
+    events = hook.build_hook_score_events(
+        trace_id="trace-fail",
+        session_id="fail",
+        prev_offset=0,
+        first_user_input="fix the bug",
+        turns=[{"usage": {"input": 100, "output": 100, "total": 200,
+                           "cache_read": 0, "cache_creation": 0},
+                "assistant_output": "I encountered an error and couldn't complete the task.",
+                "tool_calls": []}],
+    )
+    by_name = {e["body"]["name"]: e for e in events}
+    assert by_name["task_completed"]["body"]["value"] == 0  # False -> 0
