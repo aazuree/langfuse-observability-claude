@@ -723,6 +723,166 @@ def calculate_turn_cost(usage: dict, model: str) -> tuple:
     return turn_cost, input_cost, output_cost, cost_details
 
 
+# ---------------------------------------------------------------------------
+# Hook-level score classifiers
+# ---------------------------------------------------------------------------
+
+# Keyword lists for session_type classification (checked in priority order)
+_SESSION_TYPE_PATTERNS = [
+    ("bug-fix", re.compile(
+        r"\b(fix|bug|error|broken|issue|crash|fail|debug|troubleshoot|regression|fault|defect)\b",
+        re.IGNORECASE,
+    )),
+    ("refactor", re.compile(
+        r"\b(refactor|clean\s*up|rename|reorganize|restructure|migrate|move|split|extract|simplify|deduplicate)\b",
+        re.IGNORECASE,
+    )),
+    ("research", re.compile(
+        r"\b(explain|what\s+does|how\s+does|why\s+does|understand|read\b.*\b(and|then)\s+(summarize|explain)|summarize|find\s+where|show\s+me|look\s+at|search\s+for|what\s+is|where\s+is|tell\s+me\s+about)\b",
+        re.IGNORECASE,
+    )),
+    ("feature", re.compile(
+        r"\b(add|create|implement|build|write|make|generate|setup|set\s*up|introduce|design|develop|new)\b",
+        re.IGNORECASE,
+    )),
+]
+
+
+def classify_session_type(first_user_input: str) -> str:
+    """Classify a session based on the first user message.
+
+    Returns one of: bug-fix, feature, refactor, research, exploratory.
+    Patterns are checked in priority order (bug-fix > refactor > research > feature).
+    """
+    text = first_user_input.strip()
+    if not text:
+        return "exploratory"
+    for label, pattern in _SESSION_TYPE_PATTERNS:
+        if pattern.search(text):
+            return label
+    return "exploratory"
+
+
+def calculate_token_efficiency(turns: list[dict]) -> float:
+    """Calculate output-to-total token ratio across all turns.
+
+    Returns a float between 0.0 and 1.0 (rounded to 4 decimals).
+    Higher values mean more output relative to input/cache tokens.
+    """
+    total_output = 0
+    total_all = 0
+    for t in turns:
+        u = t["usage"]
+        total_output += u["output"]
+        total_all += u["output"] + u["input"] + u["cache_read"] + u["cache_creation"]
+    if total_all == 0:
+        return 0.0
+    return round(total_output / total_all, 4)
+
+
+_FAILURE_PATTERNS = re.compile(
+    r"\b(couldn't complete|failed to|unable to|error occurred|I encountered an error|"
+    r"I'm unable|I cannot|not able to complete|could not)\b",
+    re.IGNORECASE,
+)
+
+_QUESTION_PATTERNS = re.compile(
+    r"(could you clarify|can you (provide|clarify|explain)|what do you mean|what you mean|"
+    r"which (one|file|approach)|do you want me to|shall I|would you like me to)",
+    re.IGNORECASE,
+)
+
+
+def classify_task_completed(turns: list[dict]) -> bool:
+    """Heuristic: did the session likely complete its task?
+
+    Checks the last turn's assistant output and tool results for error/failure
+    signals. Returns True if the session appears to have finished successfully.
+    """
+    if not turns:
+        return True  # no turns = nothing to fail
+
+    last_turn = turns[-1]
+    last_output = last_turn.get("assistant_output", "")
+
+    # Check if last output indicates failure
+    if _FAILURE_PATTERNS.search(last_output):
+        return False
+
+    # Check if last output is asking a clarifying question (incomplete)
+    if _QUESTION_PATTERNS.search(last_output):
+        return False
+
+    # Check last turn's tool calls for errors
+    tool_calls = last_turn.get("tool_calls", [])
+    for tc in tool_calls:
+        output = tc.get("output", "")
+        if output.startswith("[ERROR]"):
+            return False
+
+    return True
+
+
+def build_hook_score_events(
+    trace_id: str,
+    session_id: str,
+    prev_offset: int,
+    first_user_input: str,
+    turns: list[dict],
+) -> list[dict]:
+    """Build score-create events for the ingestion batch.
+
+    Returns 3 events: session_type (CATEGORICAL), token_efficiency (NUMERIC),
+    task_completed (BOOLEAN as int 0/1).
+    """
+    now = datetime.now(timezone.utc).isoformat()
+
+    session_type = classify_session_type(first_user_input)
+    token_eff = calculate_token_efficiency(turns)
+    completed = classify_task_completed(turns)
+
+    scores = [
+        {
+            "name": "session_type",
+            "dataType": "CATEGORICAL",
+            "value": session_type,
+        },
+        {
+            "name": "token_efficiency",
+            "dataType": "NUMERIC",
+            "value": token_eff,
+        },
+        {
+            "name": "task_completed",
+            "dataType": "BOOLEAN",
+            "value": 1 if completed else 0,
+        },
+    ]
+
+    events = []
+    for score in scores:
+        # Deterministic ID for idempotent re-ingestion
+        score_id = str(uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"{session_id}:{prev_offset}:score:{score['name']}",
+        ))
+        events.append({
+            "id": f"evt-{score_id}",
+            "timestamp": now,
+            "type": "score-create",
+            "body": {
+                "id": f"score-{score_id}",
+                "traceId": trace_id,
+                "name": score["name"],
+                "dataType": score["dataType"],
+                "value": score["value"],
+                "source": "API",
+            },
+        })
+
+    return events
+
+
 def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
     """Core processing logic for a single session transcript."""
     prev_offset = load_state(session_id)
@@ -991,6 +1151,16 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
                 evt["body"]["tags"].append("has-subagents")
                 evt["body"]["tags"].append(f"subagents:{len(subagent_cost_summaries)}")
                 break
+
+    # Hook-level scores (trace-level)
+    score_events = build_hook_score_events(
+        trace_id=trace_id,
+        session_id=session_id,
+        prev_offset=prev_offset,
+        first_user_input=first_user_input,
+        turns=turns,
+    )
+    batch.extend(score_events)
 
     send_to_langfuse(batch)
     save_state(session_id, total_lines)

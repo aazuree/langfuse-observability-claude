@@ -242,3 +242,29 @@ LANGFUSE_PUBLIC_KEY=$PK LANGFUSE_SECRET_KEY=$SK python3 eval-hook.py --score --r
 (no LLM calls). Use for one-time migration of old scores.
 
 Scores appear on individual generations in the Langfuse dashboard — filter, trend, and aggregate from there.
+
+## Hook-Level Scores (Phase 1)
+
+Three heuristic scores are automatically attached to every trace during ingestion:
+
+| Score | Type | Values | Source |
+|-------|------|--------|--------|
+| `session_type` | Categorical | bug-fix, feature, refactor, research, exploratory | First user message keyword matching |
+| `token_efficiency` | Numeric | 0.0-1.0 | output_tokens / total_all_tokens |
+| `task_completed` | Boolean | true/false | Last turn error/question detection |
+
+These are deterministic (no LLM calls) and run on every Stop hook invocation.
+Scores use deterministic UUIDs so re-ingestion (`--reprocess`) updates rather than duplicates.
+
+### Classifier Details
+
+**`session_type`** — Priority order: bug-fix > refactor > research > feature > exploratory.
+Matches keyword patterns in the first user message. Fallback is `exploratory`.
+
+**`token_efficiency`** — `output_tokens / (output + input + cache_read + cache_creation)`.
+Low values indicate context-heavy sessions (lots of cache reads). High values indicate
+productive output sessions. Rounded to 4 decimal places.
+
+**`task_completed`** — Checks last turn for failure patterns ("couldn't complete",
+"encountered an error") and trailing clarifying questions. Also checks last turn's
+tool outputs for `[ERROR]` prefix. Returns `true` if no failure signals detected.
