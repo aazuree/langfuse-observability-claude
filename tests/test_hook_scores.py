@@ -62,3 +62,64 @@ def test_session_type_case_insensitive():
 def test_session_type_priority_bugfix_over_feature():
     """Bug-fix keywords should win when mixed with feature keywords."""
     assert hook.classify_session_type("add error handling to fix the crash") == "bug-fix"
+
+
+# --- calculate_token_efficiency ---
+
+def test_token_efficiency_balanced():
+    """50/50 input/output should give ~0.5."""
+    turns = [{"usage": {"input": 500, "output": 500, "total": 1000,
+                         "cache_read": 0, "cache_creation": 0}}]
+    result = hook.calculate_token_efficiency(turns)
+    assert result == 0.5
+
+
+def test_token_efficiency_heavy_cache():
+    """Sessions dominated by cache reads should score low."""
+    turns = [{"usage": {"input": 100, "output": 500, "total": 600,
+                         "cache_read": 50000, "cache_creation": 10000}}]
+    result = hook.calculate_token_efficiency(turns)
+    assert 0.0 < result < 0.02  # 500 / (500 + 100 + 50000 + 10000) ≈ 0.008
+
+
+def test_token_efficiency_output_only():
+    """All output tokens = max efficiency (1.0)."""
+    turns = [{"usage": {"input": 0, "output": 1000, "total": 1000,
+                         "cache_read": 0, "cache_creation": 0}}]
+    result = hook.calculate_token_efficiency(turns)
+    assert result == 1.0
+
+
+def test_token_efficiency_zero_tokens():
+    """No tokens at all should return 0.0 (avoid division by zero)."""
+    turns = [{"usage": {"input": 0, "output": 0, "total": 0,
+                         "cache_read": 0, "cache_creation": 0}}]
+    result = hook.calculate_token_efficiency(turns)
+    assert result == 0.0
+
+
+def test_token_efficiency_empty_turns():
+    """Empty turn list should return 0.0."""
+    result = hook.calculate_token_efficiency([])
+    assert result == 0.0
+
+
+def test_token_efficiency_multiple_turns():
+    """Should aggregate across all turns."""
+    turns = [
+        {"usage": {"input": 100, "output": 200, "total": 300,
+                    "cache_read": 0, "cache_creation": 0}},
+        {"usage": {"input": 100, "output": 300, "total": 400,
+                    "cache_read": 0, "cache_creation": 0}},
+    ]
+    result = hook.calculate_token_efficiency(turns)
+    # (200 + 300) / (200 + 300 + 100 + 100) = 500 / 700 = 0.714...
+    assert round(result, 2) == 0.71
+
+
+def test_token_efficiency_rounds_to_4_decimals():
+    """Result should be rounded to 4 decimal places."""
+    turns = [{"usage": {"input": 333, "output": 777, "total": 1110,
+                         "cache_read": 111, "cache_creation": 0}}]
+    result = hook.calculate_token_efficiency(turns)
+    assert result == round(result, 4)

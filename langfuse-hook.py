@@ -763,6 +763,23 @@ def classify_session_type(first_user_input: str) -> str:
     return "exploratory"
 
 
+def calculate_token_efficiency(turns: list[dict]) -> float:
+    """Calculate output-to-total token ratio across all turns.
+
+    Returns a float between 0.0 and 1.0 (rounded to 4 decimals).
+    Higher values mean more output relative to input/cache tokens.
+    """
+    total_output = 0
+    total_all = 0
+    for t in turns:
+        u = t["usage"]
+        total_output += u["output"]
+        total_all += u["output"] + u["input"] + u["cache_read"] + u["cache_creation"]
+    if total_all == 0:
+        return 0.0
+    return round(total_output / total_all, 4)
+
+
 def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
     """Core processing logic for a single session transcript."""
     prev_offset = load_state(session_id)
