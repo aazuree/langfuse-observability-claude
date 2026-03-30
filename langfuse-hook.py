@@ -723,6 +723,46 @@ def calculate_turn_cost(usage: dict, model: str) -> tuple:
     return turn_cost, input_cost, output_cost, cost_details
 
 
+# ---------------------------------------------------------------------------
+# Hook-level score classifiers
+# ---------------------------------------------------------------------------
+
+# Keyword lists for session_type classification (checked in priority order)
+_SESSION_TYPE_PATTERNS = [
+    ("bug-fix", re.compile(
+        r"\b(fix|bug|error|broken|issue|crash|fail|debug|troubleshoot|regression|fault|defect)\b",
+        re.IGNORECASE,
+    )),
+    ("refactor", re.compile(
+        r"\b(refactor|clean\s*up|rename|reorganize|restructure|migrate|move|split|extract|simplify|deduplicate)\b",
+        re.IGNORECASE,
+    )),
+    ("research", re.compile(
+        r"\b(explain|what\s+does|how\s+does|why\s+does|understand|read\b.*\b(and|then)\s+(summarize|explain)|summarize|find\s+where|show\s+me|look\s+at|search\s+for|what\s+is|where\s+is|tell\s+me\s+about)\b",
+        re.IGNORECASE,
+    )),
+    ("feature", re.compile(
+        r"\b(add|create|implement|build|write|make|generate|setup|set\s*up|introduce|design|develop|new)\b",
+        re.IGNORECASE,
+    )),
+]
+
+
+def classify_session_type(first_user_input: str) -> str:
+    """Classify a session based on the first user message.
+
+    Returns one of: bug-fix, feature, refactor, research, exploratory.
+    Patterns are checked in priority order (bug-fix > refactor > research > feature).
+    """
+    text = first_user_input.strip()
+    if not text:
+        return "exploratory"
+    for label, pattern in _SESSION_TYPE_PATTERNS:
+        if pattern.search(text):
+            return label
+    return "exploratory"
+
+
 def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
     """Core processing logic for a single session transcript."""
     prev_offset = load_state(session_id)
