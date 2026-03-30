@@ -780,6 +780,49 @@ def calculate_token_efficiency(turns: list[dict]) -> float:
     return round(total_output / total_all, 4)
 
 
+_FAILURE_PATTERNS = re.compile(
+    r"\b(couldn't complete|failed to|unable to|error occurred|I encountered an error|"
+    r"I'm unable|I cannot|not able to complete|could not)\b",
+    re.IGNORECASE,
+)
+
+_QUESTION_PATTERNS = re.compile(
+    r"(could you clarify|can you (provide|clarify|explain)|what do you mean|what you mean|"
+    r"which (one|file|approach)|do you want me to|shall I|would you like me to)",
+    re.IGNORECASE,
+)
+
+
+def classify_task_completed(turns: list[dict]) -> bool:
+    """Heuristic: did the session likely complete its task?
+
+    Checks the last turn's assistant output and tool results for error/failure
+    signals. Returns True if the session appears to have finished successfully.
+    """
+    if not turns:
+        return True  # no turns = nothing to fail
+
+    last_turn = turns[-1]
+    last_output = last_turn.get("assistant_output", "")
+
+    # Check if last output indicates failure
+    if _FAILURE_PATTERNS.search(last_output):
+        return False
+
+    # Check if last output is asking a clarifying question (incomplete)
+    if _QUESTION_PATTERNS.search(last_output):
+        return False
+
+    # Check last turn's tool calls for errors
+    tool_calls = last_turn.get("tool_calls", [])
+    for tc in tool_calls:
+        output = tc.get("output", "")
+        if output.startswith("[ERROR]"):
+            return False
+
+    return True
+
+
 def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
     """Core processing logic for a single session transcript."""
     prev_offset = load_state(session_id)

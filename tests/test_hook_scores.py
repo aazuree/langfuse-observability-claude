@@ -123,3 +123,69 @@ def test_token_efficiency_rounds_to_4_decimals():
                          "cache_read": 111, "cache_creation": 0}}]
     result = hook.calculate_token_efficiency(turns)
     assert result == round(result, 4)
+
+
+# --- classify_task_completed ---
+
+def _make_turns(last_output, tool_calls=None):
+    """Helper to build a minimal turn list for classify_task_completed."""
+    return [{
+        "user_input": "do something",
+        "assistant_output": last_output,
+        "tool_calls": tool_calls or [],
+        "usage": {"input": 0, "output": 100, "total": 100,
+                  "cache_read": 0, "cache_creation": 0},
+    }]
+
+
+def test_task_completed_clean_finish():
+    turns = _make_turns("Done! I've updated the file.")
+    assert hook.classify_task_completed(turns) is True
+
+
+def test_task_completed_with_error_output():
+    turns = _make_turns("I encountered an error and couldn't complete the task.")
+    assert hook.classify_task_completed(turns) is False
+
+
+def test_task_completed_tool_error():
+    turns = _make_turns("Here are the results.", [
+        {"name": "Bash", "output": "[ERROR] command not found", "input": {}},
+    ])
+    assert hook.classify_task_completed(turns) is False
+
+
+def test_task_completed_empty_turns():
+    assert hook.classify_task_completed([]) is True
+
+
+def test_task_completed_asks_question():
+    """If the last output is asking a clarifying question, task is not completed."""
+    turns = _make_turns("Could you clarify what you mean by 'fix the layout'?")
+    assert hook.classify_task_completed(turns) is False
+
+
+def test_task_completed_single_turn_success():
+    turns = _make_turns("The function has been refactored to use async/await.")
+    assert hook.classify_task_completed(turns) is True
+
+
+def test_task_completed_tool_error_not_last():
+    """Error in non-last tool call but clean final output is still success."""
+    turns = [
+        {
+            "user_input": "fix it",
+            "assistant_output": "Had an error but recovered.",
+            "tool_calls": [{"name": "Bash", "output": "[ERROR] oops", "input": {}}],
+            "usage": {"input": 0, "output": 100, "total": 100,
+                      "cache_read": 0, "cache_creation": 0},
+        },
+        {
+            "user_input": "",
+            "assistant_output": "Fixed! The tests pass now.",
+            "tool_calls": [{"name": "Bash", "output": "All 5 tests passed", "input": {}}],
+            "usage": {"input": 0, "output": 100, "total": 100,
+                      "cache_read": 0, "cache_creation": 0},
+        },
+    ]
+    assert hook.classify_task_completed(turns) is True
