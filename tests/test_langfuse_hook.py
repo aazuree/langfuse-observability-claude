@@ -1434,3 +1434,116 @@ class TestMain:
 
         hook.main()
         assert any("transcript_path" in m for m in logged)
+
+
+# ---------------------------------------------------------------------------
+# TestProcessSessionNewFields
+# ---------------------------------------------------------------------------
+
+class TestProcessSessionNewFields:
+    def _make_transcript(self, tmp_path, entries):
+        f = tmp_path / "session.jsonl"
+        f.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        return str(f)
+
+    def test_generation_metadata_contains_new_fields(self, tmp_path, monkeypatch):
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        monkeypatch.setattr(hook, "STATE_DIR", str(state_dir))
+
+        sent_batches = []
+        monkeypatch.setattr(hook, "send_to_langfuse", lambda batch: sent_batches.append(batch))
+
+        entries = [
+            {
+                "type": "user",
+                "timestamp": "2026-03-29T10:00:00+00:00",
+                "message": {"role": "user", "content": "Hello"},
+            },
+            {
+                "type": "assistant",
+                "requestId": "req-abc",
+                "timestamp": "2026-03-29T10:00:01+00:00",
+                "message": {
+                    "id": "msg-1",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "Answer"}],
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "speed": "fast",
+                        "service_tier": "standard",
+                        "inference_geo": "us-east-1",
+                        "server_tool_use": {"web_search_requests": 3, "web_fetch_requests": 1},
+                        "cache_creation": {"ephemeral_5m_input_tokens": 100, "ephemeral_1h_input_tokens": 200},
+                    },
+                },
+            },
+        ]
+        path = self._make_transcript(tmp_path, entries)
+        hook.process_session("new-fields-session", path, "/test/project")
+
+        assert len(sent_batches) == 1
+        batch = sent_batches[0]
+
+        gen_events = [e for e in batch if e["type"] == "generation-create"]
+        assert len(gen_events) == 1
+
+        gen_body = gen_events[0]["body"]
+        metadata = gen_body["metadata"]
+
+        # Verify new metadata fields
+        assert metadata["speed"] == "fast"
+        assert metadata["service_tier"] == "standard"
+        assert metadata["inference_geo"] == "us-east-1"
+        assert metadata["request_ids"] == ["req-abc"]
+        assert metadata["web_search_requests"] == 3
+        assert metadata["web_fetch_requests"] == 1
+
+        # Verify usageDetails contains cache ephemeral fields
+        usage_details = gen_body["usageDetails"]
+        assert usage_details["cache_ephemeral_5m_input_tokens"] == 100
+        assert usage_details["cache_ephemeral_1h_input_tokens"] == 200
+
+    def test_fast_tag_added(self, tmp_path, monkeypatch):
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        monkeypatch.setattr(hook, "STATE_DIR", str(state_dir))
+
+        sent_batches = []
+        monkeypatch.setattr(hook, "send_to_langfuse", lambda batch: sent_batches.append(batch))
+
+        entries = [
+            {
+                "type": "user",
+                "timestamp": "2026-03-29T10:00:00+00:00",
+                "message": {"role": "user", "content": "Hello"},
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-03-29T10:00:01+00:00",
+                "message": {
+                    "id": "msg-1",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "Answer"}],
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "speed": "fast",
+                    },
+                },
+            },
+        ]
+        path = self._make_transcript(tmp_path, entries)
+        hook.process_session("fast-tag-session", path, "/test/project")
+
+        assert len(sent_batches) == 1
+        batch = sent_batches[0]
+
+        trace_events = [e for e in batch if e["type"] == "trace-create"]
+        assert len(trace_events) == 1
+
+        tags = trace_events[0]["body"]["tags"]
+        assert "fast" in tags

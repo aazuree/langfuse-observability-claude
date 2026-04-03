@@ -946,6 +946,9 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
     # Derive repo name from cwd
     repo_name = os.path.basename(cwd.rstrip("/")) if cwd else ""
 
+    # Check if any turn used fast inference
+    has_fast = any(t.get("speed") == "fast" for t in turns)
+
     # Collect unique model families used across all turns
     model_families = set()
     for t in turns:
@@ -1003,6 +1006,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
                 repo_name or None,
                 *sorted(model_families),
                 session_meta.get("entrypoint") or None,
+                "fast" if has_fast else None,
             ] if t],
         },
     })
@@ -1048,6 +1052,8 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
             "total": usage["total"],
             "cache_read_input_tokens": usage["cache_read"],
             "cache_creation_input_tokens": usage["cache_creation"],
+            "cache_ephemeral_5m_input_tokens": turn.get("cache_ephemeral_5m", 0),
+            "cache_ephemeral_1h_input_tokens": turn.get("cache_ephemeral_1h", 0),
         }
 
         gen_body = {
@@ -1066,6 +1072,12 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
                 "tools_used": tool_names,
                 "tool_count": len(tool_names),
                 "api_calls": len(turn["api_call_ids"]),
+                "speed": turn.get("speed", ""),
+                "service_tier": turn.get("service_tier", ""),
+                "inference_geo": turn.get("inference_geo", ""),
+                "request_ids": list(dict.fromkeys(turn.get("request_ids", []))),
+                "web_search_requests": turn.get("web_search_requests", 0),
+                "web_fetch_requests": turn.get("web_fetch_requests", 0),
             },
         }
 
