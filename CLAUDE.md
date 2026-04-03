@@ -117,12 +117,27 @@ Each trace is enriched with:
 - repo/project name — derived from `cwd` (e.g., `langfuse-observability`)
 - model family — `opus`, `sonnet`, or `haiku`
 - entrypoint — `cli` or other launch method
+- `fast` — present if any turn used `/fast` mode
+- `has-errors` — present if API errors occurred during the session
 
-**Metadata** (structured key-value on trace):
+**Trace Metadata** (structured key-value on trace):
 - `git_branch`, `cli_version`, `entrypoint`, `repo_name`, `cwd`
 - `turn_count`, `tool_calls_total`, `total_tokens`, `total_input_tokens`, `total_output_tokens`
+- `api_errors` — error summary: `total_count`, `by_status` (HTTP codes), `first_error_at`, `last_error_at`
 
 Extracted from the first `type: "user"` entry in the JSONL transcript via `extract_session_metadata()`.
+API errors extracted from `type: "system"` / `subtype: "api_error"` entries via `extract_api_errors()`.
+
+**Per-Generation Metadata** (on each generation):
+- `speed` — `standard` or `fast` (from `/fast` toggle)
+- `service_tier` — API routing tier
+- `inference_geo` — inference region (e.g., `us-east-1`)
+- `request_ids` — list of Anthropic request IDs for server-side correlation
+- `web_search_requests`, `web_fetch_requests` — server-side tool use counts
+
+**Per-Generation usageDetails** (extended):
+- `cache_ephemeral_5m_input_tokens` — cache tokens with 5-minute TTL
+- `cache_ephemeral_1h_input_tokens` — cache tokens with 1-hour TTL
 
 ## Langfuse API Gotchas
 
