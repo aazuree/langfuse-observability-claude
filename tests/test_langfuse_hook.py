@@ -1639,3 +1639,105 @@ class TestExtractApiErrors:
         ]
         result = hook.extract_api_errors(entries)
         assert result["total_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# TestProcessSessionApiErrors
+# ---------------------------------------------------------------------------
+
+class TestProcessSessionApiErrors:
+    def _make_transcript(self, tmp_path, entries):
+        f = tmp_path / "session.jsonl"
+        f.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        return str(f)
+
+    def test_api_errors_in_trace_metadata(self, tmp_path, monkeypatch):
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        monkeypatch.setattr(hook, "STATE_DIR", str(state_dir))
+
+        sent_batches = []
+        monkeypatch.setattr(hook, "send_to_langfuse", lambda batch: sent_batches.append(batch))
+
+        entries = [
+            {
+                "type": "system",
+                "subtype": "api_error",
+                "level": "error",
+                "timestamp": "2026-03-29T10:00:00+00:00",
+                "error": {"status": 529},
+            },
+            {
+                "type": "user",
+                "timestamp": "2026-03-29T10:00:01+00:00",
+                "message": {"role": "user", "content": "Hello"},
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-03-29T10:00:02+00:00",
+                "message": {
+                    "id": "msg-1",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "Answer"}],
+                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                },
+            },
+        ]
+        path = self._make_transcript(tmp_path, entries)
+        hook.process_session("api-errors-session", path, "/test/project")
+
+        assert len(sent_batches) == 1
+        batch = sent_batches[0]
+
+        trace_events = [e for e in batch if e["type"] == "trace-create"]
+        assert len(trace_events) == 1
+
+        trace_body = trace_events[0]["body"]
+        metadata = trace_body["metadata"]
+        tags = trace_body["tags"]
+
+        assert "api_errors" in metadata
+        api_errors = metadata["api_errors"]
+        assert api_errors["total_count"] == 1
+        assert api_errors["by_status"] == {"529": 1}
+
+        assert "has-errors" in tags
+
+    def test_no_errors_no_tag(self, tmp_path, monkeypatch):
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        monkeypatch.setattr(hook, "STATE_DIR", str(state_dir))
+
+        sent_batches = []
+        monkeypatch.setattr(hook, "send_to_langfuse", lambda batch: sent_batches.append(batch))
+
+        entries = [
+            {
+                "type": "user",
+                "timestamp": "2026-03-29T10:00:00+00:00",
+                "message": {"role": "user", "content": "Hello"},
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-03-29T10:00:01+00:00",
+                "message": {
+                    "id": "msg-1",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "Answer"}],
+                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                },
+            },
+        ]
+        path = self._make_transcript(tmp_path, entries)
+        hook.process_session("no-errors-session", path, "/test/project")
+
+        assert len(sent_batches) == 1
+        batch = sent_batches[0]
+
+        trace_events = [e for e in batch if e["type"] == "trace-create"]
+        assert len(trace_events) == 1
+
+        tags = trace_events[0]["body"]["tags"]
+        assert "has-errors" not in tags

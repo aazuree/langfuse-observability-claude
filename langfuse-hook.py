@@ -972,6 +972,9 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
         save_state(session_id, total_lines)
         return
 
+    api_errors = extract_api_errors(entries)
+    has_errors = api_errors["total_count"] > 0
+
     # Derive repo name from cwd
     repo_name = os.path.basename(cwd.rstrip("/")) if cwd else ""
 
@@ -1029,6 +1032,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
                 "cli_version": session_meta.get("version", ""),
                 "entrypoint": session_meta.get("entrypoint", ""),
                 "repo_name": repo_name,
+                "api_errors": api_errors if has_errors else None,
             },
             "tags": [t for t in [
                 "claude-code",
@@ -1036,6 +1040,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
                 *sorted(model_families),
                 session_meta.get("entrypoint") or None,
                 "fast" if has_fast else None,
+                "has-errors" if has_errors else None,
             ] if t],
         },
     })
