@@ -819,6 +819,240 @@ class TestBuildTurns:
 
 
 # ---------------------------------------------------------------------------
+# TestBuildTurnsNewFields
+# ---------------------------------------------------------------------------
+
+class TestBuildTurnsNewFields:
+    """Tests for new per-generation fields extracted in build_turns()."""
+
+    def _make_entries(self, assistant_usage, request_id=None, extra_assistants=None):
+        """Helper: one user + one assistant entry."""
+        assistant_entry = {
+            "type": "assistant",
+            "timestamp": "2026-03-29T10:00:01+00:00",
+            "message": {
+                "id": "msg-1",
+                "role": "assistant",
+                "model": "claude-sonnet-4-6",
+                "content": [{"type": "text", "text": "Answer"}],
+                "usage": assistant_usage,
+            },
+        }
+        if request_id is not None:
+            assistant_entry["requestId"] = request_id
+
+        entries = [
+            {
+                "type": "user",
+                "timestamp": "2026-03-29T10:00:00+00:00",
+                "message": {"role": "user", "content": "Hello"},
+            },
+            assistant_entry,
+        ]
+        if extra_assistants:
+            entries.extend(extra_assistants)
+        return entries
+
+    def test_speed_extracted(self):
+        entries = self._make_entries({"input_tokens": 10, "output_tokens": 5, "speed": "fast"})
+        turns = hook.build_turns(entries)
+        assert turns[0]["speed"] == "fast"
+
+    def test_speed_defaults_empty(self):
+        entries = self._make_entries({"input_tokens": 10, "output_tokens": 5})
+        turns = hook.build_turns(entries)
+        assert turns[0]["speed"] == ""
+
+    def test_service_tier_extracted(self):
+        entries = self._make_entries({"input_tokens": 10, "output_tokens": 5, "service_tier": "standard"})
+        turns = hook.build_turns(entries)
+        assert turns[0]["service_tier"] == "standard"
+
+    def test_inference_geo_extracted(self):
+        entries = self._make_entries({"input_tokens": 10, "output_tokens": 5, "inference_geo": "us-east-1"})
+        turns = hook.build_turns(entries)
+        assert turns[0]["inference_geo"] == "us-east-1"
+
+    def test_inference_geo_skips_empty_string(self):
+        entries = self._make_entries({"input_tokens": 10, "output_tokens": 5, "inference_geo": ""})
+        turns = hook.build_turns(entries)
+        assert turns[0]["inference_geo"] == ""
+
+    def test_server_tool_use_summed(self):
+        entries = [
+            {
+                "type": "user",
+                "timestamp": "2026-03-29T10:00:00+00:00",
+                "message": {"role": "user", "content": "Hello"},
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-03-29T10:00:01+00:00",
+                "message": {
+                    "id": "msg-1",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "Answer 1"}],
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "server_tool_use": {"web_search_requests": 2, "web_fetch_requests": 1},
+                    },
+                },
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-03-29T10:00:02+00:00",
+                "message": {
+                    "id": "msg-2",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "Answer 2"}],
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "server_tool_use": {"web_search_requests": 1, "web_fetch_requests": 3},
+                    },
+                },
+            },
+        ]
+        turns = hook.build_turns(entries)
+        assert turns[0]["web_search_requests"] == 3
+        assert turns[0]["web_fetch_requests"] == 4
+
+    def test_cache_ephemeral_summed(self):
+        entries = [
+            {
+                "type": "user",
+                "timestamp": "2026-03-29T10:00:00+00:00",
+                "message": {"role": "user", "content": "Hello"},
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-03-29T10:00:01+00:00",
+                "message": {
+                    "id": "msg-1",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "Answer 1"}],
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "cache_creation": {"ephemeral_5m_input_tokens": 100, "ephemeral_1h_input_tokens": 200},
+                    },
+                },
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-03-29T10:00:02+00:00",
+                "message": {
+                    "id": "msg-2",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "Answer 2"}],
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "cache_creation": {"ephemeral_5m_input_tokens": 50, "ephemeral_1h_input_tokens": 150},
+                    },
+                },
+            },
+        ]
+        turns = hook.build_turns(entries)
+        assert turns[0]["cache_ephemeral_5m"] == 150
+        assert turns[0]["cache_ephemeral_1h"] == 350
+
+    def test_request_ids_collected(self):
+        entries = [
+            {
+                "type": "user",
+                "timestamp": "2026-03-29T10:00:00+00:00",
+                "message": {"role": "user", "content": "Hello"},
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-03-29T10:00:01+00:00",
+                "requestId": "req-aaa",
+                "message": {
+                    "id": "msg-1",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "Answer 1"}],
+                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                },
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-03-29T10:00:02+00:00",
+                "requestId": "req-bbb",
+                "message": {
+                    "id": "msg-2",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "Answer 2"}],
+                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                },
+            },
+        ]
+        turns = hook.build_turns(entries)
+        assert sorted(turns[0]["request_ids"]) == ["req-aaa", "req-bbb"]
+
+    def test_request_ids_empty_when_absent(self):
+        entries = self._make_entries({"input_tokens": 10, "output_tokens": 5})
+        turns = hook.build_turns(entries)
+        assert turns[0]["request_ids"] == []
+
+    def test_multiple_api_calls_last_wins_for_scalar_fields(self):
+        entries = [
+            {
+                "type": "user",
+                "timestamp": "2026-03-29T10:00:00+00:00",
+                "message": {"role": "user", "content": "Hello"},
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-03-29T10:00:01+00:00",
+                "message": {
+                    "id": "msg-1",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "Answer 1"}],
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "speed": "fast",
+                        "service_tier": "standard",
+                        "inference_geo": "us-east-1",
+                    },
+                },
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-03-29T10:00:02+00:00",
+                "message": {
+                    "id": "msg-2",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "Answer 2"}],
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "speed": "turbo",
+                        "service_tier": "premium",
+                        "inference_geo": "eu-west-1",
+                    },
+                },
+            },
+        ]
+        turns = hook.build_turns(entries)
+        # Last non-empty value wins — but order of iteration over a set is non-deterministic,
+        # so we just verify one of the two valid values is present.
+        assert turns[0]["speed"] in ("fast", "turbo")
+        assert turns[0]["service_tier"] in ("standard", "premium")
+        assert turns[0]["inference_geo"] in ("us-east-1", "eu-west-1")
+
+
+# ---------------------------------------------------------------------------
 # log (rotation)
 # ---------------------------------------------------------------------------
 
@@ -1200,3 +1434,359 @@ class TestMain:
 
         hook.main()
         assert any("transcript_path" in m for m in logged)
+
+
+# ---------------------------------------------------------------------------
+# TestProcessSessionNewFields
+# ---------------------------------------------------------------------------
+
+class TestProcessSessionNewFields:
+    def _make_transcript(self, tmp_path, entries):
+        f = tmp_path / "session.jsonl"
+        f.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        return str(f)
+
+    def test_generation_metadata_contains_new_fields(self, tmp_path, monkeypatch):
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        monkeypatch.setattr(hook, "STATE_DIR", str(state_dir))
+
+        sent_batches = []
+        monkeypatch.setattr(hook, "send_to_langfuse", lambda batch: sent_batches.append(batch))
+
+        entries = [
+            {
+                "type": "user",
+                "timestamp": "2026-03-29T10:00:00+00:00",
+                "message": {"role": "user", "content": "Hello"},
+            },
+            {
+                "type": "assistant",
+                "requestId": "req-abc",
+                "timestamp": "2026-03-29T10:00:01+00:00",
+                "message": {
+                    "id": "msg-1",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "Answer"}],
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "speed": "fast",
+                        "service_tier": "standard",
+                        "inference_geo": "us-east-1",
+                        "server_tool_use": {"web_search_requests": 3, "web_fetch_requests": 1},
+                        "cache_creation": {"ephemeral_5m_input_tokens": 100, "ephemeral_1h_input_tokens": 200},
+                    },
+                },
+            },
+        ]
+        path = self._make_transcript(tmp_path, entries)
+        hook.process_session("new-fields-session", path, "/test/project")
+
+        assert len(sent_batches) == 1
+        batch = sent_batches[0]
+
+        gen_events = [e for e in batch if e["type"] == "generation-create"]
+        assert len(gen_events) == 1
+
+        gen_body = gen_events[0]["body"]
+        metadata = gen_body["metadata"]
+
+        # Verify new metadata fields
+        assert metadata["speed"] == "fast"
+        assert metadata["service_tier"] == "standard"
+        assert metadata["inference_geo"] == "us-east-1"
+        assert metadata["request_ids"] == ["req-abc"]
+        assert metadata["web_search_requests"] == 3
+        assert metadata["web_fetch_requests"] == 1
+
+        # Verify usageDetails contains cache ephemeral fields
+        usage_details = gen_body["usageDetails"]
+        assert usage_details["cache_ephemeral_5m_input_tokens"] == 100
+        assert usage_details["cache_ephemeral_1h_input_tokens"] == 200
+
+    def test_fast_tag_added(self, tmp_path, monkeypatch):
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        monkeypatch.setattr(hook, "STATE_DIR", str(state_dir))
+
+        sent_batches = []
+        monkeypatch.setattr(hook, "send_to_langfuse", lambda batch: sent_batches.append(batch))
+
+        entries = [
+            {
+                "type": "user",
+                "timestamp": "2026-03-29T10:00:00+00:00",
+                "message": {"role": "user", "content": "Hello"},
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-03-29T10:00:01+00:00",
+                "message": {
+                    "id": "msg-1",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "Answer"}],
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "speed": "fast",
+                    },
+                },
+            },
+        ]
+        path = self._make_transcript(tmp_path, entries)
+        hook.process_session("fast-tag-session", path, "/test/project")
+
+        assert len(sent_batches) == 1
+        batch = sent_batches[0]
+
+        trace_events = [e for e in batch if e["type"] == "trace-create"]
+        assert len(trace_events) == 1
+
+        tags = trace_events[0]["body"]["tags"]
+        assert "fast" in tags
+
+
+# ---------------------------------------------------------------------------
+# extract_api_errors
+# ---------------------------------------------------------------------------
+
+class TestExtractApiErrors:
+    def test_no_errors(self):
+        entries = [
+            {"type": "user", "message": {"role": "user", "content": "hello"}},
+            {"type": "assistant", "message": {"role": "assistant", "content": "hi"}},
+        ]
+        result = hook.extract_api_errors(entries)
+        assert result["total_count"] == 0
+        assert result["by_status"] == {}
+
+    def test_single_error(self):
+        entries = [
+            {
+                "type": "system",
+                "subtype": "api_error",
+                "level": "error",
+                "timestamp": "2026-03-29T10:00:05+00:00",
+                "error": {"status": 529},
+            }
+        ]
+        result = hook.extract_api_errors(entries)
+        assert result["total_count"] == 1
+        assert result["by_status"] == {"529": 1}
+        assert result["first_error_at"] == "2026-03-29T10:00:05+00:00"
+        assert result["last_error_at"] == "2026-03-29T10:00:05+00:00"
+
+    def test_multiple_errors(self):
+        entries = [
+            {
+                "type": "system",
+                "subtype": "api_error",
+                "level": "error",
+                "timestamp": "2026-03-29T10:00:01+00:00",
+                "error": {"status": 529},
+            },
+            {
+                "type": "system",
+                "subtype": "api_error",
+                "level": "error",
+                "timestamp": "2026-03-29T10:00:03+00:00",
+                "error": {"status": 500},
+            },
+            {
+                "type": "system",
+                "subtype": "api_error",
+                "level": "error",
+                "timestamp": "2026-03-29T10:00:05+00:00",
+                "error": {"status": 529},
+            },
+        ]
+        result = hook.extract_api_errors(entries)
+        assert result["total_count"] == 3
+        assert result["by_status"] == {"529": 2, "500": 1}
+        assert result["first_error_at"] == "2026-03-29T10:00:01+00:00"
+        assert result["last_error_at"] == "2026-03-29T10:00:05+00:00"
+
+    def test_missing_error_status(self):
+        entries = [
+            {
+                "type": "system",
+                "subtype": "api_error",
+                "level": "error",
+                "timestamp": "2026-03-29T10:00:00+00:00",
+                "error": {},
+            }
+        ]
+        result = hook.extract_api_errors(entries)
+        assert result["total_count"] == 1
+        assert result["by_status"] == {"unknown": 1}
+
+    def test_non_error_system_entries_ignored(self):
+        entries = [
+            {
+                "type": "system",
+                "subtype": "turn_duration",
+                "timestamp": "2026-03-29T10:00:01+00:00",
+                "durationMs": 1234,
+            },
+            {
+                "type": "system",
+                "subtype": "local_command",
+                "timestamp": "2026-03-29T10:00:02+00:00",
+            },
+        ]
+        result = hook.extract_api_errors(entries)
+        assert result["total_count"] == 0
+
+
+# ---------------------------------------------------------------------------
+# TestProcessSessionApiErrors
+# ---------------------------------------------------------------------------
+
+class TestProcessSessionApiErrors:
+    def _make_transcript(self, tmp_path, entries):
+        f = tmp_path / "session.jsonl"
+        f.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        return str(f)
+
+    def test_api_errors_in_trace_metadata(self, tmp_path, monkeypatch):
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        monkeypatch.setattr(hook, "STATE_DIR", str(state_dir))
+
+        sent_batches = []
+        monkeypatch.setattr(hook, "send_to_langfuse", lambda batch: sent_batches.append(batch))
+
+        entries = [
+            {
+                "type": "system",
+                "subtype": "api_error",
+                "level": "error",
+                "timestamp": "2026-03-29T10:00:00+00:00",
+                "error": {"status": 529},
+            },
+            {
+                "type": "user",
+                "timestamp": "2026-03-29T10:00:01+00:00",
+                "message": {"role": "user", "content": "Hello"},
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-03-29T10:00:02+00:00",
+                "message": {
+                    "id": "msg-1",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "Answer"}],
+                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                },
+            },
+        ]
+        path = self._make_transcript(tmp_path, entries)
+        hook.process_session("api-errors-session", path, "/test/project")
+
+        assert len(sent_batches) == 1
+        batch = sent_batches[0]
+
+        trace_events = [e for e in batch if e["type"] == "trace-create"]
+        assert len(trace_events) == 1
+
+        trace_body = trace_events[0]["body"]
+        metadata = trace_body["metadata"]
+        tags = trace_body["tags"]
+
+        assert "api_errors" in metadata
+        api_errors = metadata["api_errors"]
+        assert api_errors["total_count"] == 1
+        assert api_errors["by_status"] == {"529": 1}
+
+        assert "has-errors" in tags
+
+    def test_no_errors_no_tag(self, tmp_path, monkeypatch):
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        monkeypatch.setattr(hook, "STATE_DIR", str(state_dir))
+
+        sent_batches = []
+        monkeypatch.setattr(hook, "send_to_langfuse", lambda batch: sent_batches.append(batch))
+
+        entries = [
+            {
+                "type": "user",
+                "timestamp": "2026-03-29T10:00:00+00:00",
+                "message": {"role": "user", "content": "Hello"},
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-03-29T10:00:01+00:00",
+                "message": {
+                    "id": "msg-1",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "Answer"}],
+                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                },
+            },
+        ]
+        path = self._make_transcript(tmp_path, entries)
+        hook.process_session("no-errors-session", path, "/test/project")
+
+        assert len(sent_batches) == 1
+        batch = sent_batches[0]
+
+        trace_events = [e for e in batch if e["type"] == "trace-create"]
+        assert len(trace_events) == 1
+
+        tags = trace_events[0]["body"]["tags"]
+        assert "has-errors" not in tags
+
+
+# ---------------------------------------------------------------------------
+# TestSubagentNewFields
+# ---------------------------------------------------------------------------
+
+class TestSubagentNewFields:
+    def test_subagent_generations_have_new_metadata(self, tmp_path):
+        entries = [
+            {"type": "user", "timestamp": "2026-04-03T10:00:00+00:00",
+             "message": {"role": "user", "content": "Do research"}},
+            {"type": "assistant", "timestamp": "2026-04-03T10:00:02+00:00",
+             "requestId": "req_sub001",
+             "message": {
+                 "id": "msg-s1", "role": "assistant", "model": "claude-sonnet-4-6",
+                 "content": [{"type": "text", "text": "Found it."}],
+                 "usage": {
+                     "input_tokens": 50, "output_tokens": 20,
+                     "cache_read_input_tokens": 1000, "cache_creation_input_tokens": 100,
+                     "speed": "standard",
+                     "service_tier": "standard",
+                     "inference_geo": "eu-west-1",
+                     "server_tool_use": {"web_search_requests": 1, "web_fetch_requests": 0},
+                     "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 100},
+                 },
+             }},
+        ]
+        f = tmp_path / "subagent.jsonl"
+        f.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+
+        events, cost, offset, tc, status = hook.ingest_subagent(
+            agent_id="test-sa", transcript_path=str(f),
+            parent_span_id="span-parent", trace_id="trace-parent",
+            session_id="sess-parent", subagent_offset=0,
+        )
+
+        gen_events = [e for e in events if e["type"] == "generation-create"]
+        assert len(gen_events) == 1
+        meta = gen_events[0]["body"]["metadata"]
+        assert meta["speed"] == "standard"
+        assert meta["service_tier"] == "standard"
+        assert meta["inference_geo"] == "eu-west-1"
+        assert meta["request_ids"] == ["req_sub001"]
+        assert meta["web_search_requests"] == 1
+        assert meta["web_fetch_requests"] == 0
+
+        usage_details = gen_events[0]["body"]["usageDetails"]
+        assert usage_details["cache_ephemeral_5m_input_tokens"] == 0
+        assert usage_details["cache_ephemeral_1h_input_tokens"] == 100

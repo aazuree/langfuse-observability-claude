@@ -310,6 +310,8 @@ def ingest_subagent(
             "input": usage["input"], "output": usage["output"], "total": usage["total"],
             "cache_read_input_tokens": usage["cache_read"],
             "cache_creation_input_tokens": usage["cache_creation"],
+            "cache_ephemeral_5m_input_tokens": turn.get("cache_ephemeral_5m", 0),
+            "cache_ephemeral_1h_input_tokens": turn.get("cache_ephemeral_1h", 0),
         }
 
         events.append({
@@ -332,6 +334,12 @@ def ingest_subagent(
                     "subagent_id": agent_id,
                     "tools_used": [tc["name"] for tc in turn["tool_calls"]],
                     "tool_count": len(turn["tool_calls"]),
+                    "speed": turn.get("speed", ""),
+                    "service_tier": turn.get("service_tier", ""),
+                    "inference_geo": turn.get("inference_geo", ""),
+                    "request_ids": list(dict.fromkeys(turn.get("request_ids", []))),
+                    "web_search_requests": turn.get("web_search_requests", 0),
+                    "web_fetch_requests": turn.get("web_fetch_requests", 0),
                 },
             },
         })
@@ -509,6 +517,7 @@ def build_turns(entries: list[dict]) -> list[dict]:
                 "message_id": msg.get("id", ""),
                 "model": msg.get("model", ""),
                 "usage": msg.get("usage", {}),
+                "request_id": entry.get("requestId", ""),
             })
         elif etype == "system" and entry.get("subtype") == "turn_duration":
             turn_durations.append(entry)
@@ -610,6 +619,13 @@ def build_turns(entries: list[dict]) -> list[dict]:
     for turn in turns:
         usage = {"input": 0, "output": 0, "total": 0,
                  "cache_read": 0, "cache_creation": 0}
+        speed = ""
+        service_tier = ""
+        inference_geo = ""
+        web_search_requests = 0
+        web_fetch_requests = 0
+        cache_ephemeral_5m = 0
+        cache_ephemeral_1h = 0
         for mid in turn["api_call_ids"]:
             u = msg_id_final_usage.get(mid, {})
             inp = u.get("input_tokens", 0)
@@ -619,7 +635,36 @@ def build_turns(entries: list[dict]) -> list[dict]:
             usage["total"] += inp + out
             usage["cache_read"] += u.get("cache_read_input_tokens", 0)
             usage["cache_creation"] += u.get("cache_creation_input_tokens", 0)
+            # Scalar fields: last non-empty value wins
+            if u.get("speed"):
+                speed = u["speed"]
+            if u.get("service_tier"):
+                service_tier = u["service_tier"]
+            if u.get("inference_geo"):
+                inference_geo = u["inference_geo"]
+            # Summed fields from server_tool_use
+            stu = u.get("server_tool_use", {})
+            web_search_requests += stu.get("web_search_requests", 0)
+            web_fetch_requests += stu.get("web_fetch_requests", 0)
+            # Summed fields from cache_creation sub-dict
+            cc = u.get("cache_creation", {})
+            cache_ephemeral_5m += cc.get("ephemeral_5m_input_tokens", 0)
+            cache_ephemeral_1h += cc.get("ephemeral_1h_input_tokens", 0)
+        # Collect request_ids from messages in this turn
+        request_ids = [
+            me.get("request_id")
+            for me in turn["messages"]
+            if me.get("request_id")
+        ]
         turn["usage"] = usage
+        turn["speed"] = speed
+        turn["service_tier"] = service_tier
+        turn["inference_geo"] = inference_geo
+        turn["web_search_requests"] = web_search_requests
+        turn["web_fetch_requests"] = web_fetch_requests
+        turn["cache_ephemeral_5m"] = cache_ephemeral_5m
+        turn["cache_ephemeral_1h"] = cache_ephemeral_1h
+        turn["request_ids"] = request_ids
         turn["api_call_ids"] = list(turn["api_call_ids"])  # make serializable
 
     # Match turn_duration entries to turns (by proximity of timestamps)
@@ -667,6 +712,35 @@ def extract_session_metadata(transcript_path: str) -> dict:
     except Exception:
         pass
     return fields
+
+
+def extract_api_errors(entries: list[dict]) -> dict:
+    """Aggregate api_error system entries into a summary."""
+    total_count = 0
+    by_status: dict[str, int] = {}
+    first_error_at = ""
+    last_error_at = ""
+
+    for entry in entries:
+        if entry.get("type") != "system" or entry.get("subtype") != "api_error":
+            continue
+        total_count += 1
+        ts = entry.get("timestamp", "")
+        if ts:
+            if not first_error_at or ts < first_error_at:
+                first_error_at = ts
+            if not last_error_at or ts > last_error_at:
+                last_error_at = ts
+        error = entry.get("error", {})
+        status = str(error.get("status", "unknown"))
+        by_status[status] = by_status.get(status, 0) + 1
+
+    return {
+        "total_count": total_count,
+        "by_status": by_status,
+        "first_error_at": first_error_at,
+        "last_error_at": last_error_at,
+    }
 
 
 def extract_cwd(transcript_path: str) -> str:
@@ -906,8 +980,14 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
         save_state(session_id, total_lines)
         return
 
+    api_errors = extract_api_errors(entries)
+    has_errors = api_errors["total_count"] > 0
+
     # Derive repo name from cwd
     repo_name = os.path.basename(cwd.rstrip("/")) if cwd else ""
+
+    # Check if any turn used fast inference
+    has_fast = any(t.get("speed") == "fast" for t in turns)
 
     # Collect unique model families used across all turns
     model_families = set()
@@ -960,12 +1040,15 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
                 "cli_version": session_meta.get("version", ""),
                 "entrypoint": session_meta.get("entrypoint", ""),
                 "repo_name": repo_name,
+                "api_errors": api_errors if has_errors else None,
             },
             "tags": [t for t in [
                 "claude-code",
                 repo_name or None,
                 *sorted(model_families),
                 session_meta.get("entrypoint") or None,
+                "fast" if has_fast else None,
+                "has-errors" if has_errors else None,
             ] if t],
         },
     })
@@ -1011,6 +1094,8 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
             "total": usage["total"],
             "cache_read_input_tokens": usage["cache_read"],
             "cache_creation_input_tokens": usage["cache_creation"],
+            "cache_ephemeral_5m_input_tokens": turn.get("cache_ephemeral_5m", 0),
+            "cache_ephemeral_1h_input_tokens": turn.get("cache_ephemeral_1h", 0),
         }
 
         gen_body = {
@@ -1029,6 +1114,12 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
                 "tools_used": tool_names,
                 "tool_count": len(tool_names),
                 "api_calls": len(turn["api_call_ids"]),
+                "speed": turn.get("speed", ""),
+                "service_tier": turn.get("service_tier", ""),
+                "inference_geo": turn.get("inference_geo", ""),
+                "request_ids": list(dict.fromkeys(turn.get("request_ids", []))),
+                "web_search_requests": turn.get("web_search_requests", 0),
+                "web_fetch_requests": turn.get("web_fetch_requests", 0),
             },
         }
 
