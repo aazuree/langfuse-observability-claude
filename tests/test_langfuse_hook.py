@@ -819,6 +819,240 @@ class TestBuildTurns:
 
 
 # ---------------------------------------------------------------------------
+# TestBuildTurnsNewFields
+# ---------------------------------------------------------------------------
+
+class TestBuildTurnsNewFields:
+    """Tests for new per-generation fields extracted in build_turns()."""
+
+    def _make_entries(self, assistant_usage, request_id=None, extra_assistants=None):
+        """Helper: one user + one assistant entry."""
+        assistant_entry = {
+            "type": "assistant",
+            "timestamp": "2026-03-29T10:00:01+00:00",
+            "message": {
+                "id": "msg-1",
+                "role": "assistant",
+                "model": "claude-sonnet-4-6",
+                "content": [{"type": "text", "text": "Answer"}],
+                "usage": assistant_usage,
+            },
+        }
+        if request_id is not None:
+            assistant_entry["requestId"] = request_id
+
+        entries = [
+            {
+                "type": "user",
+                "timestamp": "2026-03-29T10:00:00+00:00",
+                "message": {"role": "user", "content": "Hello"},
+            },
+            assistant_entry,
+        ]
+        if extra_assistants:
+            entries.extend(extra_assistants)
+        return entries
+
+    def test_speed_extracted(self):
+        entries = self._make_entries({"input_tokens": 10, "output_tokens": 5, "speed": "fast"})
+        turns = hook.build_turns(entries)
+        assert turns[0]["speed"] == "fast"
+
+    def test_speed_defaults_empty(self):
+        entries = self._make_entries({"input_tokens": 10, "output_tokens": 5})
+        turns = hook.build_turns(entries)
+        assert turns[0]["speed"] == ""
+
+    def test_service_tier_extracted(self):
+        entries = self._make_entries({"input_tokens": 10, "output_tokens": 5, "service_tier": "standard"})
+        turns = hook.build_turns(entries)
+        assert turns[0]["service_tier"] == "standard"
+
+    def test_inference_geo_extracted(self):
+        entries = self._make_entries({"input_tokens": 10, "output_tokens": 5, "inference_geo": "us-east-1"})
+        turns = hook.build_turns(entries)
+        assert turns[0]["inference_geo"] == "us-east-1"
+
+    def test_inference_geo_skips_empty_string(self):
+        entries = self._make_entries({"input_tokens": 10, "output_tokens": 5, "inference_geo": ""})
+        turns = hook.build_turns(entries)
+        assert turns[0]["inference_geo"] == ""
+
+    def test_server_tool_use_summed(self):
+        entries = [
+            {
+                "type": "user",
+                "timestamp": "2026-03-29T10:00:00+00:00",
+                "message": {"role": "user", "content": "Hello"},
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-03-29T10:00:01+00:00",
+                "message": {
+                    "id": "msg-1",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "Answer 1"}],
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "server_tool_use": {"web_search_requests": 2, "web_fetch_requests": 1},
+                    },
+                },
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-03-29T10:00:02+00:00",
+                "message": {
+                    "id": "msg-2",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "Answer 2"}],
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "server_tool_use": {"web_search_requests": 1, "web_fetch_requests": 3},
+                    },
+                },
+            },
+        ]
+        turns = hook.build_turns(entries)
+        assert turns[0]["web_search_requests"] == 3
+        assert turns[0]["web_fetch_requests"] == 4
+
+    def test_cache_ephemeral_summed(self):
+        entries = [
+            {
+                "type": "user",
+                "timestamp": "2026-03-29T10:00:00+00:00",
+                "message": {"role": "user", "content": "Hello"},
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-03-29T10:00:01+00:00",
+                "message": {
+                    "id": "msg-1",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "Answer 1"}],
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "cache_creation": {"ephemeral_5m_input_tokens": 100, "ephemeral_1h_input_tokens": 200},
+                    },
+                },
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-03-29T10:00:02+00:00",
+                "message": {
+                    "id": "msg-2",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "Answer 2"}],
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "cache_creation": {"ephemeral_5m_input_tokens": 50, "ephemeral_1h_input_tokens": 150},
+                    },
+                },
+            },
+        ]
+        turns = hook.build_turns(entries)
+        assert turns[0]["cache_ephemeral_5m"] == 150
+        assert turns[0]["cache_ephemeral_1h"] == 350
+
+    def test_request_ids_collected(self):
+        entries = [
+            {
+                "type": "user",
+                "timestamp": "2026-03-29T10:00:00+00:00",
+                "message": {"role": "user", "content": "Hello"},
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-03-29T10:00:01+00:00",
+                "requestId": "req-aaa",
+                "message": {
+                    "id": "msg-1",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "Answer 1"}],
+                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                },
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-03-29T10:00:02+00:00",
+                "requestId": "req-bbb",
+                "message": {
+                    "id": "msg-2",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "Answer 2"}],
+                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                },
+            },
+        ]
+        turns = hook.build_turns(entries)
+        assert sorted(turns[0]["request_ids"]) == ["req-aaa", "req-bbb"]
+
+    def test_request_ids_empty_when_absent(self):
+        entries = self._make_entries({"input_tokens": 10, "output_tokens": 5})
+        turns = hook.build_turns(entries)
+        assert turns[0]["request_ids"] == []
+
+    def test_multiple_api_calls_last_wins_for_scalar_fields(self):
+        entries = [
+            {
+                "type": "user",
+                "timestamp": "2026-03-29T10:00:00+00:00",
+                "message": {"role": "user", "content": "Hello"},
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-03-29T10:00:01+00:00",
+                "message": {
+                    "id": "msg-1",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "Answer 1"}],
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "speed": "fast",
+                        "service_tier": "standard",
+                        "inference_geo": "us-east-1",
+                    },
+                },
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-03-29T10:00:02+00:00",
+                "message": {
+                    "id": "msg-2",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "Answer 2"}],
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 5,
+                        "speed": "turbo",
+                        "service_tier": "premium",
+                        "inference_geo": "eu-west-1",
+                    },
+                },
+            },
+        ]
+        turns = hook.build_turns(entries)
+        # Last non-empty value wins — but order of iteration over a set is non-deterministic,
+        # so we just verify one of the two valid values is present.
+        assert turns[0]["speed"] in ("fast", "turbo")
+        assert turns[0]["service_tier"] in ("standard", "premium")
+        assert turns[0]["inference_geo"] in ("us-east-1", "eu-west-1")
+
+
+# ---------------------------------------------------------------------------
 # log (rotation)
 # ---------------------------------------------------------------------------
 

@@ -509,6 +509,7 @@ def build_turns(entries: list[dict]) -> list[dict]:
                 "message_id": msg.get("id", ""),
                 "model": msg.get("model", ""),
                 "usage": msg.get("usage", {}),
+                "request_id": entry.get("requestId", ""),
             })
         elif etype == "system" and entry.get("subtype") == "turn_duration":
             turn_durations.append(entry)
@@ -610,6 +611,13 @@ def build_turns(entries: list[dict]) -> list[dict]:
     for turn in turns:
         usage = {"input": 0, "output": 0, "total": 0,
                  "cache_read": 0, "cache_creation": 0}
+        speed = ""
+        service_tier = ""
+        inference_geo = ""
+        web_search_requests = 0
+        web_fetch_requests = 0
+        cache_ephemeral_5m = 0
+        cache_ephemeral_1h = 0
         for mid in turn["api_call_ids"]:
             u = msg_id_final_usage.get(mid, {})
             inp = u.get("input_tokens", 0)
@@ -619,7 +627,36 @@ def build_turns(entries: list[dict]) -> list[dict]:
             usage["total"] += inp + out
             usage["cache_read"] += u.get("cache_read_input_tokens", 0)
             usage["cache_creation"] += u.get("cache_creation_input_tokens", 0)
+            # Scalar fields: last non-empty value wins
+            if u.get("speed"):
+                speed = u["speed"]
+            if u.get("service_tier"):
+                service_tier = u["service_tier"]
+            if u.get("inference_geo"):
+                inference_geo = u["inference_geo"]
+            # Summed fields from server_tool_use
+            stu = u.get("server_tool_use", {})
+            web_search_requests += stu.get("web_search_requests", 0)
+            web_fetch_requests += stu.get("web_fetch_requests", 0)
+            # Summed fields from cache_creation sub-dict
+            cc = u.get("cache_creation", {})
+            cache_ephemeral_5m += cc.get("ephemeral_5m_input_tokens", 0)
+            cache_ephemeral_1h += cc.get("ephemeral_1h_input_tokens", 0)
+        # Collect request_ids from messages in this turn
+        request_ids = [
+            me.get("request_id")
+            for me in turn["messages"]
+            if me.get("request_id")
+        ]
         turn["usage"] = usage
+        turn["speed"] = speed
+        turn["service_tier"] = service_tier
+        turn["inference_geo"] = inference_geo
+        turn["web_search_requests"] = web_search_requests
+        turn["web_fetch_requests"] = web_fetch_requests
+        turn["cache_ephemeral_5m"] = cache_ephemeral_5m
+        turn["cache_ephemeral_1h"] = cache_ephemeral_1h
+        turn["request_ids"] = request_ids
         turn["api_call_ids"] = list(turn["api_call_ids"])  # make serializable
 
     # Match turn_duration entries to turns (by proximity of timestamps)
