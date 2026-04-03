@@ -1741,3 +1741,52 @@ class TestProcessSessionApiErrors:
 
         tags = trace_events[0]["body"]["tags"]
         assert "has-errors" not in tags
+
+
+# ---------------------------------------------------------------------------
+# TestSubagentNewFields
+# ---------------------------------------------------------------------------
+
+class TestSubagentNewFields:
+    def test_subagent_generations_have_new_metadata(self, tmp_path):
+        entries = [
+            {"type": "user", "timestamp": "2026-04-03T10:00:00+00:00",
+             "message": {"role": "user", "content": "Do research"}},
+            {"type": "assistant", "timestamp": "2026-04-03T10:00:02+00:00",
+             "requestId": "req_sub001",
+             "message": {
+                 "id": "msg-s1", "role": "assistant", "model": "claude-sonnet-4-6",
+                 "content": [{"type": "text", "text": "Found it."}],
+                 "usage": {
+                     "input_tokens": 50, "output_tokens": 20,
+                     "cache_read_input_tokens": 1000, "cache_creation_input_tokens": 100,
+                     "speed": "standard",
+                     "service_tier": "standard",
+                     "inference_geo": "eu-west-1",
+                     "server_tool_use": {"web_search_requests": 1, "web_fetch_requests": 0},
+                     "cache_creation": {"ephemeral_5m_input_tokens": 0, "ephemeral_1h_input_tokens": 100},
+                 },
+             }},
+        ]
+        f = tmp_path / "subagent.jsonl"
+        f.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+
+        events, cost, offset, tc, status = hook.ingest_subagent(
+            agent_id="test-sa", transcript_path=str(f),
+            parent_span_id="span-parent", trace_id="trace-parent",
+            session_id="sess-parent", subagent_offset=0,
+        )
+
+        gen_events = [e for e in events if e["type"] == "generation-create"]
+        assert len(gen_events) == 1
+        meta = gen_events[0]["body"]["metadata"]
+        assert meta["speed"] == "standard"
+        assert meta["service_tier"] == "standard"
+        assert meta["inference_geo"] == "eu-west-1"
+        assert meta["request_ids"] == ["req_sub001"]
+        assert meta["web_search_requests"] == 1
+        assert meta["web_fetch_requests"] == 0
+
+        usage_details = gen_events[0]["body"]["usageDetails"]
+        assert usage_details["cache_ephemeral_5m_input_tokens"] == 0
+        assert usage_details["cache_ephemeral_1h_input_tokens"] == 100

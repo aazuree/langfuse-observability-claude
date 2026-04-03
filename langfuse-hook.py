@@ -310,6 +310,8 @@ def ingest_subagent(
             "input": usage["input"], "output": usage["output"], "total": usage["total"],
             "cache_read_input_tokens": usage["cache_read"],
             "cache_creation_input_tokens": usage["cache_creation"],
+            "cache_ephemeral_5m_input_tokens": turn.get("cache_ephemeral_5m", 0),
+            "cache_ephemeral_1h_input_tokens": turn.get("cache_ephemeral_1h", 0),
         }
 
         events.append({
@@ -332,6 +334,12 @@ def ingest_subagent(
                     "subagent_id": agent_id,
                     "tools_used": [tc["name"] for tc in turn["tool_calls"]],
                     "tool_count": len(turn["tool_calls"]),
+                    "speed": turn.get("speed", ""),
+                    "service_tier": turn.get("service_tier", ""),
+                    "inference_geo": turn.get("inference_geo", ""),
+                    "request_ids": list(dict.fromkeys(turn.get("request_ids", []))),
+                    "web_search_requests": turn.get("web_search_requests", 0),
+                    "web_fetch_requests": turn.get("web_fetch_requests", 0),
                 },
             },
         })
