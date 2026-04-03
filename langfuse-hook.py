@@ -706,6 +706,35 @@ def extract_session_metadata(transcript_path: str) -> dict:
     return fields
 
 
+def extract_api_errors(entries: list[dict]) -> dict:
+    """Aggregate api_error system entries into a summary."""
+    total_count = 0
+    by_status: dict[str, int] = {}
+    first_error_at = ""
+    last_error_at = ""
+
+    for entry in entries:
+        if entry.get("type") != "system" or entry.get("subtype") != "api_error":
+            continue
+        total_count += 1
+        ts = entry.get("timestamp", "")
+        if ts:
+            if not first_error_at or ts < first_error_at:
+                first_error_at = ts
+            if not last_error_at or ts > last_error_at:
+                last_error_at = ts
+        error = entry.get("error", {})
+        status = str(error.get("status", "unknown"))
+        by_status[status] = by_status.get(status, 0) + 1
+
+    return {
+        "total_count": total_count,
+        "by_status": by_status,
+        "first_error_at": first_error_at,
+        "last_error_at": last_error_at,
+    }
+
+
 def extract_cwd(transcript_path: str) -> str:
     """Scan the transcript for the first non-empty cwd field."""
     try:

@@ -1547,3 +1547,95 @@ class TestProcessSessionNewFields:
 
         tags = trace_events[0]["body"]["tags"]
         assert "fast" in tags
+
+
+# ---------------------------------------------------------------------------
+# extract_api_errors
+# ---------------------------------------------------------------------------
+
+class TestExtractApiErrors:
+    def test_no_errors(self):
+        entries = [
+            {"type": "user", "message": {"role": "user", "content": "hello"}},
+            {"type": "assistant", "message": {"role": "assistant", "content": "hi"}},
+        ]
+        result = hook.extract_api_errors(entries)
+        assert result["total_count"] == 0
+        assert result["by_status"] == {}
+
+    def test_single_error(self):
+        entries = [
+            {
+                "type": "system",
+                "subtype": "api_error",
+                "level": "error",
+                "timestamp": "2026-03-29T10:00:05+00:00",
+                "error": {"status": 529},
+            }
+        ]
+        result = hook.extract_api_errors(entries)
+        assert result["total_count"] == 1
+        assert result["by_status"] == {"529": 1}
+        assert result["first_error_at"] == "2026-03-29T10:00:05+00:00"
+        assert result["last_error_at"] == "2026-03-29T10:00:05+00:00"
+
+    def test_multiple_errors(self):
+        entries = [
+            {
+                "type": "system",
+                "subtype": "api_error",
+                "level": "error",
+                "timestamp": "2026-03-29T10:00:01+00:00",
+                "error": {"status": 529},
+            },
+            {
+                "type": "system",
+                "subtype": "api_error",
+                "level": "error",
+                "timestamp": "2026-03-29T10:00:03+00:00",
+                "error": {"status": 500},
+            },
+            {
+                "type": "system",
+                "subtype": "api_error",
+                "level": "error",
+                "timestamp": "2026-03-29T10:00:05+00:00",
+                "error": {"status": 529},
+            },
+        ]
+        result = hook.extract_api_errors(entries)
+        assert result["total_count"] == 3
+        assert result["by_status"] == {"529": 2, "500": 1}
+        assert result["first_error_at"] == "2026-03-29T10:00:01+00:00"
+        assert result["last_error_at"] == "2026-03-29T10:00:05+00:00"
+
+    def test_missing_error_status(self):
+        entries = [
+            {
+                "type": "system",
+                "subtype": "api_error",
+                "level": "error",
+                "timestamp": "2026-03-29T10:00:00+00:00",
+                "error": {},
+            }
+        ]
+        result = hook.extract_api_errors(entries)
+        assert result["total_count"] == 1
+        assert result["by_status"] == {"unknown": 1}
+
+    def test_non_error_system_entries_ignored(self):
+        entries = [
+            {
+                "type": "system",
+                "subtype": "turn_duration",
+                "timestamp": "2026-03-29T10:00:01+00:00",
+                "durationMs": 1234,
+            },
+            {
+                "type": "system",
+                "subtype": "local_command",
+                "timestamp": "2026-03-29T10:00:02+00:00",
+            },
+        ]
+        result = hook.extract_api_errors(entries)
+        assert result["total_count"] == 0
