@@ -98,15 +98,22 @@ uv run pytest tests/ -k "discover" -v  # Run tests matching pattern
 
 ## Cost Model
 
-Pricing is model-aware (per 1M tokens):
+Pricing is model-aware (per 1M tokens). Source: [platform.claude.com/docs/en/about-claude/pricing](https://platform.claude.com/docs/en/about-claude/pricing) (last verified 2026-04-04).
 
-| Model | Input | Output | Cache Read | Cache Create |
-|-------|-------|--------|------------|--------------|
-| Opus | $15.00 | $75.00 | $1.50 | $18.75 |
-| Sonnet | $3.00 | $15.00 | $0.30 | $3.75 |
-| Haiku | $0.80 | $4.00 | $0.08 | $1.00 |
+| Model | Input | Output | Cache Read | Cache Write 5m | Cache Write 1h |
+|-------|-------|--------|------------|----------------|----------------|
+| Opus 4.6 / 4.5 | $5.00 | $25.00 | $0.50 | $6.25 | $10.00 |
+| Opus 4.1 / 4.0 (legacy) | $15.00 | $75.00 | $1.50 | $18.75 | $30.00 |
+| Sonnet (all versions) | $3.00 | $15.00 | $0.30 | $3.75 | $6.00 |
+| Haiku 4.5 | $1.00 | $5.00 | $0.10 | $1.25 | $2.00 |
+| Haiku 3.5 | $0.80 | $4.00 | $0.08 | $1.00 | $1.60 |
+| Haiku 3 (deprecated) | $0.25 | $1.25 | $0.03 | $0.30 | $0.50 |
+
+Cache write cost is split by tier when `cache_ephemeral_5m` / `cache_ephemeral_1h` are available in `usageDetails`; otherwise all cache_creation is billed at the 5m rate.
 
 Set `REPORT_API_EQUIVALENT_COST = False` in `langfuse-hook.py` to report $0.
+
+**Keeping prices up to date:** Pricing is hardcoded in `calculate_turn_cost()` (langfuse-hook.py ~line 766). When Anthropic releases new models or changes prices, update that function and the table above. See [ADR: Why we don't use Langfuse built-in pricing](#langfuse-api-gotchas) below.
 
 ## Tags and Metadata
 

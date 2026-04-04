@@ -4,8 +4,10 @@ import importlib.util
 import json
 import os
 import tempfile
+import unittest.mock as mock
 from pathlib import Path
 from datetime import datetime, timezone
+import pytest
 
 # Import the hook module (hyphenated filename requires importlib)
 _spec = importlib.util.spec_from_file_location(
@@ -485,15 +487,31 @@ class TestCalculateTurnCost:
         assert abs(inp_cost - 3.0) < 0.001  # $3/1M input
         assert abs(out_cost - 15.0) < 0.001  # $15/1M output
 
-    def test_opus_pricing(self):
+    def test_opus_pricing_new(self):
+        # Opus 4.5 / 4.6: $5 input, $25 output
         usage = self._usage(inp=1_000_000, out=1_000_000)
         cost, inp_cost, out_cost, details = hook.calculate_turn_cost(usage, "claude-opus-4-6")
+        assert abs(inp_cost - 5.0) < 0.001   # $5/1M input
+        assert abs(out_cost - 25.0) < 0.001  # $25/1M output
+
+    def test_opus_pricing_legacy(self):
+        # Opus 4.1 / 4.0: $15 input, $75 output
+        usage = self._usage(inp=1_000_000, out=1_000_000)
+        cost, inp_cost, out_cost, details = hook.calculate_turn_cost(usage, "claude-opus-4-20250514")
         assert abs(inp_cost - 15.0) < 0.001  # $15/1M input
         assert abs(out_cost - 75.0) < 0.001  # $75/1M output
 
-    def test_haiku_pricing(self):
+    def test_haiku_4_5_pricing(self):
+        # Haiku 4.5: $1 input, $5 output
         usage = self._usage(inp=1_000_000, out=1_000_000)
-        cost, inp_cost, out_cost, details = hook.calculate_turn_cost(usage, "claude-haiku-4-5")
+        cost, inp_cost, out_cost, details = hook.calculate_turn_cost(usage, "claude-haiku-4-5-20251001")
+        assert abs(inp_cost - 1.00) < 0.001  # $1/1M input
+        assert abs(out_cost - 5.00) < 0.001  # $5/1M output
+
+    def test_haiku_3_5_pricing(self):
+        # Haiku 3.5: $0.80 input, $4 output
+        usage = self._usage(inp=1_000_000, out=1_000_000)
+        cost, inp_cost, out_cost, details = hook.calculate_turn_cost(usage, "claude-3-5-haiku-20241022")
         assert abs(inp_cost - 0.80) < 0.001  # $0.80/1M input
         assert abs(out_cost - 4.00) < 0.001  # $4/1M output
 
@@ -502,10 +520,26 @@ class TestCalculateTurnCost:
         cost, inp_cost, out_cost, details = hook.calculate_turn_cost(usage, "claude-sonnet-4-6")
         assert abs(details["cache_read_input_tokens"] - 0.30) < 0.001
 
-    def test_cache_creation_cost(self):
+    def test_cache_creation_cost_5m(self):
+        # All cache_creation treated as 5m when no per-tier breakdown given
         usage = self._usage(cache_creation=1_000_000)
         cost, inp_cost, out_cost, details = hook.calculate_turn_cost(usage, "claude-sonnet-4-6")
         assert abs(details["cache_creation_input_tokens"] - 3.75) < 0.001
+
+    def test_cache_creation_cost_tiered(self):
+        # 500k at 5m ($3.75) + 500k at 1h ($6.00) = $1.875 + $3.00 = $4.875
+        usage = self._usage(cache_creation=1_000_000)
+        cost, inp_cost, out_cost, details = hook.calculate_turn_cost(
+            usage, "claude-sonnet-4-6", cache_5m=500_000, cache_1h=500_000
+        )
+        expected = (500_000 * 3.75 + 500_000 * 6.00) / 1_000_000
+        assert abs(details["cache_creation_input_tokens"] - expected) < 0.001
+
+    def test_opus_4_6_cache_write(self):
+        # Opus 4.6 5m cache write = $6.25/MTok
+        usage = self._usage(cache_creation=1_000_000)
+        cost, inp_cost, out_cost, details = hook.calculate_turn_cost(usage, "claude-opus-4-6")
+        assert abs(details["cache_creation_input_tokens"] - 6.25) < 0.001
 
     def test_zero_usage(self):
         usage = self._usage()
@@ -519,11 +553,42 @@ class TestCalculateTurnCost:
         assert cost == 0.0
         assert details == {}
 
-    def test_unknown_model_defaults_to_sonnet(self):
+    def test_unknown_model_returns_zero_and_warns(self, monkeypatch):
+        warnings = []
+        monkeypatch.setattr(hook, "log", lambda msg: warnings.append(msg))
         usage = self._usage(inp=1_000_000, out=1_000_000)
-        cost, _, _, details = hook.calculate_turn_cost(usage, "some-unknown-model")
-        # Should use sonnet pricing
-        assert abs(details["input"] - 3.0) < 0.001
+        cost, inp_cost, out_cost, details = hook.calculate_turn_cost(usage, "some-unknown-model")
+        # Returns $0 so the dashboard shows an obvious gap rather than a wrong number
+        assert cost == 0.0
+        assert inp_cost == 0.0
+        assert details == {}
+        # Must have logged a warning naming the model
+        assert any("[WARN]" in w and "some-unknown-model" in w for w in warnings)
+
+    @pytest.mark.parametrize("model,expected_input,expected_output", [
+        # Current models
+        ("claude-opus-4-6",              5.0,   25.0),
+        ("claude-opus-4-5-20251101",     5.0,   25.0),
+        ("claude-sonnet-4-6",            3.0,   15.0),
+        ("claude-sonnet-4-5-20250929",   3.0,   15.0),
+        ("claude-sonnet-4-20250514",     3.0,   15.0),
+        ("claude-haiku-4-5-20251001",    1.0,    5.0),
+        # Legacy models
+        ("claude-opus-4-1-20250805",    15.0,   75.0),
+        ("claude-opus-4-20250514",      15.0,   75.0),
+        ("claude-3-5-haiku-20241022",    0.80,   4.0),
+        ("claude-3-haiku-20240307",      0.25,   1.25),
+    ])
+    def test_all_known_models_have_explicit_pricing(self, model, expected_input, expected_output):
+        """Ensures every known model ID hits an explicit branch, not the unknown-model fallback."""
+        logged = []
+        with mock.patch.object(hook, "log", side_effect=lambda msg: logged.append(msg)):
+            usage = self._usage(inp=1_000_000, out=1_000_000)
+            cost, inp_cost, out_cost, _ = hook.calculate_turn_cost(usage, model)
+        assert not any("[WARN]" in w for w in logged), \
+            f"Model '{model}' triggered unknown-model fallback — update calculate_turn_cost()"
+        assert abs(inp_cost - expected_input) < 0.001, f"{model} input cost wrong"
+        assert abs(out_cost - expected_output) < 0.001, f"{model} output cost wrong"
 
     def test_total_equals_input_plus_output(self):
         usage = self._usage(inp=500_000, out=200_000, cache_read=100_000)
