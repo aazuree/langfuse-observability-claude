@@ -56,15 +56,18 @@ All services bound to `127.0.0.1` only. API key never leaves the machine.
 ## Project Structure
 
 ```
-langfuse-hook.py      # Core hook script (~700 lines) - parses transcripts, sends to Langfuse
-eval-hook.py          # LLM-as-a-Judge evaluator (~250 lines) - evaluates traces via claude CLI
-docker-compose.yml    # Full Langfuse stack (6 services)
-setup.sh              # One-command setup (generates .env, starts services, configures hook)
-.env.example          # Template for environment variables
-.env                  # Generated secrets (gitignored)
-tests/                # Test suite
-  test_eval_hook.py   # Unit tests for eval-hook.py
-  test_subagent_tracking.py  # Unit tests for subagent cost tracking
+langfuse-hook.py                 # Core hook script (~1400 lines) - parses transcripts, sends to Langfuse
+eval-hook.py                     # LLM-as-a-Judge evaluator (~630 lines) - evaluates traces via claude CLI
+backfill-score-observations.py   # One-time backfill script - re-posts trace scores with observationId
+docker-compose.yml               # Full Langfuse stack (6 services)
+setup.sh                         # One-command setup (generates .env, starts services, configures hook)
+.env.example                     # Template for environment variables
+.env                             # Generated secrets (gitignored)
+tests/
+  test_langfuse_hook.py          # Core hook unit tests (186 tests)
+  test_hook_scores.py            # Hook-level score classifier tests
+  test_subagent_tracking.py      # Subagent cost tracking tests
+  test_eval_hook.py              # LLM-as-a-Judge evaluator tests
 ```
 
 ## Running Tests
@@ -113,7 +116,7 @@ Cache write cost is split by tier when `cache_ephemeral_5m` / `cache_ephemeral_1
 
 Set `REPORT_API_EQUIVALENT_COST = False` in `langfuse-hook.py` to report $0.
 
-**Keeping prices up to date:** Pricing is hardcoded in `calculate_turn_cost()` (langfuse-hook.py ~line 766). When Anthropic releases new models or changes prices, update that function and the table above. See [ADR: Why we don't use Langfuse built-in pricing](#langfuse-api-gotchas) below.
+**Keeping prices up to date:** Pricing is hardcoded in `calculate_turn_cost()` (`langfuse-hook.py`). When Anthropic releases new models or changes prices, update that function and the table above. Unknown models return $0 and emit a `[WARN]` in `langfuse-hook.log` — that's the signal to update. We send explicit costs rather than relying on Langfuse's built-in model table because Langfuse's table lags new model releases by days/weeks.
 
 ## Tags and Metadata
 
@@ -204,7 +207,7 @@ Trace (parent session)
 - `setup.sh` backs up existing `~/.claude/settings.json` before modifying hooks
 - All ports are localhost-only by design - do not expose to network
 
-## LLM-as-a-Judge Evaluator (Phase 2)
+## LLM-as-a-Judge Evaluator
 
 `eval-hook.py` evaluates each generation (turn) independently using `claude` CLI with
 Haiku (Pro subscription). Follows Langfuse best practice of observation-level scoring —
@@ -265,7 +268,7 @@ LANGFUSE_PUBLIC_KEY=$PK LANGFUSE_SECRET_KEY=$SK python3 eval-hook.py --score --r
 
 Scores appear on individual generations in the Langfuse dashboard — filter, trend, and aggregate from there.
 
-## Hook-Level Scores (Phase 1)
+## Hook-Level Scores
 
 Three heuristic scores are automatically attached to every trace during ingestion:
 
