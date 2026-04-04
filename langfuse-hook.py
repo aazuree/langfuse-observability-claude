@@ -927,7 +927,6 @@ def classify_task_completed(turns: list[dict]) -> bool:
 def build_hook_score_events(
     trace_id: str,
     session_id: str,
-    prev_offset: int,
     first_user_input: str,
     turns: list[dict],
 ) -> list[dict]:
@@ -962,10 +961,11 @@ def build_hook_score_events(
 
     events = []
     for score in scores:
-        # Deterministic ID for idempotent re-ingestion
+        # Stable ID keyed only on session+name so each run upserts the same
+        # score rather than accumulating one per turn.
         score_id = str(uuid.uuid5(
             uuid.NAMESPACE_URL,
-            f"{session_id}:{prev_offset}:score:{score['name']}",
+            f"{session_id}:score:{score['name']}",
         ))
         events.append({
             "id": f"evt-{score_id}",
@@ -1276,7 +1276,6 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
     score_events = build_hook_score_events(
         trace_id=trace_id,
         session_id=session_id,
-        prev_offset=prev_offset,
         first_user_input=first_user_input,
         turns=turns,
     )

@@ -198,8 +198,7 @@ def test_build_hook_score_events_returns_three_events():
     events = hook.build_hook_score_events(
         trace_id="trace-abc",
         session_id="abc",
-        prev_offset=0,
-        first_user_input="fix the login bug",
+                first_user_input="fix the login bug",
         turns=[{"usage": {"input": 100, "output": 200, "total": 300,
                            "cache_read": 0, "cache_creation": 0},
                 "assistant_output": "Done, fixed the bug.",
@@ -215,8 +214,7 @@ def test_build_hook_score_events_types():
     events = hook.build_hook_score_events(
         trace_id="trace-xyz",
         session_id="xyz",
-        prev_offset=0,
-        first_user_input="explain the auth module",
+                first_user_input="explain the auth module",
         turns=[{"usage": {"input": 500, "output": 500, "total": 1000,
                            "cache_read": 0, "cache_creation": 0},
                 "assistant_output": "The auth module works by...",
@@ -245,8 +243,7 @@ def test_build_hook_score_events_types():
 def test_build_hook_score_events_deterministic_ids():
     """Same inputs should produce same event IDs (idempotent re-ingestion)."""
     args = dict(
-        trace_id="trace-abc", session_id="abc", prev_offset=0,
-        first_user_input="hello",
+        trace_id="trace-abc", session_id="abc",         first_user_input="hello",
         turns=[{"usage": {"input": 0, "output": 100, "total": 100,
                            "cache_read": 0, "cache_creation": 0},
                 "assistant_output": "Hi!",
@@ -259,13 +256,27 @@ def test_build_hook_score_events_deterministic_ids():
     assert ids_a == ids_b
 
 
+def test_build_hook_score_events_stable_ids_across_turns():
+    """Score IDs must be the same regardless of how many turns have been processed.
+    Previously the ID included prev_offset, creating duplicate scores per turn."""
+    base = dict(
+        trace_id="trace-abc", session_id="abc",
+        first_user_input="hello",
+        turns=[{"usage": {"input": 0, "output": 100, "total": 100,
+                           "cache_read": 0, "cache_creation": 0},
+                "assistant_output": "Hi!", "tool_calls": []}],
+    )
+    events_turn1 = hook.build_hook_score_events(**base)
+    events_turn3 = hook.build_hook_score_events(**base)
+    assert [e["id"] for e in events_turn1] == [e["id"] for e in events_turn3]
+
+
 def test_build_hook_score_events_task_completed_false():
     """task_completed should be 0 (False) when last turn has failure."""
     events = hook.build_hook_score_events(
         trace_id="trace-fail",
         session_id="fail",
-        prev_offset=0,
-        first_user_input="fix the bug",
+                first_user_input="fix the bug",
         turns=[{"usage": {"input": 100, "output": 100, "total": 200,
                            "cache_read": 0, "cache_creation": 0},
                 "assistant_output": "I encountered an error and couldn't complete the task.",
