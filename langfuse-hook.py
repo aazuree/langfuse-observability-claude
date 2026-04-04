@@ -296,7 +296,9 @@ def ingest_subagent(
         usage = turn["usage"]
         model = turn.get("model", "claude-sonnet-4-6") or "claude-sonnet-4-6"
 
-        turn_cost, input_cost, output_cost, cost_details = calculate_turn_cost(usage, model)
+        turn_cost, input_cost, output_cost, cost_details = calculate_turn_cost(
+            usage, model, turn.get("cache_ephemeral_5m", 0), turn.get("cache_ephemeral_1h", 0)
+        )
 
         total_cost += turn_cost
         total_tokens += usage["total"]
@@ -763,8 +765,11 @@ def extract_cwd(transcript_path: str) -> str:
     return ""
 
 
-def calculate_turn_cost(usage: dict, model: str) -> tuple:
+def calculate_turn_cost(usage: dict, model: str, cache_5m: int = 0, cache_1h: int = 0) -> tuple:
     """Calculate cost for a turn's token usage.
+
+    cache_5m / cache_1h: per-tier cache creation token counts (from usageDetails).
+    When provided, costs are split by tier; otherwise all cache_creation billed at 5m rate.
 
     Returns: (turn_cost, input_cost, output_cost, cost_details)
     """
@@ -772,17 +777,39 @@ def calculate_turn_cost(usage: dict, model: str) -> tuple:
         return 0.0, 0.0, 0.0, {}
 
     m = model.lower()
+    # Pricing per 1M tokens: (input, output, cache_read, cache_write_5m, cache_write_1h)
+    # Source: platform.claude.com/docs/en/about-claude/pricing (verified 2026-04-04)
+    # When a new model releases, its name will fall through to Sonnet pricing and log a warning.
+    # Update this function + CLAUDE.md Cost Model table when that happens.
     if "haiku" in m:
-        p_in, p_out, p_cr, p_cc = 0.80, 4.00, 0.08, 1.00
+        if "haiku-4" in m:                          # Haiku 4.5+
+            p_in, p_out, p_cr, p_cc5, p_cc1 = 1.00, 5.00, 0.10, 1.25, 2.00
+        elif "3-5" in m:                             # Haiku 3.5
+            p_in, p_out, p_cr, p_cc5, p_cc1 = 0.80, 4.00, 0.08, 1.00, 1.60
+        else:                                        # Haiku 3
+            p_in, p_out, p_cr, p_cc5, p_cc1 = 0.25, 1.25, 0.03, 0.30, 0.50
     elif "opus" in m:
-        p_in, p_out, p_cr, p_cc = 15.0, 75.0, 1.50, 18.75
+        if any(x in m for x in ("opus-4-5", "opus-4-6")):  # Opus 4.5 / 4.6
+            p_in, p_out, p_cr, p_cc5, p_cc1 = 5.0, 25.0, 0.50, 6.25, 10.0
+        else:                                        # Opus 4.1, 4.0, 3 (legacy)
+            p_in, p_out, p_cr, p_cc5, p_cc1 = 15.0, 75.0, 1.50, 18.75, 30.0
+    elif "sonnet" in m:                              # Sonnet (all versions)
+        p_in, p_out, p_cr, p_cc5, p_cc1 = 3.0, 15.0, 0.30, 3.75, 6.00
     else:
-        p_in, p_out, p_cr, p_cc = 3.0, 15.0, 0.30, 3.75
+        log(f"[WARN] calculate_turn_cost: unrecognised model '{model}' — cost reported as $0. "
+            "Update calculate_turn_cost() and CLAUDE.md if this is a new Anthropic model.")
+        return 0.0, 0.0, 0.0, {}
+
+    # Cache creation cost: use per-tier breakdown when available
+    if cache_5m or cache_1h:
+        cc_cost = (cache_5m * p_cc5 + cache_1h * p_cc1) / 1_000_000
+    else:
+        cc_cost = usage["cache_creation"] * p_cc5 / 1_000_000
 
     input_cost = (
         usage["input"] * p_in / 1_000_000
         + usage["cache_read"] * p_cr / 1_000_000
-        + usage["cache_creation"] * p_cc / 1_000_000
+        + cc_cost
     )
     output_cost = usage["output"] * p_out / 1_000_000
     turn_cost = input_cost + output_cost
@@ -791,7 +818,7 @@ def calculate_turn_cost(usage: dict, model: str) -> tuple:
         "input": usage["input"] * p_in / 1_000_000,
         "output": output_cost,
         "cache_read_input_tokens": usage["cache_read"] * p_cr / 1_000_000,
-        "cache_creation_input_tokens": usage["cache_creation"] * p_cc / 1_000_000,
+        "cache_creation_input_tokens": cc_cost,
         "total": turn_cost,
     }
     return turn_cost, input_cost, output_cost, cost_details
@@ -1085,7 +1112,9 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
                 end_time = computed_end.isoformat()
 
         # Cost: $0 for Pro subscription
-        turn_cost, input_cost, output_cost, cost_details = calculate_turn_cost(usage, model)
+        turn_cost, input_cost, output_cost, cost_details = calculate_turn_cost(
+            usage, model, turn.get("cache_ephemeral_5m", 0), turn.get("cache_ephemeral_1h", 0)
+        )
         total_cost += turn_cost
 
         usage_details = {
