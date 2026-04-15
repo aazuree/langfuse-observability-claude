@@ -191,10 +191,74 @@ def test_task_completed_tool_error_not_last():
     assert hook.classify_task_completed(turns) is True
 
 
+# --- compute_cache_hit_rate ---
+
+def test_cache_hit_rate_no_cache():
+    """Zero cache activity should return 0.0."""
+    turns = [{"usage": {"cache_read": 0, "cache_creation": 0}}]
+    assert hook.compute_cache_hit_rate(turns) == 0.0
+
+
+def test_cache_hit_rate_all_reads():
+    """All cache reads, no creation → 1.0."""
+    turns = [{"usage": {"cache_read": 1000, "cache_creation": 0}}]
+    assert hook.compute_cache_hit_rate(turns) == 1.0
+
+
+def test_cache_hit_rate_all_creates():
+    """All cache creation, no reads → 0.0."""
+    turns = [{"usage": {"cache_read": 0, "cache_creation": 1000}}]
+    assert hook.compute_cache_hit_rate(turns) == 0.0
+
+
+def test_cache_hit_rate_mixed():
+    """Half and half → 0.5."""
+    turns = [{"usage": {"cache_read": 1000, "cache_creation": 1000}}]
+    assert hook.compute_cache_hit_rate(turns) == 0.5
+
+
+def test_cache_hit_rate_multi_turn():
+    """Aggregates across turns."""
+    turns = [
+        {"usage": {"cache_read": 100, "cache_creation": 100}},
+        {"usage": {"cache_read": 300, "cache_creation": 200}},
+    ]
+    # total read: 400, total create: 300, ratio: 400/700 ≈ 0.5714
+    assert hook.compute_cache_hit_rate(turns) == 0.5714
+
+
+def test_cache_hit_rate_empty_turns():
+    """Empty turns list → 0.0."""
+    assert hook.compute_cache_hit_rate([]) == 0.0
+
+
+# --- classify_cost_tier ---
+
+def test_cost_tier_cheap():
+    """Cost < $0.10 → 'cheap'."""
+    assert hook.classify_cost_tier(0.00) == "cheap"
+    assert hook.classify_cost_tier(0.05) == "cheap"
+    assert hook.classify_cost_tier(0.099) == "cheap"
+
+
+def test_cost_tier_moderate():
+    """$0.10 ≤ cost < $1.00 → 'moderate'."""
+    assert hook.classify_cost_tier(0.10) == "moderate"
+    assert hook.classify_cost_tier(0.50) == "moderate"
+    assert hook.classify_cost_tier(0.999) == "moderate"
+
+
+def test_cost_tier_expensive():
+    """Cost ≥ $1.00 → 'expensive'."""
+    assert hook.classify_cost_tier(1.00) == "expensive"
+    assert hook.classify_cost_tier(5.00) == "expensive"
+    assert hook.classify_cost_tier(100.00) == "expensive"
+
+
 # --- build_hook_score_events ---
 
-def test_build_hook_score_events_returns_three_events():
-    """Should produce exactly 3 score-create events."""
+def test_build_hook_score_events_returns_five_events():
+    """Should produce exactly 5 score-create events."""
     events = hook.build_hook_score_events(
         trace_id="trace-abc",
         session_id="abc",
@@ -203,10 +267,11 @@ def test_build_hook_score_events_returns_three_events():
                            "cache_read": 0, "cache_creation": 0},
                 "assistant_output": "Done, fixed the bug.",
                 "tool_calls": []}],
+        total_cost=0.05,
     )
-    assert len(events) == 3
+    assert len(events) == 5
     names = {e["body"]["name"] for e in events}
-    assert names == {"session_type", "token_efficiency", "task_completed"}
+    assert names == {"session_type", "token_efficiency", "task_completed", "cache_hit_rate", "cost_tier"}
 
 
 def test_build_hook_score_events_types():
@@ -216,9 +281,10 @@ def test_build_hook_score_events_types():
         session_id="xyz",
                 first_user_input="explain the auth module",
         turns=[{"usage": {"input": 500, "output": 500, "total": 1000,
-                           "cache_read": 0, "cache_creation": 0},
+                           "cache_read": 2000, "cache_creation": 3000},
                 "assistant_output": "The auth module works by...",
                 "tool_calls": []}],
+        total_cost=0.50,
     )
     by_name = {e["body"]["name"]: e for e in events}
 
@@ -230,14 +296,26 @@ def test_build_hook_score_events_types():
     assert st["body"]["traceId"] == "trace-xyz"
 
     # token_efficiency
+    # output / (output + input + cache_read + cache_creation)
+    # = 500 / (500 + 500 + 2000 + 3000) = 500/6000 = 0.0833
     te = by_name["token_efficiency"]
     assert te["body"]["dataType"] == "NUMERIC"
-    assert te["body"]["value"] == 0.5
+    assert te["body"]["value"] == 0.0833
 
     # task_completed
     tc = by_name["task_completed"]
     assert tc["body"]["dataType"] == "BOOLEAN"
     assert tc["body"]["value"] == 1  # True -> 1
+
+    # cache_hit_rate
+    chr = by_name["cache_hit_rate"]
+    assert chr["body"]["dataType"] == "NUMERIC"
+    assert chr["body"]["value"] == 0.4  # 2000 / (2000 + 3000)
+
+    # cost_tier
+    ct = by_name["cost_tier"]
+    assert ct["body"]["dataType"] == "CATEGORICAL"
+    assert ct["body"]["value"] == "moderate"
 
 
 def test_build_hook_score_events_deterministic_ids():
@@ -248,6 +326,7 @@ def test_build_hook_score_events_deterministic_ids():
                            "cache_read": 0, "cache_creation": 0},
                 "assistant_output": "Hi!",
                 "tool_calls": []}],
+        total_cost=0.01,
     )
     events_a = hook.build_hook_score_events(**args)
     events_b = hook.build_hook_score_events(**args)
@@ -265,6 +344,7 @@ def test_build_hook_score_events_stable_ids_across_turns():
         turns=[{"usage": {"input": 0, "output": 100, "total": 100,
                            "cache_read": 0, "cache_creation": 0},
                 "assistant_output": "Hi!", "tool_calls": []}],
+        total_cost=0.01,
     )
     events_turn1 = hook.build_hook_score_events(**base)
     events_turn3 = hook.build_hook_score_events(**base)
@@ -281,6 +361,7 @@ def test_build_hook_score_events_task_completed_false():
                            "cache_read": 0, "cache_creation": 0},
                 "assistant_output": "I encountered an error and couldn't complete the task.",
                 "tool_calls": []}],
+        total_cost=0.02,
     )
     by_name = {e["body"]["name"]: e for e in events}
     assert by_name["task_completed"]["body"]["value"] == 0  # False -> 0

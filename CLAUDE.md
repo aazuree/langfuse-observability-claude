@@ -272,13 +272,15 @@ Scores appear on individual generations in the Langfuse dashboard — filter, tr
 
 ## Hook-Level Scores
 
-Three heuristic scores are automatically attached to every trace during ingestion:
+Five heuristic scores are automatically attached to every trace during ingestion:
 
 | Score | Type | Values | Source |
 |-------|------|--------|--------|
 | `session_type` | Categorical | bug-fix, feature, refactor, research, exploratory | First user message keyword matching |
 | `token_efficiency` | Numeric | 0.0-1.0 | output_tokens / total_all_tokens |
 | `task_completed` | Boolean | true/false | Last turn error/question detection |
+| `cache_hit_rate` | Numeric | 0.0-1.0 | cache_read / (cache_read + cache_creation) |
+| `cost_tier` | Categorical | cheap, moderate, expensive | Total session cost bucketing |
 
 These are deterministic (no LLM calls) and run on every Stop hook invocation.
 Scores use deterministic UUIDs so re-ingestion (`--reprocess`) updates rather than duplicates.
@@ -295,3 +297,11 @@ productive output sessions. Rounded to 4 decimal places.
 **`task_completed`** — Checks last turn for failure patterns ("couldn't complete",
 "encountered an error") and trailing clarifying questions. Also checks last turn's
 tool outputs for `[ERROR]` prefix. Returns `true` if no failure signals detected.
+
+**`cache_hit_rate`** — Measures cache warmth. Formula: `cache_read / (cache_read + cache_creation)`.
+0.0 = cold session (no prior cache), 1.0 = fully warm (all cache hits). Useful for identifying
+sessions that benefit from prompt caching vs. sessions that are doing cache initialization.
+
+**`cost_tier`** — Buckets session cost for dashboard filtering. `cheap` (< $0.10), `moderate` ($0.10–$1.00),
+`expensive` (≥ $1.00). Enables one-click filtering to find expensive sessions or identify
+cost trends across models.

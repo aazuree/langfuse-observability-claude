@@ -924,22 +924,58 @@ def classify_task_completed(turns: list[dict]) -> bool:
     return True
 
 
+def compute_cache_hit_rate(turns: list[dict]) -> float:
+    """Compute cache hit rate across all turns.
+
+    Cache hit rate = cache_read / (cache_read + cache_creation)
+    0.0 = no cache activity or all cold misses, 1.0 = all cache hits.
+    """
+    if not turns:
+        return 0.0
+
+    cache_read = sum(turn.get("usage", {}).get("cache_read", 0) for turn in turns)
+    cache_creation = sum(turn.get("usage", {}).get("cache_creation", 0) for turn in turns)
+    denominator = cache_read + cache_creation
+
+    if denominator == 0:
+        return 0.0
+
+    return round(cache_read / denominator, 4)
+
+
+def classify_cost_tier(total_cost: float) -> str:
+    """Classify session cost into a tier for dashboard filtering.
+
+    < $0.10 = cheap, $0.10–$1.00 = moderate, ≥ $1.00 = expensive.
+    """
+    if total_cost < 0.10:
+        return "cheap"
+    elif total_cost < 1.00:
+        return "moderate"
+    else:
+        return "expensive"
+
+
 def build_hook_score_events(
     trace_id: str,
     session_id: str,
     first_user_input: str,
     turns: list[dict],
+    total_cost: float,
 ) -> list[dict]:
     """Build score-create events for the ingestion batch.
 
-    Returns 3 events: session_type (CATEGORICAL), token_efficiency (NUMERIC),
-    task_completed (BOOLEAN as int 0/1).
+    Returns 5 events: session_type (CATEGORICAL), token_efficiency (NUMERIC),
+    task_completed (BOOLEAN as int 0/1), cache_hit_rate (NUMERIC),
+    cost_tier (CATEGORICAL).
     """
     now = datetime.now(timezone.utc).isoformat()
 
     session_type = classify_session_type(first_user_input)
     token_eff = calculate_token_efficiency(turns)
     completed = classify_task_completed(turns)
+    cache_hit = compute_cache_hit_rate(turns)
+    cost_tier = classify_cost_tier(total_cost)
 
     scores = [
         {
@@ -956,6 +992,16 @@ def build_hook_score_events(
             "name": "task_completed",
             "dataType": "BOOLEAN",
             "value": 1 if completed else 0,
+        },
+        {
+            "name": "cache_hit_rate",
+            "dataType": "NUMERIC",
+            "value": cache_hit,
+        },
+        {
+            "name": "cost_tier",
+            "dataType": "CATEGORICAL",
+            "value": cost_tier,
         },
     ]
 
@@ -1278,6 +1324,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
         session_id=session_id,
         first_user_input=first_user_input,
         turns=turns,
+        total_cost=total_cost,
     )
     batch.extend(score_events)
 

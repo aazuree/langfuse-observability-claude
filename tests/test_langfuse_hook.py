@@ -1229,13 +1229,13 @@ class TestProcessSession:
         assert len(sent_batches) == 1
         batch = sent_batches[0]
 
-        # Should have: 1 trace + 1 generation + 3 scores = 5 events
+        # Should have: 1 trace + 1 generation + 5 scores = 7 events
         trace_events = [e for e in batch if e["type"] == "trace-create"]
         gen_events = [e for e in batch if e["type"] == "generation-create"]
         score_events = [e for e in batch if e["type"] == "score-create"]
         assert len(trace_events) == 1
         assert len(gen_events) == 1
-        assert len(score_events) == 3
+        assert len(score_events) == 5
 
         # Trace metadata
         trace = trace_events[0]["body"]
