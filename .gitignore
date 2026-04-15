@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 .pytest_cache/
 docs/
+.worktrees/
 
 # Secrets and credentials
 *.key
