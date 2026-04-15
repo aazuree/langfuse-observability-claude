@@ -310,10 +310,10 @@ def ingest_subagent(
 
         usage_details = {
             "input": usage["input"], "output": usage["output"], "total": usage["total"],
-            "cache_read_input_tokens": usage["cache_read"],
-            "cache_creation_input_tokens": usage["cache_creation"],
-            "cache_ephemeral_5m_input_tokens": turn.get("cache_ephemeral_5m", 0),
-            "cache_ephemeral_1h_input_tokens": turn.get("cache_ephemeral_1h", 0),
+            "cache_read": usage["cache_read"],
+            "cache_create": usage["cache_creation"],
+            "cache_5m": turn.get("cache_ephemeral_5m", 0),
+            "cache_1h": turn.get("cache_ephemeral_1h", 0),
         }
 
         events.append({
@@ -1121,10 +1121,10 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
             "input": usage["input"],
             "output": usage["output"],
             "total": usage["total"],
-            "cache_read_input_tokens": usage["cache_read"],
-            "cache_creation_input_tokens": usage["cache_creation"],
-            "cache_ephemeral_5m_input_tokens": turn.get("cache_ephemeral_5m", 0),
-            "cache_ephemeral_1h_input_tokens": turn.get("cache_ephemeral_1h", 0),
+            "cache_read": usage["cache_read"],
+            "cache_create": usage["cache_creation"],
+            "cache_5m": turn.get("cache_ephemeral_5m", 0),
+            "cache_1h": turn.get("cache_ephemeral_1h", 0),
         }
 
         gen_body = {
