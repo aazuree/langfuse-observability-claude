@@ -112,7 +112,7 @@ Pricing is model-aware (per 1M tokens). Source: [platform.claude.com/docs/en/abo
 | Haiku 3.5 | $0.80 | $4.00 | $0.08 | $1.00 | $1.60 |
 | Haiku 3 (deprecated) | $0.25 | $1.25 | $0.03 | $0.30 | $0.50 |
 
-Cache write cost is split by tier when `cache_ephemeral_5m` / `cache_ephemeral_1h` are available in `usageDetails`; otherwise all cache_creation is billed at the 5m rate.
+Cache write cost is split by tier when `cache_5m` / `cache_1h` are available in `usageDetails`; otherwise all cache_create is billed at the 5m rate.
 
 Set `REPORT_API_EQUIVALENT_COST = False` in `langfuse-hook.py` to report $0.
 
@@ -146,15 +146,17 @@ API errors extracted from `type: "system"` / `subtype: "api_error"` entries via 
 - `web_search_requests`, `web_fetch_requests` — server-side tool use counts
 
 **Per-Generation usageDetails** (extended):
-- `cache_ephemeral_5m_input_tokens` — cache tokens with 5-minute TTL
-- `cache_ephemeral_1h_input_tokens` — cache tokens with 1-hour TTL
+- `cache_read` — cache read tokens (shared across tiers)
+- `cache_create` — cache creation tokens (split by tier below)
+- `cache_5m` — cache creation tokens with 5-minute TTL
+- `cache_1h` — cache creation tokens with 1-hour TTL
 
 ## Langfuse API Gotchas
 
 - **Use `usageDetails` + `costDetails`, not `usage` + `totalCost`**. Top-level `totalCost` on `generation-create` is silently ignored by Langfuse v3. Cost must go in `costDetails`; token counts in `usageDetails`.
 - **Explicit costs override auto-calculation**. When both `costDetails` and a matching built-in model exist, Langfuse uses the explicit values.
 - **Built-in model pricing lags new models**. Langfuse v3.73.1 has no pricing for `claude-opus-4-6` or `claude-sonnet-4-6` — only older model IDs like `claude-opus-4-20250514`. This is why we send explicit costs.
-- **Cache tokens are invisible in `usage`**. Only `usageDetails` (flexible map) surfaces `cache_read_input_tokens` and `cache_creation_input_tokens` as separate line items in the UI.
+- **Cache tokens are invisible in `usage`**. Only `usageDetails` (flexible map) surfaces `cache_read` and `cache_create` as separate line items in the UI, with tier breakdowns in `cache_5m` and `cache_1h`.
 - **ClickHouse ingestion is async**. Observations may take 5-10s to appear after the ingestion API returns 201.
 
 ## Token Anatomy
@@ -168,7 +170,7 @@ cache_read: 16.1M tokens      $24.21  (63%)   <-- biggest cost driver
 cache_create:  545K tokens     $10.22  (27%)
 ```
 
-The `input + output` count in the Langfuse UI can be misleadingly small. Always check `cache_read_input_tokens` in `usageDetails` for the real volume.
+The `input + output` count in the Langfuse UI can be misleadingly small. Always check `cache_read` in `usageDetails` for the real volume.
 
 ## Subagent Cost Tracking
 

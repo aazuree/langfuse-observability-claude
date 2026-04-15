@@ -1568,8 +1568,8 @@ class TestProcessSessionNewFields:
 
         # Verify usageDetails contains cache ephemeral fields
         usage_details = gen_body["usageDetails"]
-        assert usage_details["cache_ephemeral_5m_input_tokens"] == 100
-        assert usage_details["cache_ephemeral_1h_input_tokens"] == 200
+        assert usage_details["cache_5m"] == 100
+        assert usage_details["cache_1h"] == 200
 
     def test_fast_tag_added(self, tmp_path, monkeypatch):
         state_dir = tmp_path / "state"
@@ -1853,5 +1853,5 @@ class TestSubagentNewFields:
         assert meta["web_fetch_requests"] == 0
 
         usage_details = gen_events[0]["body"]["usageDetails"]
-        assert usage_details["cache_ephemeral_5m_input_tokens"] == 0
-        assert usage_details["cache_ephemeral_1h_input_tokens"] == 100
+        assert usage_details["cache_5m"] == 0
+        assert usage_details["cache_1h"] == 100
