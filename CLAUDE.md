@@ -101,16 +101,18 @@ uv run pytest tests/ -k "discover" -v  # Run tests matching pattern
 
 ## Cost Model
 
-Pricing is model-aware (per 1M tokens). Source: [platform.claude.com/docs/en/about-claude/pricing](https://platform.claude.com/docs/en/about-claude/pricing) (last verified 2026-04-04).
+Pricing is model-aware (per 1M tokens). Source: [platform.claude.com/docs/en/about-claude/pricing](https://platform.claude.com/docs/en/about-claude/pricing) (last verified 2026-04-17).
 
 | Model | Input | Output | Cache Read | Cache Write 5m | Cache Write 1h |
 |-------|-------|--------|------------|----------------|----------------|
-| Opus 4.6 / 4.5 | $5.00 | $25.00 | $0.50 | $6.25 | $10.00 |
+| Opus 4.7 / 4.6 / 4.5 | $5.00 | $25.00 | $0.50 | $6.25 | $10.00 |
 | Opus 4.1 / 4.0 (legacy) | $15.00 | $75.00 | $1.50 | $18.75 | $30.00 |
 | Sonnet (all versions) | $3.00 | $15.00 | $0.30 | $3.75 | $6.00 |
 | Haiku 4.5 | $1.00 | $5.00 | $0.10 | $1.25 | $2.00 |
 | Haiku 3.5 | $0.80 | $4.00 | $0.08 | $1.00 | $1.60 |
 | Haiku 3 (deprecated) | $0.25 | $1.25 | $0.03 | $0.30 | $0.50 |
+
+**Opus 4.7 tokenizer note:** Opus 4.7 ships with a new tokenizer that may produce up to 35% more tokens for the same input text vs. prior models. Per-token rates are unchanged, but absolute session cost for equivalent workloads on 4.7 can be meaningfully higher than on 4.6.
 
 Cache write cost is split by tier when `cache_5m` / `cache_1h` are available in `usageDetails`; otherwise all cache_create is billed at the 5m rate.
 
@@ -128,15 +130,35 @@ Each trace is enriched with:
 - model family — `opus`, `sonnet`, or `haiku`
 - entrypoint — `cli` or other launch method
 - `fast` — present if any turn used `/fast` mode
+- `has-thinking` — present if any turn contains extended-thinking chain-of-thought
 - `has-errors` — present if API errors occurred during the session
+- `permission:<mode>` — current permission mode (`default`, `acceptEdits`, `plan`, `bypassPermissions`)
+- `pr:<N>` — one tag per PR linked from the session (via `pr-link` transcript entries)
+
+**Trace Name precedence:**
+1. `customTitle` from `type: "custom-title"` (user-set via in-CLI title command)
+2. Legacy `slug` field (only present in v2.1.111 and earlier transcripts)
+3. Truncated first user prompt (80 chars)
+4. `"Claude Code Session"` fallback
+
+The auto-generated 3-word slug (e.g. `goofy-frolicking-dove`) was removed from
+JSONL transcripts in Claude Code v2.1.112. We now derive the trace name from the
+custom title when set, otherwise from the first prompt.
 
 **Trace Metadata** (structured key-value on trace):
 - `git_branch`, `cli_version`, `entrypoint`, `repo_name`, `cwd`
 - `turn_count`, `tool_calls_total`, `total_tokens`, `total_input_tokens`, `total_output_tokens`
 - `api_errors` — error summary: `total_count`, `by_status` (HTTP codes), `first_error_at`, `last_error_at`
+- `custom_title` — user-set session title (when present)
+- `permission_mode` — last permission mode observed
+- `pr_links` — list of `{number, url, repository, timestamp}` from `pr-link` entries
+- `away_summaries` — list of `{content, timestamp}` from `system/away_summary` entries
 
 Extracted from the first `type: "user"` entry in the JSONL transcript via `extract_session_metadata()`.
 API errors extracted from `type: "system"` / `subtype: "api_error"` entries via `extract_api_errors()`.
+Custom title, permission mode, PR links, and away summaries are extracted via
+`extract_custom_title()`, `extract_permission_mode()`, `extract_pr_links()`,
+and `extract_away_summaries()` respectively.
 
 **Per-Generation Metadata** (on each generation):
 - `speed` — `standard` or `fast` (from `/fast` toggle)
@@ -144,12 +166,33 @@ API errors extracted from `type: "system"` / `subtype: "api_error"` entries via 
 - `inference_geo` — inference region (e.g., `us-east-1`)
 - `request_ids` — list of Anthropic request IDs for server-side correlation
 - `web_search_requests`, `web_fetch_requests` — server-side tool use counts
+- `thinking_chars` — length of extended-thinking text captured (only present when thinking exists)
 
 **Per-Generation usageDetails** (extended):
 - `cache_read` — cache read tokens (shared across tiers)
 - `cache_create` — cache creation tokens (split by tier below)
 - `cache_5m` — cache creation tokens with 5-minute TTL
 - `cache_1h` — cache creation tokens with 1-hour TTL
+
+## Extended Thinking (Chain-of-Thought) Capture
+
+When a turn uses [extended thinking](https://platform.claude.com/docs/en/build-with-claude/extended-thinking), the assistant content contains `thinking` blocks (plain CoT) and/or `redacted_thinking` blocks (encrypted by Anthropic's safety layer). The hook extracts both via `extract_thinking_blocks()` and prepends them to the generation's `output` field as:
+
+```
+<thinking>
+...chain of thought text...
+</thinking>
+
+...final assistant response...
+```
+
+**Design choice:** thinking is prepended to `output` (not stored in metadata) because the `output` field is the most visible surface in the Langfuse UI, and metadata is already large on rich traces. Truncation still respects `MAX_TEXT=10000` — the raw JSONL transcript on disk remains the source of truth for un-truncated CoT.
+
+**Multi-step turns:** When a turn makes multiple API calls (e.g. think → tool → think → reply), thinking from each call is concatenated in chronological order. Per streaming update we keep the final state per `message.id` to avoid duplication.
+
+**Redacted thinking:** Redacted segments are rendered as `[redacted thinking block]` — the encrypted payload itself is never exposed.
+
+**Tag:** Traces containing any thinking blocks are tagged `has-thinking` for filtering.
 
 ## Langfuse API Gotchas
 
