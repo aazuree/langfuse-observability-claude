@@ -197,6 +197,182 @@ class TestExtractToolUses:
 
 
 # ---------------------------------------------------------------------------
+# extract_thinking_blocks / format_thinking_output
+# ---------------------------------------------------------------------------
+
+class TestExtractThinkingBlocks:
+    def test_plain_thinking_block(self):
+        content = [
+            {"type": "thinking", "thinking": "Let me reason about this..."},
+            {"type": "text", "text": "The answer is 4."},
+        ]
+        assert hook.extract_thinking_blocks(content) == "Let me reason about this..."
+
+    def test_multiple_thinking_blocks_joined(self):
+        content = [
+            {"type": "thinking", "thinking": "Step 1"},
+            {"type": "thinking", "thinking": "Step 2"},
+            {"type": "text", "text": "Done"},
+        ]
+        assert hook.extract_thinking_blocks(content) == "Step 1\nStep 2"
+
+    def test_redacted_thinking_shows_marker(self):
+        content = [
+            {"type": "redacted_thinking", "data": "opaque-encrypted-payload"},
+            {"type": "text", "text": "Response"},
+        ]
+        result = hook.extract_thinking_blocks(content)
+        assert "[redacted thinking block]" in result
+        # Never leak the encrypted payload
+        assert "opaque-encrypted-payload" not in result
+
+    def test_mixed_thinking_and_redacted(self):
+        content = [
+            {"type": "thinking", "thinking": "Plain cot"},
+            {"type": "redacted_thinking", "data": "xxx"},
+            {"type": "thinking", "thinking": "More cot"},
+        ]
+        result = hook.extract_thinking_blocks(content)
+        assert result == "Plain cot\n[redacted thinking block]\nMore cot"
+
+    def test_no_thinking_returns_empty(self):
+        content = [{"type": "text", "text": "just a response"}]
+        assert hook.extract_thinking_blocks(content) == ""
+
+    def test_string_input_returns_empty(self):
+        assert hook.extract_thinking_blocks("plain string") == ""
+
+    def test_empty_thinking_skipped(self):
+        content = [{"type": "thinking", "thinking": ""}]
+        assert hook.extract_thinking_blocks(content) == ""
+
+
+class TestFormatThinkingOutput:
+    def test_no_thinking_returns_output_unchanged(self):
+        assert hook.format_thinking_output("", "response") == "response"
+
+    def test_prepends_thinking_to_output(self):
+        result = hook.format_thinking_output("reasoning", "answer")
+        assert result == "<thinking>\nreasoning\n</thinking>\n\nanswer"
+
+    def test_thinking_only_no_output(self):
+        # Turns can be tool-use-only with no final text; still surface thinking
+        result = hook.format_thinking_output("reasoning", "")
+        assert result == "<thinking>\nreasoning\n</thinking>"
+
+    def test_both_empty(self):
+        assert hook.format_thinking_output("", "") == ""
+
+
+class TestBuildTurnsWithThinking:
+    """Integration: verify thinking flows through build_turns to turn['thinking']."""
+
+    def test_single_turn_captures_thinking(self):
+        entries = [
+            {"type": "user", "timestamp": "2026-04-17T10:00:00+00:00", "uuid": "u1",
+             "message": {"role": "user", "content": "Solve this"}},
+            {"type": "assistant", "timestamp": "2026-04-17T10:00:02+00:00",
+             "message": {
+                 "id": "msg-1", "role": "assistant", "model": "claude-opus-4-7",
+                 "content": [
+                     {"type": "thinking", "thinking": "I should think step by step"},
+                     {"type": "text", "text": "The answer is 42."},
+                 ],
+                 "usage": {"input_tokens": 10, "output_tokens": 5,
+                           "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+             }},
+        ]
+        turns = hook.build_turns(entries)
+        assert len(turns) == 1
+        assert turns[0]["thinking"] == "I should think step by step"
+        assert turns[0]["assistant_output"] == "The answer is 42."
+
+    def test_multi_step_turn_concatenates_thinking_across_api_calls(self):
+        """A turn that does think -> tool -> think -> reply should preserve both thinking segments."""
+        entries = [
+            {"type": "user", "timestamp": "2026-04-17T10:00:00+00:00", "uuid": "u1",
+             "message": {"role": "user", "content": "Do a thing"}},
+            # First assistant API call: think + tool_use
+            {"type": "assistant", "timestamp": "2026-04-17T10:00:01+00:00",
+             "message": {
+                 "id": "msg-1", "role": "assistant", "model": "claude-opus-4-7",
+                 "content": [
+                     {"type": "thinking", "thinking": "First I need to read the file"},
+                     {"type": "tool_use", "id": "t1", "name": "Read", "input": {"path": "x"}},
+                 ],
+                 "usage": {"input_tokens": 10, "output_tokens": 5,
+                           "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+             }},
+            # Tool result (user message with tool_result, no user text)
+            {"type": "user", "timestamp": "2026-04-17T10:00:02+00:00", "uuid": "u2",
+             "message": {"role": "user", "content": [
+                 {"type": "tool_result", "tool_use_id": "t1", "content": "file contents"},
+             ]}},
+            # Second assistant API call: think + final text
+            {"type": "assistant", "timestamp": "2026-04-17T10:00:03+00:00",
+             "message": {
+                 "id": "msg-2", "role": "assistant", "model": "claude-opus-4-7",
+                 "content": [
+                     {"type": "thinking", "thinking": "Now I can answer"},
+                     {"type": "text", "text": "Here is the result."},
+                 ],
+                 "usage": {"input_tokens": 15, "output_tokens": 8,
+                           "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+             }},
+        ]
+        turns = hook.build_turns(entries)
+        assert len(turns) == 1
+        # Both thinking segments preserved in chronological order
+        assert "First I need to read the file" in turns[0]["thinking"]
+        assert "Now I can answer" in turns[0]["thinking"]
+        assert turns[0]["thinking"].index("First") < turns[0]["thinking"].index("Now")
+        assert turns[0]["assistant_output"] == "Here is the result."
+
+    def test_streaming_dedupe_keeps_last_thinking_per_message_id(self):
+        """Streaming updates share a message_id; only the final (complete) thinking should be kept."""
+        entries = [
+            {"type": "user", "timestamp": "2026-04-17T10:00:00+00:00", "uuid": "u1",
+             "message": {"role": "user", "content": "Go"}},
+            # Partial streaming update
+            {"type": "assistant", "timestamp": "2026-04-17T10:00:01+00:00",
+             "message": {
+                 "id": "msg-1", "role": "assistant", "model": "claude-opus-4-7",
+                 "content": [{"type": "thinking", "thinking": "Partial..."}],
+                 "usage": {"input_tokens": 10, "output_tokens": 1,
+                           "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+             }},
+            # Final streaming update (same msg_id, complete thinking)
+            {"type": "assistant", "timestamp": "2026-04-17T10:00:02+00:00",
+             "message": {
+                 "id": "msg-1", "role": "assistant", "model": "claude-opus-4-7",
+                 "content": [
+                     {"type": "thinking", "thinking": "Partial but complete now"},
+                     {"type": "text", "text": "Done."},
+                 ],
+                 "usage": {"input_tokens": 10, "output_tokens": 5,
+                           "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+             }},
+        ]
+        turns = hook.build_turns(entries)
+        assert turns[0]["thinking"] == "Partial but complete now"
+
+    def test_no_thinking_produces_empty_field(self):
+        entries = [
+            {"type": "user", "timestamp": "2026-04-17T10:00:00+00:00", "uuid": "u1",
+             "message": {"role": "user", "content": "Hi"}},
+            {"type": "assistant", "timestamp": "2026-04-17T10:00:01+00:00",
+             "message": {
+                 "id": "msg-1", "role": "assistant", "model": "claude-opus-4-7",
+                 "content": [{"type": "text", "text": "Hello."}],
+                 "usage": {"input_tokens": 5, "output_tokens": 2,
+                           "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+             }},
+        ]
+        turns = hook.build_turns(entries)
+        assert turns[0]["thinking"] == ""
+
+
+# ---------------------------------------------------------------------------
 # extract_tool_results
 # ---------------------------------------------------------------------------
 
@@ -471,6 +647,126 @@ class TestExtractSlug:
 
 
 # ---------------------------------------------------------------------------
+# extract_custom_title (v2.1.110+ schema)
+# ---------------------------------------------------------------------------
+
+class TestExtractCustomTitle:
+    def test_returns_first_custom_title(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        entries = [
+            {"type": "user"},
+            {"type": "custom-title", "customTitle": "fix-pricing-bug"},
+            {"type": "custom-title", "customTitle": "later-renamed"},
+        ]
+        f.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        assert hook.extract_custom_title(str(f)) == "fix-pricing-bug"
+
+    def test_no_custom_title(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        f.write_text(json.dumps({"type": "user"}) + "\n")
+        assert hook.extract_custom_title(str(f)) == ""
+
+    def test_skips_empty(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        entries = [
+            {"type": "custom-title", "customTitle": ""},
+            {"type": "custom-title", "customTitle": "real-title"},
+        ]
+        f.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        assert hook.extract_custom_title(str(f)) == "real-title"
+
+    def test_nonexistent_file(self):
+        assert hook.extract_custom_title("/nonexistent.jsonl") == ""
+
+
+# ---------------------------------------------------------------------------
+# extract_permission_mode
+# ---------------------------------------------------------------------------
+
+class TestExtractPermissionMode:
+    def test_returns_last_mode(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        entries = [
+            {"type": "permission-mode", "permissionMode": "default"},
+            {"type": "user"},
+            {"type": "permission-mode", "permissionMode": "acceptEdits"},
+        ]
+        f.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        assert hook.extract_permission_mode(str(f)) == "acceptEdits"
+
+    def test_no_mode(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        f.write_text(json.dumps({"type": "user"}) + "\n")
+        assert hook.extract_permission_mode(str(f)) == ""
+
+    def test_nonexistent_file(self):
+        assert hook.extract_permission_mode("/nonexistent.jsonl") == ""
+
+
+# ---------------------------------------------------------------------------
+# extract_pr_links
+# ---------------------------------------------------------------------------
+
+class TestExtractPrLinks:
+    def test_collects_in_order(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        entries = [
+            {"type": "pr-link", "prNumber": 9, "prUrl": "https://x/9",
+             "prRepository": "a/b", "timestamp": "2026-04-15T13:18:20.953Z"},
+            {"type": "user"},
+            {"type": "pr-link", "prNumber": 10, "prUrl": "https://x/10",
+             "prRepository": "a/b", "timestamp": "2026-04-15T14:00:00.000Z"},
+        ]
+        f.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        out = hook.extract_pr_links(str(f))
+        assert len(out) == 2
+        assert out[0]["number"] == 9 and out[0]["url"] == "https://x/9"
+        assert out[1]["number"] == 10
+
+    def test_empty_when_none(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        f.write_text(json.dumps({"type": "user"}) + "\n")
+        assert hook.extract_pr_links(str(f)) == []
+
+
+# ---------------------------------------------------------------------------
+# extract_away_summaries
+# ---------------------------------------------------------------------------
+
+class TestExtractAwaySummaries:
+    def test_collects_summaries(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        entries = [
+            {"type": "system", "subtype": "away_summary",
+             "content": "Goal: design routine X", "timestamp": "2026-04-17T08:00:00Z"},
+            {"type": "system", "subtype": "stop_hook_summary"},
+            {"type": "system", "subtype": "away_summary",
+             "content": "Continued planning", "timestamp": "2026-04-17T08:10:00Z"},
+        ]
+        f.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        out = hook.extract_away_summaries(str(f))
+        assert len(out) == 2
+        assert out[0]["content"] == "Goal: design routine X"
+        assert out[1]["content"] == "Continued planning"
+
+    def test_skips_empty_content(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        entries = [
+            {"type": "system", "subtype": "away_summary", "content": ""},
+            {"type": "system", "subtype": "away_summary", "content": "real"},
+        ]
+        f.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        out = hook.extract_away_summaries(str(f))
+        assert len(out) == 1
+        assert out[0]["content"] == "real"
+
+    def test_empty_when_none(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        f.write_text(json.dumps({"type": "user"}) + "\n")
+        assert hook.extract_away_summaries(str(f)) == []
+
+
+# ---------------------------------------------------------------------------
 # calculate_turn_cost
 # ---------------------------------------------------------------------------
 
@@ -567,6 +863,8 @@ class TestCalculateTurnCost:
 
     @pytest.mark.parametrize("model,expected_input,expected_output", [
         # Current models
+        ("claude-opus-4-7",              5.0,   25.0),
+        ("claude-opus-4-7-20260415",     5.0,   25.0),
         ("claude-opus-4-6",              5.0,   25.0),
         ("claude-opus-4-5-20251101",     5.0,   25.0),
         ("claude-sonnet-4-6",            3.0,   15.0),

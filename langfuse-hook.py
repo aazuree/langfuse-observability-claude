@@ -40,6 +40,11 @@ MAX_LOG_BYTES = 10 * 1024 * 1024  # 10 MB
 
 SAFE_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
+# Synthetic user-message wrappers (slash commands, local-command output,
+# system reminders, prompt-submit hooks). Used to skip these when picking
+# a human-readable trace name from the first user prompt.
+_SYNTHETIC_PROMPT_RE = re.compile(r"^<[a-z][a-z0-9-]*>")
+
 SUBAGENT_MATCH_WINDOW_S = 60  # Max seconds between Agent tool_use and subagent start
 
 # Patterns to redact from text before sending to Langfuse
@@ -316,6 +321,23 @@ def ingest_subagent(
             "cache_1h": turn.get("cache_ephemeral_1h", 0),
         }
 
+        sa_thinking = turn.get("thinking", "")
+        sa_output = format_thinking_output(sa_thinking, turn["assistant_output"])
+
+        sa_metadata = {
+            "subagent_id": agent_id,
+            "tools_used": [tc["name"] for tc in turn["tool_calls"]],
+            "tool_count": len(turn["tool_calls"]),
+            "speed": turn.get("speed", ""),
+            "service_tier": turn.get("service_tier", ""),
+            "inference_geo": turn.get("inference_geo", ""),
+            "request_ids": list(dict.fromkeys(turn.get("request_ids", []))),
+            "web_search_requests": turn.get("web_search_requests", 0),
+            "web_fetch_requests": turn.get("web_fetch_requests", 0),
+        }
+        if sa_thinking:
+            sa_metadata["thinking_chars"] = len(sa_thinking)
+
         events.append({
             "id": f"evt-{gen_id}",
             "timestamp": start_time or now,
@@ -327,22 +349,12 @@ def ingest_subagent(
                 "name": f"Subagent Turn {turn_idx + 1}: {redact_secrets(truncate(turn['user_input'], 80))}",
                 "model": model,
                 "input": redact_secrets(truncate(turn["user_input"], MAX_TEXT)) or None,
-                "output": redact_secrets(truncate(turn["assistant_output"], MAX_TEXT)) or None,
+                "output": redact_secrets(truncate(sa_output, MAX_TEXT)) or None,
                 "startTime": start_time,
                 "endTime": end_time,
                 "usageDetails": usage_details,
                 "costDetails": cost_details if cost_details else None,
-                "metadata": {
-                    "subagent_id": agent_id,
-                    "tools_used": [tc["name"] for tc in turn["tool_calls"]],
-                    "tool_count": len(turn["tool_calls"]),
-                    "speed": turn.get("speed", ""),
-                    "service_tier": turn.get("service_tier", ""),
-                    "inference_geo": turn.get("inference_geo", ""),
-                    "request_ids": list(dict.fromkeys(turn.get("request_ids", []))),
-                    "web_search_requests": turn.get("web_search_requests", 0),
-                    "web_fetch_requests": turn.get("web_fetch_requests", 0),
-                },
+                "metadata": sa_metadata,
             },
         })
 
@@ -394,7 +406,11 @@ def ingest_subagent(
 
 
 def extract_slug(transcript_path: str) -> str:
-    """Scan the transcript for the first non-empty slug field."""
+    """Scan the transcript for the first non-empty slug field.
+
+    Legacy: removed from Claude Code v2.1.112+ transcripts. Kept for back-compat
+    with older transcripts processed via --reprocess.
+    """
     try:
         with open(transcript_path) as f:
             for line in f:
@@ -411,6 +427,73 @@ def extract_slug(transcript_path: str) -> str:
     except Exception:
         pass
     return ""
+
+
+def _iter_transcript(transcript_path: str):
+    try:
+        with open(transcript_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    yield json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+    except Exception:
+        return
+
+
+def extract_custom_title(transcript_path: str) -> str:
+    """First non-empty customTitle entry (v2.1.110+ transcripts).
+
+    Set by the user via the in-CLI title command. Absent in most sessions.
+    """
+    for entry in _iter_transcript(transcript_path):
+        if entry.get("type") == "custom-title":
+            title = entry.get("customTitle", "")
+            if title:
+                return title
+    return ""
+
+
+def extract_permission_mode(transcript_path: str) -> str:
+    """Most recent permission-mode entry. The mode can change mid-session."""
+    last = ""
+    for entry in _iter_transcript(transcript_path):
+        if entry.get("type") == "permission-mode":
+            mode = entry.get("permissionMode", "")
+            if mode:
+                last = mode
+    return last
+
+
+def extract_pr_links(transcript_path: str) -> list:
+    """All pr-link entries in chronological order."""
+    out = []
+    for entry in _iter_transcript(transcript_path):
+        if entry.get("type") == "pr-link":
+            out.append({
+                "number": entry.get("prNumber"),
+                "url": entry.get("prUrl"),
+                "repository": entry.get("prRepository"),
+                "timestamp": entry.get("timestamp"),
+            })
+    return out
+
+
+def extract_away_summaries(transcript_path: str) -> list:
+    """All system/away_summary entries — content written when user steps away."""
+    out = []
+    for entry in _iter_transcript(transcript_path):
+        if entry.get("type") == "system" and entry.get("subtype") == "away_summary":
+            content = entry.get("content")
+            if content:
+                out.append({
+                    "content": truncate(content, MAX_TEXT),
+                    "timestamp": entry.get("timestamp"),
+                })
+    return out
 
 
 def parse_transcript(transcript_path: str, skip_lines: int = 0) -> tuple[list[dict], int]:
@@ -456,6 +539,39 @@ def extract_tool_uses(content) -> list[dict]:
     if not isinstance(content, list):
         return []
     return [b for b in content if isinstance(b, dict) and b.get("type") == "tool_use"]
+
+
+def extract_thinking_blocks(content) -> str:
+    """Extract extended-thinking chain-of-thought from assistant content.
+
+    Handles both `thinking` blocks (plain CoT) and `redacted_thinking` blocks
+    (encrypted by Anthropic's safety layer — we surface a marker, not the
+    opaque payload). Returns concatenated text, empty string if none.
+    """
+    if not isinstance(content, list):
+        return ""
+    parts = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        btype = block.get("type")
+        if btype == "thinking":
+            t = block.get("thinking", "")
+            if t:
+                parts.append(t)
+        elif btype == "redacted_thinking":
+            parts.append("[redacted thinking block]")
+    return "\n".join(parts)
+
+
+def format_thinking_output(thinking: str, output: str) -> str:
+    """Prepend a thinking preamble to an assistant response for Langfuse display.
+
+    Returns the original output unchanged when thinking is empty.
+    """
+    if not thinking:
+        return output
+    return f"<thinking>\n{thinking}\n</thinking>\n\n{output}" if output else f"<thinking>\n{thinking}\n</thinking>"
 
 
 def extract_tool_results(content) -> dict[str, str]:
@@ -576,6 +692,7 @@ def build_turns(entries: list[dict]) -> list[dict]:
                     "usage": {"input": 0, "output": 0, "total": 0},
                     "api_call_ids": set(),
                     "messages": [me],
+                    "thinking_by_mid": {},
                 }
             elif current_turn:
                 current_turn["messages"].append(me)
@@ -599,6 +716,12 @@ def build_turns(entries: list[dict]) -> list[dict]:
             text = extract_text_blocks(content)
             if text.strip():
                 current_turn["assistant_output"] = text
+
+            # Collect extended-thinking blocks (per message_id, last streaming update wins).
+            # Preserves thinking across multi-step turns (e.g. think -> tool -> think -> reply).
+            thinking = extract_thinking_blocks(content)
+            if thinking and mid:
+                current_turn["thinking_by_mid"][mid] = thinking
 
             # Collect tool uses
             for tu in extract_tool_uses(content):
@@ -668,6 +791,10 @@ def build_turns(entries: list[dict]) -> list[dict]:
         turn["cache_ephemeral_1h"] = cache_ephemeral_1h
         turn["request_ids"] = request_ids
         turn["api_call_ids"] = list(turn["api_call_ids"])  # make serializable
+        # Flatten extended-thinking blocks in message arrival order. Dict
+        # preserves insertion order (Python 3.7+), so this matches the
+        # chronological sequence of API calls that produced the thinking.
+        turn["thinking"] = "\n\n".join(turn.pop("thinking_by_mid", {}).values())
 
     # Match turn_duration entries to turns (by proximity of timestamps)
     for td in turn_durations:
@@ -778,7 +905,7 @@ def calculate_turn_cost(usage: dict, model: str, cache_5m: int = 0, cache_1h: in
 
     m = model.lower()
     # Pricing per 1M tokens: (input, output, cache_read, cache_write_5m, cache_write_1h)
-    # Source: platform.claude.com/docs/en/about-claude/pricing (verified 2026-04-04)
+    # Source: platform.claude.com/docs/en/about-claude/pricing (verified 2026-04-17)
     # When a new model releases, its name will fall through to Sonnet pricing and log a warning.
     # Update this function + CLAUDE.md Cost Model table when that happens.
     if "haiku" in m:
@@ -789,7 +916,7 @@ def calculate_turn_cost(usage: dict, model: str, cache_5m: int = 0, cache_1h: in
         else:                                        # Haiku 3
             p_in, p_out, p_cr, p_cc5, p_cc1 = 0.25, 1.25, 0.03, 0.30, 0.50
     elif "opus" in m:
-        if any(x in m for x in ("opus-4-5", "opus-4-6")):  # Opus 4.5 / 4.6
+        if any(x in m for x in ("opus-4-5", "opus-4-6", "opus-4-7")):  # Opus 4.5 / 4.6 / 4.7
             p_in, p_out, p_cr, p_cc5, p_cc1 = 5.0, 25.0, 0.50, 6.25, 10.0
         else:                                        # Opus 4.1, 4.0, 3 (legacy)
             p_in, p_out, p_cr, p_cc5, p_cc1 = 15.0, 75.0, 1.50, 18.75, 30.0
@@ -1034,6 +1161,10 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
     """Core processing logic for a single session transcript."""
     prev_offset = load_state(session_id)
     slug = extract_slug(transcript_path)
+    custom_title = extract_custom_title(transcript_path)
+    permission_mode = extract_permission_mode(transcript_path)
+    pr_links = extract_pr_links(transcript_path)
+    away_summaries = extract_away_summaries(transcript_path)
     entries, total_lines = parse_transcript(transcript_path, skip_lines=prev_offset)
 
     if not entries:
@@ -1062,6 +1193,9 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
     # Check if any turn used fast inference
     has_fast = any(t.get("speed") == "fast" for t in turns)
 
+    # Check if any turn contains extended-thinking chain-of-thought
+    has_thinking = any(t.get("thinking") for t in turns)
+
     # Collect unique model families used across all turns
     model_families = set()
     for t in turns:
@@ -1088,7 +1222,29 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
             last_assistant_output = t["assistant_output"]
             break
 
+    # For trace naming, skip synthetic stubs (slash commands, local-command
+    # output, system reminders, prompt-submit hooks) which all start with an
+    # XML-like wrapper tag. Real user prompts are plain text. Falls back to
+    # the raw first prompt if every turn is a stub.
+    first_real_prompt = first_user_input
+    for t in turns:
+        ui = (t.get("user_input") or "").strip()
+        if ui and not _SYNTHETIC_PROMPT_RE.match(ui):
+            first_real_prompt = ui
+            break
+
     trace_ts = turns[0].get("start_time") or now
+
+    # Trace name precedence: custom title > legacy slug > truncated first prompt
+    trace_name = (
+        custom_title
+        or slug
+        or truncate(redact_secrets(first_real_prompt), 80).strip()
+        or "Claude Code Session"
+    )
+
+    pr_tags = [f"pr:{p['number']}" for p in pr_links if p.get("number") is not None]
+
     # 1. Trace
     batch.append({
         "id": f"evt-{uuid.uuid4()}-trace",
@@ -1097,7 +1253,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
         "body": {
             "id": trace_id,
             "timestamp": trace_ts,
-            "name": slug or "Claude Code Session",
+            "name": trace_name,
             "sessionId": session_id,
             "userId": os.environ.get("USER", "unknown"),
             "input": redact_secrets(truncate(first_user_input, MAX_TEXT)) or None,
@@ -1114,6 +1270,10 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
                 "entrypoint": session_meta.get("entrypoint", ""),
                 "repo_name": repo_name,
                 "api_errors": api_errors if has_errors else None,
+                "custom_title": custom_title or None,
+                "permission_mode": permission_mode or None,
+                "pr_links": pr_links or None,
+                "away_summaries": away_summaries or None,
             },
             "tags": [t for t in [
                 "claude-code",
@@ -1121,7 +1281,10 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
                 *sorted(model_families),
                 session_meta.get("entrypoint") or None,
                 "fast" if has_fast else None,
+                "has-thinking" if has_thinking else None,
                 "has-errors" if has_errors else None,
+                f"permission:{permission_mode}" if permission_mode else None,
+                *pr_tags,
             ] if t],
         },
     })
@@ -1173,13 +1336,16 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
             "cache_1h": turn.get("cache_ephemeral_1h", 0),
         }
 
+        turn_thinking = turn.get("thinking", "")
+        output_with_thinking = format_thinking_output(turn_thinking, turn["assistant_output"])
+
         gen_body = {
             "id": gen_id,
             "traceId": trace_id,
             "name": f"Turn {prev_offset + turn_idx + 1}: {redact_secrets(truncate(turn['user_input'], 80))}",
             "model": model,
             "input": redact_secrets(truncate(turn["user_input"], MAX_TEXT)) or None,
-            "output": redact_secrets(truncate(turn["assistant_output"], MAX_TEXT)) or None,
+            "output": redact_secrets(truncate(output_with_thinking, MAX_TEXT)) or None,
             "startTime": start_time,
             "endTime": end_time,
             "completionStartTime": first_token_time,
@@ -1202,6 +1368,8 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
             gen_body["metadata"]["ttft_ms"] = ttft_ms
         if duration_ms:
             gen_body["metadata"]["duration_ms"] = duration_ms
+        if turn_thinking:
+            gen_body["metadata"]["thinking_chars"] = len(turn_thinking)
 
         batch.append({
             "id": f"evt-{turn_id}-gen",
@@ -1372,7 +1540,7 @@ def reprocess_all() -> None:
 
     for idx, transcript in enumerate(transcripts, 1):
         session_id = sanitize_id(transcript.stem)
-        slug = extract_slug(str(transcript))
+        slug = extract_slug(str(transcript)) or extract_custom_title(str(transcript))
         cwd = extract_cwd(str(transcript))
 
         # Delete existing trace to avoid duplicates, then reset state
