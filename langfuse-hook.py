@@ -15,7 +15,6 @@ Environment variables:
   LANGFUSE_HOST        - Langfuse base URL (default: http://localhost:3000)
 """
 
-import base64
 import hashlib
 import json
 import os
@@ -26,6 +25,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request, urlopen
+
+# Ensure langfuse_common can be imported from the same directory
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from langfuse_common import log as common_log, make_auth_header, redact_secrets
 
 LANGFUSE_HOST = os.environ.get("LANGFUSE_HOST", "http://localhost:3000")
 LANGFUSE_PUBLIC_KEY = os.environ.get("LANGFUSE_PUBLIC_KEY", "")
@@ -48,30 +51,13 @@ _SYNTHETIC_PROMPT_RE = re.compile(r"^<[a-z][a-z0-9-]*>")
 
 SUBAGENT_MATCH_WINDOW_S = 60  # Max seconds between Agent tool_use and subagent start
 
-# Patterns to redact from text before sending to Langfuse
-SECRET_PATTERNS = [
-    re.compile(r"(?i)(api[_-]?key|apikey|secret[_-]?key|access[_-]?key|token|password|passwd|credential|auth)[\s]*[=:]\s*['\"]?([^\s'\"]{8,})['\"]?"),
-    re.compile(r"(?i)(sk|pk|api|key|token|secret|password|bearer|ghp|gho|ghu|ghs|ghr|glpat|xox[bposatr]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[-_]?[a-zA-Z0-9/+=]{16,}"),
-    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"),
-    re.compile(r"(?i)Bearer\s+[a-zA-Z0-9._\-/+=]{20,}"),
-]
-
 # Pro subscription: $0 marginal cost. Set to True to report equivalent API cost instead.
 REPORT_API_EQUIVALENT_COST = True
 
 
 def log(msg: str) -> None:
-    try:
-        # Rotate log if it exceeds MAX_LOG_BYTES
-        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > MAX_LOG_BYTES:
-            rotated = LOG_FILE + ".1"
-            if os.path.exists(rotated):
-                os.remove(rotated)
-            os.rename(LOG_FILE, rotated)
-        with open(LOG_FILE, "a") as f:
-            f.write(f"{datetime.now(timezone.utc).isoformat()} {msg}\n")
-    except Exception:
-        pass
+    """Wrapper around common_log for backward compatibility."""
+    common_log(LOG_FILE, msg)
 
 
 def sanitize_id(value: str) -> str:
@@ -80,20 +66,6 @@ def sanitize_id(value: str) -> str:
         return value
     # Fall back to a hash of the value
     return hashlib.sha256(value.encode()).hexdigest()[:32]
-
-
-def redact_secrets(text: str) -> str:
-    """Redact known secret patterns from text."""
-    for pattern in SECRET_PATTERNS:
-        text = pattern.sub("[REDACTED]", text)
-    return text
-
-
-def make_auth_header() -> str:
-    creds = base64.b64encode(
-        f"{LANGFUSE_PUBLIC_KEY}:{LANGFUSE_SECRET_KEY}".encode()
-    ).decode()
-    return f"Basic {creds}"
 
 
 def send_to_langfuse(batch: list[dict]) -> None:

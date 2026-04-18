@@ -41,6 +41,10 @@ from pathlib import Path
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
+# Ensure langfuse_common can be imported from the same directory
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from langfuse_common import log as common_log, make_auth_header, redact_secrets
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -62,30 +66,13 @@ CLI_TIMEOUT_SECONDS = 30  # timeout for claude CLI invocations
 
 
 def log(msg: str) -> None:
-    """Append a timestamped message to the log file (10 MB rotation)."""
-    try:
-        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > MAX_LOG_BYTES:
-            rotated = LOG_FILE + ".1"
-            if os.path.exists(rotated):
-                os.remove(rotated)
-            os.rename(LOG_FILE, rotated)
-        with open(LOG_FILE, "a") as f:
-            f.write(f"{datetime.now(timezone.utc).isoformat()} {msg}\n")
-    except Exception:
-        pass
+    """Wrapper around common_log for backward compatibility."""
+    common_log(LOG_FILE, msg)
 
 
 # ---------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------
-
-
-def make_auth_header() -> str:
-    """Build HTTP Basic auth header from Langfuse keys."""
-    creds = base64.b64encode(
-        f"{LANGFUSE_PUBLIC_KEY}:{LANGFUSE_SECRET_KEY}".encode()
-    ).decode()
-    return f"Basic {creds}"
 
 
 # ---------------------------------------------------------------------------
