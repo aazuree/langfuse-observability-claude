@@ -52,6 +52,13 @@ _SYNTHETIC_PROMPT_RE = re.compile(r"^<[a-z][a-z0-9-]*>")
 
 SUBAGENT_MATCH_WINDOW_S = 60  # Max seconds between Agent tool_use and subagent start
 
+# Cost tier thresholds (used for session classification in Langfuse dashboard)
+COST_TIER_CHEAP_MAX = 0.10      # Sessions under $0.10
+COST_TIER_MODERATE_MAX = 1.00   # Sessions $0.10-$1.00; above $1.00 = expensive
+
+# Default model for cost calculation when model field is missing
+DEFAULT_MODEL = "claude-opus-4-6"
+
 # Pro subscription: $0 marginal cost. Set to True to report equivalent API cost instead.
 REPORT_API_EQUIVALENT_COST = True
 
@@ -1000,9 +1007,9 @@ def classify_cost_tier(total_cost: float) -> str:
 
     < $0.10 = cheap, $0.10–$1.00 = moderate, ≥ $1.00 = expensive.
     """
-    if total_cost < 0.10:
+    if total_cost < COST_TIER_CHEAP_MAX:
         return "cheap"
-    elif total_cost < 1.00:
+    elif total_cost < COST_TIER_MODERATE_MAX:
         return "moderate"
     else:
         return "expensive"
@@ -1221,7 +1228,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
         first_token_time = turn.get("first_token_time")
         duration_ms = turn.get("duration_ms")
         usage = turn["usage"]
-        model = turn.get("model", "claude-opus-4-6") or "claude-opus-4-6"
+        model = turn.get("model") or DEFAULT_MODEL
 
         tool_names = [tc["name"] for tc in turn["tool_calls"]]
 
