@@ -23,6 +23,7 @@ import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterator
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
@@ -396,7 +397,7 @@ def extract_slug(transcript_path: str) -> str:
     return ""
 
 
-def _iter_transcript(transcript_path: str):
+def _iter_transcript(transcript_path: str) -> Iterator[dict]:
     try:
         with open(transcript_path) as f:
             for line in f:
@@ -488,7 +489,7 @@ def truncate(s: str, limit: int) -> str:
     return s[:limit] + "..." if len(s) > limit else s
 
 
-def extract_text_blocks(content) -> str:
+def extract_text_blocks(content: list) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
