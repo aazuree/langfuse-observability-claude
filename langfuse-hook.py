@@ -1005,10 +1005,11 @@ def classify_task_completed(turns: list[dict]) -> bool:
 
 
 def compute_cache_hit_rate(turns: list[dict]) -> float:
-    """Compute cache hit rate across all turns.
+    """Calculate cache hit rate: cache_read / (cache_read + cache_creation).
 
-    Cache hit rate = cache_read / (cache_read + cache_creation)
-    0.0 = no cache activity or all cold misses, 1.0 = all cache hits.
+    Returns 0.0 when denominator is 0 (no cache activity). This conflates
+    "cold session" (no cache activity yet) with "cache miss" scenarios.
+    In Langfuse dashboard, filter by cache_read > 0 to distinguish.
     """
     if not turns:
         return 0.0
@@ -1018,7 +1019,7 @@ def compute_cache_hit_rate(turns: list[dict]) -> float:
     denominator = cache_read + cache_creation
 
     if denominator == 0:
-        return 0.0
+        return 0.0  # No cache activity; see docstring
 
     return round(cache_read / denominator, 4)
 
