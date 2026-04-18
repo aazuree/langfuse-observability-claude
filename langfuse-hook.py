@@ -15,7 +15,7 @@ Environment variables:
   LANGFUSE_HOST        - Langfuse base URL (default: http://localhost:3000)
 """
 
-import base64
+import hashlib
 import json
 import os
 import re
@@ -23,8 +23,13 @@ import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterator
 from urllib.error import URLError
 from urllib.request import Request, urlopen
+
+# Ensure langfuse_common can be imported from the same directory
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from langfuse_common import log as common_log, make_auth_header, redact_secrets
 
 LANGFUSE_HOST = os.environ.get("LANGFUSE_HOST", "http://localhost:3000")
 LANGFUSE_PUBLIC_KEY = os.environ.get("LANGFUSE_PUBLIC_KEY", "")
@@ -47,30 +52,20 @@ _SYNTHETIC_PROMPT_RE = re.compile(r"^<[a-z][a-z0-9-]*>")
 
 SUBAGENT_MATCH_WINDOW_S = 60  # Max seconds between Agent tool_use and subagent start
 
-# Patterns to redact from text before sending to Langfuse
-SECRET_PATTERNS = [
-    re.compile(r"(?i)(api[_-]?key|apikey|secret[_-]?key|access[_-]?key|token|password|passwd|credential|auth)[\s]*[=:]\s*['\"]?([^\s'\"]{8,})['\"]?"),
-    re.compile(r"(?i)(sk|pk|api|key|token|secret|password|bearer|ghp|gho|ghu|ghs|ghr|glpat|xox[bposatr]|AKIA|AGPA|AIDA|AROA|AIPA|ANPA|ANVA|ASIA)[-_]?[a-zA-Z0-9/+=]{16,}"),
-    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"),
-    re.compile(r"(?i)Bearer\s+[a-zA-Z0-9._\-/+=]{20,}"),
-]
+# Cost tier thresholds (used for session classification in Langfuse dashboard)
+COST_TIER_CHEAP_MAX = 0.10      # Sessions under $0.10
+COST_TIER_MODERATE_MAX = 1.00   # Sessions $0.10-$1.00; above $1.00 = expensive
+
+# Default model for cost calculation when model field is missing
+DEFAULT_MODEL = "claude-opus-4-6"
 
 # Pro subscription: $0 marginal cost. Set to True to report equivalent API cost instead.
 REPORT_API_EQUIVALENT_COST = True
 
 
 def log(msg: str) -> None:
-    try:
-        # Rotate log if it exceeds MAX_LOG_BYTES
-        if os.path.exists(LOG_FILE) and os.path.getsize(LOG_FILE) > MAX_LOG_BYTES:
-            rotated = LOG_FILE + ".1"
-            if os.path.exists(rotated):
-                os.remove(rotated)
-            os.rename(LOG_FILE, rotated)
-        with open(LOG_FILE, "a") as f:
-            f.write(f"{datetime.now(timezone.utc).isoformat()} {msg}\n")
-    except Exception:
-        pass
+    """Wrapper around common_log for backward compatibility."""
+    common_log(LOG_FILE, msg)
 
 
 def sanitize_id(value: str) -> str:
@@ -78,25 +73,19 @@ def sanitize_id(value: str) -> str:
     if SAFE_ID_RE.match(value):
         return value
     # Fall back to a hash of the value
-    import hashlib
     return hashlib.sha256(value.encode()).hexdigest()[:32]
 
 
-def redact_secrets(text: str) -> str:
-    """Redact known secret patterns from text."""
-    for pattern in SECRET_PATTERNS:
-        text = pattern.sub("[REDACTED]", text)
-    return text
+def send_to_langfuse(batch: list[dict]) -> bool:
+    """Send events to Langfuse in batches of 50.
 
+    Args:
+        batch: List of event dicts to send
 
-def make_auth_header() -> str:
-    creds = base64.b64encode(
-        f"{LANGFUSE_PUBLIC_KEY}:{LANGFUSE_SECRET_KEY}".encode()
-    ).decode()
-    return f"Basic {creds}"
-
-
-def send_to_langfuse(batch: list[dict]) -> None:
+    Returns:
+        True if all batches sent successfully, False if any failed
+    """
+    success = True
     for i in range(0, len(batch), 50):
         chunk = batch[i : i + 50]
         payload = json.dumps({"batch": chunk}).encode()
@@ -115,6 +104,8 @@ def send_to_langfuse(batch: list[dict]) -> None:
                 log(f"Langfuse response ({resp.status}): {body[:200]}")
         except URLError as e:
             log(f"Failed to send to Langfuse: {e}")
+            success = False
+    return success
 
 
 def load_state(session_id: str) -> int:
@@ -122,7 +113,8 @@ def load_state(session_id: str) -> int:
     state_file = os.path.join(STATE_DIR, f"{session_id}.offset")
     try:
         return int(Path(state_file).read_text().strip())
-    except Exception:
+    except (IOError, OSError, ValueError):
+        # File doesn't exist, can't be read, or content isn't a valid integer
         return 0
 
 
@@ -138,7 +130,8 @@ def load_subagent_state(session_id: str) -> dict:
     state_file = os.path.join(STATE_DIR, f"{session_id}.subagents.json")
     try:
         return json.loads(Path(state_file).read_text())
-    except Exception:
+    except (IOError, OSError, json.JSONDecodeError):
+        # File doesn't exist, can't be read, or contains invalid JSON
         return {}
 
 
@@ -193,7 +186,8 @@ def discover_subagents(
                 if first_line:
                     entry = json.loads(first_line)
                     first_ts = parse_ts(entry.get("timestamp", ""))
-        except Exception:
+        except (IOError, OSError, json.JSONDecodeError):
+            # Can't open file, read it, or parse JSON; skip this subagent
             continue
 
         if first_ts is None:
@@ -246,7 +240,8 @@ def discover_subagents(
                 if meta_desc and meta_desc != desc:
                     log(f"Subagent {agent_id}: meta description '{meta_desc}' != tool_use '{desc}'")
                 log(f"Matched subagent {agent_id} (meta: type={meta_type}, desc={meta_desc})")
-            except Exception:
+            except (IOError, OSError, json.JSONDecodeError):
+                # .meta.json doesn't exist, can't be read, or contains invalid JSON
                 log(f"Matched subagent {agent_id} (no .meta.json)")
 
             matched.append((agent_id, jsonl_path, desc, sa_type, content_idx))
@@ -419,12 +414,13 @@ def extract_slug(transcript_path: str) -> str:
                         return slug
                 except json.JSONDecodeError:
                     continue
-    except Exception:
+    except (IOError, OSError):
+        # Can't open or read the transcript file
         pass
     return ""
 
 
-def _iter_transcript(transcript_path: str):
+def _iter_transcript(transcript_path: str) -> Iterator[dict]:
     try:
         with open(transcript_path) as f:
             for line in f:
@@ -435,7 +431,8 @@ def _iter_transcript(transcript_path: str):
                     yield json.loads(line)
                 except json.JSONDecodeError:
                     continue
-    except Exception:
+    except (IOError, OSError):
+        # Can't open or read the transcript file
         return
 
 
@@ -507,7 +504,8 @@ def parse_transcript(transcript_path: str, skip_lines: int = 0) -> tuple[list[di
                     entries.append(json.loads(line))
                 except json.JSONDecodeError:
                     continue
-    except Exception as e:
+    except (IOError, OSError) as e:
+        # Can't open or read the transcript file
         log(f"Failed to read transcript: {e}")
     return entries, total
 
@@ -516,7 +514,7 @@ def truncate(s: str, limit: int) -> str:
     return s[:limit] + "..." if len(s) > limit else s
 
 
-def extract_text_blocks(content) -> str:
+def extract_text_blocks(content: list) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -572,7 +570,8 @@ def parse_ts(ts_str: str) -> datetime | None:
         # Handle various ISO formats
         ts_str = ts_str.replace("Z", "+00:00")
         return datetime.fromisoformat(ts_str)
-    except Exception:
+    except ValueError:
+        # Invalid ISO format timestamp string
         return None
 
 
@@ -790,7 +789,8 @@ def extract_session_metadata(transcript_path: str) -> dict:
                         break
                 except json.JSONDecodeError:
                     continue
-    except Exception:
+    except (IOError, OSError):
+        # Can't open or read the transcript file
         pass
     return fields
 
@@ -839,7 +839,8 @@ def extract_cwd(transcript_path: str) -> str:
                         return cwd
                 except json.JSONDecodeError:
                     continue
-    except Exception:
+    except (IOError, OSError):
+        # Can't open or read the transcript file
         pass
     return ""
 
@@ -1004,10 +1005,11 @@ def classify_task_completed(turns: list[dict]) -> bool:
 
 
 def compute_cache_hit_rate(turns: list[dict]) -> float:
-    """Compute cache hit rate across all turns.
+    """Calculate cache hit rate: cache_read / (cache_read + cache_creation).
 
-    Cache hit rate = cache_read / (cache_read + cache_creation)
-    0.0 = no cache activity or all cold misses, 1.0 = all cache hits.
+    Returns 0.0 when denominator is 0 (no cache activity). This conflates
+    "cold session" (no cache activity yet) with "cache miss" scenarios.
+    In Langfuse dashboard, filter by cache_read > 0 to distinguish.
     """
     if not turns:
         return 0.0
@@ -1017,7 +1019,7 @@ def compute_cache_hit_rate(turns: list[dict]) -> float:
     denominator = cache_read + cache_creation
 
     if denominator == 0:
-        return 0.0
+        return 0.0  # No cache activity; see docstring
 
     return round(cache_read / denominator, 4)
 
@@ -1027,9 +1029,9 @@ def classify_cost_tier(total_cost: float) -> str:
 
     < $0.10 = cheap, $0.10–$1.00 = moderate, ≥ $1.00 = expensive.
     """
-    if total_cost < 0.10:
+    if total_cost < COST_TIER_CHEAP_MAX:
         return "cheap"
-    elif total_cost < 1.00:
+    elif total_cost < COST_TIER_MODERATE_MAX:
         return "moderate"
     else:
         return "expensive"
@@ -1248,7 +1250,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
         first_token_time = turn.get("first_token_time")
         duration_ms = turn.get("duration_ms")
         usage = turn["usage"]
-        model = turn.get("model", "claude-opus-4-6") or "claude-opus-4-6"
+        model = turn.get("model") or DEFAULT_MODEL
 
         tool_names = [tc["name"] for tc in turn["tool_calls"]]
 
@@ -1439,7 +1441,8 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
     )
     batch.extend(score_events)
 
-    send_to_langfuse(batch)
+    if not send_to_langfuse(batch):
+        log(f"[WARN] Some events failed to send for session {session_id}")
     save_state(session_id, total_lines)
 
     tool_span_count = sum(len(t["tool_calls"]) for t in turns)
@@ -1503,7 +1506,8 @@ def reprocess_all() -> None:
 
         try:
             process_session(session_id, str(transcript), cwd)
-        except Exception as e:
+        except (IOError, OSError, json.JSONDecodeError, ValueError) as e:
+            # Broad exception from process_session (file I/O, JSON, parsing errors)
             print(f"  Error: {e}")
             log(f"Reprocess error for {session_id}: {e}")
 
@@ -1517,7 +1521,8 @@ def main() -> None:
 
     try:
         hook_input = json.load(sys.stdin)
-    except Exception as e:
+    except json.JSONDecodeError as e:
+        # Invalid JSON in stdin
         log(f"Failed to parse stdin: {e}")
         return
 

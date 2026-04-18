@@ -17,6 +17,11 @@ _spec = importlib.util.spec_from_file_location(
 hook = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(hook)
 
+# Import langfuse_common for patching auth keys in tests
+import sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+import langfuse_common
+
 
 # ---------------------------------------------------------------------------
 # sanitize_id
@@ -106,8 +111,8 @@ class TestRedactSecrets:
 
 class TestMakeAuthHeader:
     def test_basic_auth_format(self, monkeypatch):
-        monkeypatch.setattr(hook, "LANGFUSE_PUBLIC_KEY", "pk-test")
-        monkeypatch.setattr(hook, "LANGFUSE_SECRET_KEY", "sk-test")
+        monkeypatch.setattr(langfuse_common, "LANGFUSE_PUBLIC_KEY", "pk-test")
+        monkeypatch.setattr(langfuse_common, "LANGFUSE_SECRET_KEY", "sk-test")
         result = hook.make_auth_header()
         assert result.startswith("Basic ")
         import base64
@@ -1254,7 +1259,7 @@ class TestLog:
     def test_log_rotation(self, tmp_path, monkeypatch):
         log_file = str(tmp_path / "test.log")
         monkeypatch.setattr(hook, "LOG_FILE", log_file)
-        monkeypatch.setattr(hook, "MAX_LOG_BYTES", 50)  # very small limit
+        monkeypatch.setattr(langfuse_common, "MAX_LOG_BYTES", 50)  # very small limit
 
         # Write enough to trigger rotation
         hook.log("x" * 60)
@@ -1296,8 +1301,8 @@ class TestSendToLangfuse:
             return MockResp()
 
         monkeypatch.setattr(hook, "urlopen", mock_urlopen)
-        monkeypatch.setattr(hook, "LANGFUSE_PUBLIC_KEY", "pk-test")
-        monkeypatch.setattr(hook, "LANGFUSE_SECRET_KEY", "sk-test")
+        monkeypatch.setattr(langfuse_common, "LANGFUSE_PUBLIC_KEY", "pk-test")
+        monkeypatch.setattr(langfuse_common, "LANGFUSE_SECRET_KEY", "sk-test")
 
         batch = [{"id": f"evt-{i}", "type": "test"} for i in range(120)]
         hook.send_to_langfuse(batch)
@@ -1306,6 +1311,34 @@ class TestSendToLangfuse:
         assert len(sent_payloads[0]["batch"]) == 50
         assert len(sent_payloads[1]["batch"]) == 50
         assert len(sent_payloads[2]["batch"]) == 20
+
+    def test_send_to_langfuse_returns_true_on_success(self, monkeypatch):
+        """Verify send_to_langfuse returns True when API succeeds."""
+        def mock_urlopen(req, timeout=15):
+            class MockResp:
+                status = 200
+                def read(self):
+                    return b'{"ok": true}'
+                def __enter__(self):
+                    return self
+                def __exit__(self, *args):
+                    pass
+            return MockResp()
+
+        monkeypatch.setattr(hook, "urlopen", mock_urlopen)
+        monkeypatch.setattr(langfuse_common, "LANGFUSE_PUBLIC_KEY", "pk-test")
+        monkeypatch.setattr(langfuse_common, "LANGFUSE_SECRET_KEY", "sk-test")
+        result = hook.send_to_langfuse([{"type": "trace"}])
+        assert result is True
+
+    def test_send_to_langfuse_returns_false_on_error(self, monkeypatch):
+        """Verify send_to_langfuse returns False when API fails."""
+        from urllib.error import URLError
+        monkeypatch.setattr(hook, "urlopen", mock.Mock(side_effect=URLError("Connection failed")))
+        monkeypatch.setattr(langfuse_common, "LANGFUSE_PUBLIC_KEY", "pk-test")
+        monkeypatch.setattr(langfuse_common, "LANGFUSE_SECRET_KEY", "sk-test")
+        result = hook.send_to_langfuse([{"type": "trace"}])
+        assert result is False
 
 
 # ---------------------------------------------------------------------------
@@ -1573,8 +1606,8 @@ class TestMain:
         assert called
 
     def test_missing_keys_logs_and_returns(self, monkeypatch):
-        monkeypatch.setattr(hook, "LANGFUSE_PUBLIC_KEY", "")
-        monkeypatch.setattr(hook, "LANGFUSE_SECRET_KEY", "")
+        monkeypatch.setattr(langfuse_common, "LANGFUSE_PUBLIC_KEY", "")
+        monkeypatch.setattr(langfuse_common, "LANGFUSE_SECRET_KEY", "")
         monkeypatch.setattr("sys.argv", ["langfuse-hook.py"])
 
         import io
@@ -1589,8 +1622,8 @@ class TestMain:
         assert any("must be set" in m for m in logged)
 
     def test_stop_hook_active_returns_early(self, monkeypatch):
-        monkeypatch.setattr(hook, "LANGFUSE_PUBLIC_KEY", "pk-test")
-        monkeypatch.setattr(hook, "LANGFUSE_SECRET_KEY", "sk-test")
+        monkeypatch.setattr(langfuse_common, "LANGFUSE_PUBLIC_KEY", "pk-test")
+        monkeypatch.setattr(langfuse_common, "LANGFUSE_SECRET_KEY", "sk-test")
         monkeypatch.setattr("sys.argv", ["langfuse-hook.py"])
 
         import io

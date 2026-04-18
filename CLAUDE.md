@@ -327,6 +327,10 @@ tool outputs for `[ERROR]` prefix. Returns `true` if no failure signals detected
 0.0 = cold session (no prior cache), 1.0 = fully warm (all cache hits). Useful for identifying
 sessions that benefit from prompt caching vs. sessions that are doing cache initialization.
 
+**Cache Hit Rate Edge Case:** Sessions with no cache activity (fresh session, no prior context)
+return 0.0, conflating with sessions that had cache misses. To distinguish in the Langfuse dashboard,
+filter by `cache_read > 0` to identify sessions with actual cache activity.
+
 **`cost_tier`** — Buckets session cost for dashboard filtering. `cheap` (< $0.10), `moderate` ($0.10–$1.00),
 `expensive` (≥ $1.00). Enables one-click filtering to find expensive sessions or identify
 cost trends across models.
