@@ -16,6 +16,7 @@ Environment variables:
 """
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -78,7 +79,6 @@ def sanitize_id(value: str) -> str:
     if SAFE_ID_RE.match(value):
         return value
     # Fall back to a hash of the value
-    import hashlib
     return hashlib.sha256(value.encode()).hexdigest()[:32]
 
 
