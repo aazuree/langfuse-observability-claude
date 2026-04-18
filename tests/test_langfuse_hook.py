@@ -1312,6 +1312,34 @@ class TestSendToLangfuse:
         assert len(sent_payloads[1]["batch"]) == 50
         assert len(sent_payloads[2]["batch"]) == 20
 
+    def test_send_to_langfuse_returns_true_on_success(self, monkeypatch):
+        """Verify send_to_langfuse returns True when API succeeds."""
+        def mock_urlopen(req, timeout=15):
+            class MockResp:
+                status = 200
+                def read(self):
+                    return b'{"ok": true}'
+                def __enter__(self):
+                    return self
+                def __exit__(self, *args):
+                    pass
+            return MockResp()
+
+        monkeypatch.setattr(hook, "urlopen", mock_urlopen)
+        monkeypatch.setattr(langfuse_common, "LANGFUSE_PUBLIC_KEY", "pk-test")
+        monkeypatch.setattr(langfuse_common, "LANGFUSE_SECRET_KEY", "sk-test")
+        result = hook.send_to_langfuse([{"type": "trace"}])
+        assert result is True
+
+    def test_send_to_langfuse_returns_false_on_error(self, monkeypatch):
+        """Verify send_to_langfuse returns False when API fails."""
+        from urllib.error import URLError
+        monkeypatch.setattr(hook, "urlopen", mock.Mock(side_effect=URLError("Connection failed")))
+        monkeypatch.setattr(langfuse_common, "LANGFUSE_PUBLIC_KEY", "pk-test")
+        monkeypatch.setattr(langfuse_common, "LANGFUSE_SECRET_KEY", "sk-test")
+        result = hook.send_to_langfuse([{"type": "trace"}])
+        assert result is False
+
 
 # ---------------------------------------------------------------------------
 # process_session (integration)

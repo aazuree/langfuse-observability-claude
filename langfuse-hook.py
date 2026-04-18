@@ -76,7 +76,16 @@ def sanitize_id(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()[:32]
 
 
-def send_to_langfuse(batch: list[dict]) -> None:
+def send_to_langfuse(batch: list[dict]) -> bool:
+    """Send events to Langfuse in batches of 50.
+
+    Args:
+        batch: List of event dicts to send
+
+    Returns:
+        True if all batches sent successfully, False if any failed
+    """
+    success = True
     for i in range(0, len(batch), 50):
         chunk = batch[i : i + 50]
         payload = json.dumps({"batch": chunk}).encode()
@@ -95,6 +104,8 @@ def send_to_langfuse(batch: list[dict]) -> None:
                 log(f"Langfuse response ({resp.status}): {body[:200]}")
         except URLError as e:
             log(f"Failed to send to Langfuse: {e}")
+            success = False
+    return success
 
 
 def load_state(session_id: str) -> int:
@@ -102,7 +113,8 @@ def load_state(session_id: str) -> int:
     state_file = os.path.join(STATE_DIR, f"{session_id}.offset")
     try:
         return int(Path(state_file).read_text().strip())
-    except Exception:
+    except (IOError, OSError, ValueError):
+        # File doesn't exist, can't be read, or content isn't a valid integer
         return 0
 
 
@@ -118,7 +130,8 @@ def load_subagent_state(session_id: str) -> dict:
     state_file = os.path.join(STATE_DIR, f"{session_id}.subagents.json")
     try:
         return json.loads(Path(state_file).read_text())
-    except Exception:
+    except (IOError, OSError, json.JSONDecodeError):
+        # File doesn't exist, can't be read, or contains invalid JSON
         return {}
 
 
@@ -173,7 +186,8 @@ def discover_subagents(
                 if first_line:
                     entry = json.loads(first_line)
                     first_ts = parse_ts(entry.get("timestamp", ""))
-        except Exception:
+        except (IOError, OSError, json.JSONDecodeError):
+            # Can't open file, read it, or parse JSON; skip this subagent
             continue
 
         if first_ts is None:
@@ -226,7 +240,8 @@ def discover_subagents(
                 if meta_desc and meta_desc != desc:
                     log(f"Subagent {agent_id}: meta description '{meta_desc}' != tool_use '{desc}'")
                 log(f"Matched subagent {agent_id} (meta: type={meta_type}, desc={meta_desc})")
-            except Exception:
+            except (IOError, OSError, json.JSONDecodeError):
+                # .meta.json doesn't exist, can't be read, or contains invalid JSON
                 log(f"Matched subagent {agent_id} (no .meta.json)")
 
             matched.append((agent_id, jsonl_path, desc, sa_type, content_idx))
@@ -399,7 +414,8 @@ def extract_slug(transcript_path: str) -> str:
                         return slug
                 except json.JSONDecodeError:
                     continue
-    except Exception:
+    except (IOError, OSError):
+        # Can't open or read the transcript file
         pass
     return ""
 
@@ -415,7 +431,8 @@ def _iter_transcript(transcript_path: str) -> Iterator[dict]:
                     yield json.loads(line)
                 except json.JSONDecodeError:
                     continue
-    except Exception:
+    except (IOError, OSError):
+        # Can't open or read the transcript file
         return
 
 
@@ -487,7 +504,8 @@ def parse_transcript(transcript_path: str, skip_lines: int = 0) -> tuple[list[di
                     entries.append(json.loads(line))
                 except json.JSONDecodeError:
                     continue
-    except Exception as e:
+    except (IOError, OSError) as e:
+        # Can't open or read the transcript file
         log(f"Failed to read transcript: {e}")
     return entries, total
 
@@ -552,7 +570,8 @@ def parse_ts(ts_str: str) -> datetime | None:
         # Handle various ISO formats
         ts_str = ts_str.replace("Z", "+00:00")
         return datetime.fromisoformat(ts_str)
-    except Exception:
+    except ValueError:
+        # Invalid ISO format timestamp string
         return None
 
 
@@ -770,7 +789,8 @@ def extract_session_metadata(transcript_path: str) -> dict:
                         break
                 except json.JSONDecodeError:
                     continue
-    except Exception:
+    except (IOError, OSError):
+        # Can't open or read the transcript file
         pass
     return fields
 
@@ -819,7 +839,8 @@ def extract_cwd(transcript_path: str) -> str:
                         return cwd
                 except json.JSONDecodeError:
                     continue
-    except Exception:
+    except (IOError, OSError):
+        # Can't open or read the transcript file
         pass
     return ""
 
@@ -1419,7 +1440,8 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
     )
     batch.extend(score_events)
 
-    send_to_langfuse(batch)
+    if not send_to_langfuse(batch):
+        log(f"[WARN] Some events failed to send for session {session_id}")
     save_state(session_id, total_lines)
 
     tool_span_count = sum(len(t["tool_calls"]) for t in turns)
@@ -1483,7 +1505,8 @@ def reprocess_all() -> None:
 
         try:
             process_session(session_id, str(transcript), cwd)
-        except Exception as e:
+        except (IOError, OSError, json.JSONDecodeError, ValueError) as e:
+            # Broad exception from process_session (file I/O, JSON, parsing errors)
             print(f"  Error: {e}")
             log(f"Reprocess error for {session_id}: {e}")
 
@@ -1497,7 +1520,8 @@ def main() -> None:
 
     try:
         hook_input = json.load(sys.stdin)
-    except Exception as e:
+    except json.JSONDecodeError as e:
+        # Invalid JSON in stdin
         log(f"Failed to parse stdin: {e}")
         return
 
