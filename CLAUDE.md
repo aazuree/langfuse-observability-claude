@@ -130,7 +130,6 @@ Each trace is enriched with:
 - model family — `opus`, `sonnet`, or `haiku`
 - entrypoint — `cli` or other launch method
 - `fast` — present if any turn used `/fast` mode
-- `has-thinking` — present if any turn contains extended-thinking chain-of-thought
 - `has-errors` — present if API errors occurred during the session
 - `permission:<mode>` — current permission mode (`default`, `acceptEdits`, `plan`, `bypassPermissions`)
 - `pr:<N>` — one tag per PR linked from the session (via `pr-link` transcript entries)
@@ -166,7 +165,6 @@ and `extract_away_summaries()` respectively.
 - `inference_geo` — inference region (e.g., `us-east-1`)
 - `request_ids` — list of Anthropic request IDs for server-side correlation
 - `web_search_requests`, `web_fetch_requests` — server-side tool use counts
-- `thinking_chars` — length of extended-thinking text captured (only present when thinking exists)
 
 **Per-Generation usageDetails** (extended):
 - `cache_read` — cache read tokens (shared across tiers)
@@ -174,25 +172,9 @@ and `extract_away_summaries()` respectively.
 - `cache_5m` — cache creation tokens with 5-minute TTL
 - `cache_1h` — cache creation tokens with 1-hour TTL
 
-## Extended Thinking (Chain-of-Thought) Capture
+## Extended Thinking
 
-When a turn uses [extended thinking](https://platform.claude.com/docs/en/build-with-claude/extended-thinking), the assistant content contains `thinking` blocks (plain CoT) and/or `redacted_thinking` blocks (encrypted by Anthropic's safety layer). The hook extracts both via `extract_thinking_blocks()` and prepends them to the generation's `output` field as:
-
-```
-<thinking>
-...chain of thought text...
-</thinking>
-
-...final assistant response...
-```
-
-**Design choice:** thinking is prepended to `output` (not stored in metadata) because the `output` field is the most visible surface in the Langfuse UI, and metadata is already large on rich traces. Truncation still respects `MAX_TEXT=10000` — the raw JSONL transcript on disk remains the source of truth for un-truncated CoT.
-
-**Multi-step turns:** When a turn makes multiple API calls (e.g. think → tool → think → reply), thinking from each call is concatenated in chronological order. Per streaming update we keep the final state per `message.id` to avoid duplication.
-
-**Redacted thinking:** Redacted segments are rendered as `[redacted thinking block]` — the encrypted payload itself is never exposed.
-
-**Tag:** Traces containing any thinking blocks are tagged `has-thinking` for filtering.
+Extended thinking capture was removed (Claude Code v2.1.112+). As of that version, Claude Code no longer writes thinking text to transcript JSONL files — `thinking` blocks always have an empty `thinking` field. The `has-thinking` tag and `thinking_chars` metadata are no longer emitted.
 
 ## Langfuse API Gotchas
 

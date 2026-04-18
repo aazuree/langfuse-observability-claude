@@ -321,9 +321,6 @@ def ingest_subagent(
             "cache_1h": turn.get("cache_ephemeral_1h", 0),
         }
 
-        sa_thinking = turn.get("thinking", "")
-        sa_output = format_thinking_output(sa_thinking, turn["assistant_output"])
-
         sa_metadata = {
             "subagent_id": agent_id,
             "tools_used": [tc["name"] for tc in turn["tool_calls"]],
@@ -335,8 +332,6 @@ def ingest_subagent(
             "web_search_requests": turn.get("web_search_requests", 0),
             "web_fetch_requests": turn.get("web_fetch_requests", 0),
         }
-        if sa_thinking:
-            sa_metadata["thinking_chars"] = len(sa_thinking)
 
         events.append({
             "id": f"evt-{gen_id}",
@@ -349,7 +344,7 @@ def ingest_subagent(
                 "name": f"Subagent Turn {turn_idx + 1}: {redact_secrets(truncate(turn['user_input'], 80))}",
                 "model": model,
                 "input": redact_secrets(truncate(turn["user_input"], MAX_TEXT)) or None,
-                "output": redact_secrets(truncate(sa_output, MAX_TEXT)) or None,
+                "output": redact_secrets(truncate(turn["assistant_output"], MAX_TEXT)) or None,
                 "startTime": start_time,
                 "endTime": end_time,
                 "usageDetails": usage_details,
@@ -541,38 +536,6 @@ def extract_tool_uses(content) -> list[dict]:
     return [b for b in content if isinstance(b, dict) and b.get("type") == "tool_use"]
 
 
-def extract_thinking_blocks(content) -> str:
-    """Extract extended-thinking chain-of-thought from assistant content.
-
-    Handles both `thinking` blocks (plain CoT) and `redacted_thinking` blocks
-    (encrypted by Anthropic's safety layer — we surface a marker, not the
-    opaque payload). Returns concatenated text, empty string if none.
-    """
-    if not isinstance(content, list):
-        return ""
-    parts = []
-    for block in content:
-        if not isinstance(block, dict):
-            continue
-        btype = block.get("type")
-        if btype == "thinking":
-            t = block.get("thinking", "")
-            if t:
-                parts.append(t)
-        elif btype == "redacted_thinking":
-            parts.append("[redacted thinking block]")
-    return "\n".join(parts)
-
-
-def format_thinking_output(thinking: str, output: str) -> str:
-    """Prepend a thinking preamble to an assistant response for Langfuse display.
-
-    Returns the original output unchanged when thinking is empty.
-    """
-    if not thinking:
-        return output
-    return f"<thinking>\n{thinking}\n</thinking>\n\n{output}" if output else f"<thinking>\n{thinking}\n</thinking>"
-
 
 def extract_tool_results(content) -> dict[str, str]:
     if not isinstance(content, list):
@@ -692,7 +655,6 @@ def build_turns(entries: list[dict]) -> list[dict]:
                     "usage": {"input": 0, "output": 0, "total": 0},
                     "api_call_ids": set(),
                     "messages": [me],
-                    "thinking_by_mid": {},
                 }
             elif current_turn:
                 current_turn["messages"].append(me)
@@ -716,12 +678,6 @@ def build_turns(entries: list[dict]) -> list[dict]:
             text = extract_text_blocks(content)
             if text.strip():
                 current_turn["assistant_output"] = text
-
-            # Collect extended-thinking blocks (per message_id, last streaming update wins).
-            # Preserves thinking across multi-step turns (e.g. think -> tool -> think -> reply).
-            thinking = extract_thinking_blocks(content)
-            if thinking and mid:
-                current_turn["thinking_by_mid"][mid] = thinking
 
             # Collect tool uses
             for tu in extract_tool_uses(content):
@@ -791,10 +747,6 @@ def build_turns(entries: list[dict]) -> list[dict]:
         turn["cache_ephemeral_1h"] = cache_ephemeral_1h
         turn["request_ids"] = request_ids
         turn["api_call_ids"] = list(turn["api_call_ids"])  # make serializable
-        # Flatten extended-thinking blocks in message arrival order. Dict
-        # preserves insertion order (Python 3.7+), so this matches the
-        # chronological sequence of API calls that produced the thinking.
-        turn["thinking"] = "\n\n".join(turn.pop("thinking_by_mid", {}).values())
 
     # Match turn_duration entries to turns (by proximity of timestamps)
     for td in turn_durations:
@@ -1193,9 +1145,6 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
     # Check if any turn used fast inference
     has_fast = any(t.get("speed") == "fast" for t in turns)
 
-    # Check if any turn contains extended-thinking chain-of-thought
-    has_thinking = any(t.get("thinking") for t in turns)
-
     # Collect unique model families used across all turns
     model_families = set()
     for t in turns:
@@ -1281,7 +1230,6 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
                 *sorted(model_families),
                 session_meta.get("entrypoint") or None,
                 "fast" if has_fast else None,
-                "has-thinking" if has_thinking else None,
                 "has-errors" if has_errors else None,
                 f"permission:{permission_mode}" if permission_mode else None,
                 *pr_tags,
@@ -1336,16 +1284,13 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
             "cache_1h": turn.get("cache_ephemeral_1h", 0),
         }
 
-        turn_thinking = turn.get("thinking", "")
-        output_with_thinking = format_thinking_output(turn_thinking, turn["assistant_output"])
-
         gen_body = {
             "id": gen_id,
             "traceId": trace_id,
             "name": f"Turn {prev_offset + turn_idx + 1}: {redact_secrets(truncate(turn['user_input'], 80))}",
             "model": model,
             "input": redact_secrets(truncate(turn["user_input"], MAX_TEXT)) or None,
-            "output": redact_secrets(truncate(output_with_thinking, MAX_TEXT)) or None,
+            "output": redact_secrets(truncate(turn["assistant_output"], MAX_TEXT)) or None,
             "startTime": start_time,
             "endTime": end_time,
             "completionStartTime": first_token_time,
@@ -1368,8 +1313,6 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
             gen_body["metadata"]["ttft_ms"] = ttft_ms
         if duration_ms:
             gen_body["metadata"]["duration_ms"] = duration_ms
-        if turn_thinking:
-            gen_body["metadata"]["thinking_chars"] = len(turn_thinking)
 
         batch.append({
             "id": f"evt-{turn_id}-gen",
