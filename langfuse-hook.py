@@ -449,6 +449,73 @@ def extract_custom_title(transcript_path: str) -> str:
     return ""
 
 
+def extract_agent_name(transcript_path: str) -> str:
+    """First non-empty agentName from type: 'agent-name' entries.
+
+    Written mid-session (~30% through) once the model identifies the task.
+    Absent in sessions that ended before Claude generated a name.
+    """
+    for entry in _iter_transcript(transcript_path):
+        if entry.get("type") == "agent-name":
+            name = entry.get("agentName", "")
+            if name:
+                return name
+    return ""
+
+
+def extract_file_history_stats(transcript_path: str) -> dict:
+    """Aggregate stats from file-history-snapshot entries.
+
+    Returns snapshot_count (total entries) and tracked_files_count
+    (unique file paths across all trackedFileBackups dicts).
+    File paths themselves are not captured to avoid leaking sensitive names.
+    """
+    snapshot_count = 0
+    all_paths: set[str] = set()
+    for entry in _iter_transcript(transcript_path):
+        if entry.get("type") != "file-history-snapshot":
+            continue
+        snapshot_count += 1
+        backups = entry.get("snapshot", {}).get("trackedFileBackups", {})
+        if isinstance(backups, dict):
+            all_paths.update(backups.keys())
+    return {"snapshot_count": snapshot_count, "tracked_files_count": len(all_paths)}
+
+
+def extract_stop_hook_stats(transcript_path: str) -> dict:
+    """Aggregate stats from system/stop_hook_summary entries.
+
+    Sums duration and error counts across all stop hook fires in the session.
+    max_duration_ms tracks the single slowest hook execution across all fires.
+    """
+    total_fires = 0
+    total_duration = 0
+    max_duration = 0
+    total_errors = 0
+    prevented_count = 0
+
+    for entry in _iter_transcript(transcript_path):
+        if entry.get("type") != "system" or entry.get("subtype") != "stop_hook_summary":
+            continue
+        total_fires += 1
+        for hook_info in entry.get("hookInfos", []):
+            d = hook_info.get("durationMs", 0)
+            total_duration += d
+            if d > max_duration:
+                max_duration = d
+        total_errors += len(entry.get("hookErrors", []))
+        if entry.get("preventedContinuation", False):
+            prevented_count += 1
+
+    return {
+        "total_hook_fires": total_fires,
+        "total_duration_ms": total_duration,
+        "max_duration_ms": max_duration,
+        "hook_errors": total_errors,
+        "prevented_continuation_count": prevented_count,
+    }
+
+
 def extract_permission_mode(transcript_path: str) -> str:
     """Most recent permission-mode entry. The mode can change mid-session."""
     last = ""
@@ -1114,11 +1181,13 @@ def build_hook_score_events(
 def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
     """Core processing logic for a single session transcript."""
     prev_offset = load_state(session_id)
-    slug = extract_slug(transcript_path)
     custom_title = extract_custom_title(transcript_path)
     permission_mode = extract_permission_mode(transcript_path)
     pr_links = extract_pr_links(transcript_path)
     away_summaries = extract_away_summaries(transcript_path)
+    agent_name = extract_agent_name(transcript_path)
+    file_history_stats = extract_file_history_stats(transcript_path)
+    stop_hook_stats = extract_stop_hook_stats(transcript_path)
     entries, total_lines = parse_transcript(transcript_path, skip_lines=prev_offset)
 
     if not entries:
@@ -1176,8 +1245,8 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
     # For trace naming, skip synthetic stubs (slash commands, local-command
     # output, system reminders, prompt-submit hooks) which all start with an
     # XML-like wrapper tag. Real user prompts are plain text. Falls back to
-    # the raw first prompt if every turn is a stub.
-    first_real_prompt = first_user_input
+    # repo/branch when every turn is a stub.
+    first_real_prompt = ""
     for t in turns:
         ui = (t.get("user_input") or "").strip()
         if ui and not _SYNTHETIC_PROMPT_RE.match(ui):
@@ -1186,11 +1255,12 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
 
     trace_ts = turns[0].get("start_time") or now
 
-    # Trace name precedence: custom title > legacy slug > truncated first prompt
+    # Trace name precedence: custom title > agent name > first prompt > repo/branch
     trace_name = (
         custom_title
-        or slug
+        or agent_name
         or truncate(redact_secrets(first_real_prompt), 80).strip()
+        or f"{repo_name}/{session_meta.get('gitBranch', '')}".strip("/")
         or "Claude Code Session"
     )
 
@@ -1225,6 +1295,9 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
                 "permission_mode": permission_mode or None,
                 "pr_links": pr_links or None,
                 "away_summaries": away_summaries or None,
+                "agent_name": agent_name or None,
+                "file_snapshots": file_history_stats if file_history_stats["snapshot_count"] > 0 else None,
+                "stop_hook": stop_hook_stats if stop_hook_stats["total_hook_fires"] > 0 else None,
             },
             "tags": [t for t in [
                 "claude-code",
@@ -1234,6 +1307,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
                 "fast" if has_fast else None,
                 "has-errors" if has_errors else None,
                 f"permission:{permission_mode}" if permission_mode else None,
+                f"agent-name:{agent_name}" if agent_name else None,
                 *pr_tags,
             ] if t],
         },

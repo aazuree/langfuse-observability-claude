@@ -533,6 +533,90 @@ class TestExtractPermissionMode:
 
 
 # ---------------------------------------------------------------------------
+# extract_agent_name
+# ---------------------------------------------------------------------------
+
+class TestExtractAgentName:
+    def test_returns_first_agent_name(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        entries = [
+            {"type": "user"},
+            {"type": "agent-name", "agentName": "langfuse-usagedetails-fix"},
+            {"type": "agent-name", "agentName": "second-name"},
+        ]
+        f.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        assert hook.extract_agent_name(str(f)) == "langfuse-usagedetails-fix"
+
+    def test_no_agent_name_entry(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        f.write_text(json.dumps({"type": "user"}) + "\n")
+        assert hook.extract_agent_name(str(f)) == ""
+
+    def test_skips_empty_agent_name(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        entries = [
+            {"type": "agent-name", "agentName": ""},
+            {"type": "agent-name", "agentName": "real-name"},
+        ]
+        f.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        assert hook.extract_agent_name(str(f)) == "real-name"
+
+    def test_nonexistent_file(self):
+        assert hook.extract_agent_name("/nonexistent.jsonl") == ""
+
+
+# ---------------------------------------------------------------------------
+# extract_file_history_stats
+# ---------------------------------------------------------------------------
+
+class TestExtractFileHistoryStats:
+    def test_empty_when_no_entries(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        f.write_text(json.dumps({"type": "user"}) + "\n")
+        result = hook.extract_file_history_stats(str(f))
+        assert result == {"snapshot_count": 0, "tracked_files_count": 0}
+
+    def test_counts_snapshots(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        entries = [
+            {"type": "file-history-snapshot", "snapshot": {"trackedFileBackups": {}, "timestamp": "t1"}, "isSnapshotUpdate": False},
+            {"type": "file-history-snapshot", "snapshot": {"trackedFileBackups": {}, "timestamp": "t2"}, "isSnapshotUpdate": True},
+        ]
+        f.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        result = hook.extract_file_history_stats(str(f))
+        assert result["snapshot_count"] == 2
+
+    def test_deduplicates_file_paths(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        entries = [
+            {
+                "type": "file-history-snapshot",
+                "snapshot": {
+                    "trackedFileBackups": {"src/a.py": "content", "src/b.py": "content"},
+                    "timestamp": "t1",
+                },
+                "isSnapshotUpdate": False,
+            },
+            {
+                "type": "file-history-snapshot",
+                "snapshot": {
+                    "trackedFileBackups": {"src/a.py": "updated", "src/c.py": "content"},
+                    "timestamp": "t2",
+                },
+                "isSnapshotUpdate": True,
+            },
+        ]
+        f.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        result = hook.extract_file_history_stats(str(f))
+        assert result["snapshot_count"] == 2
+        assert result["tracked_files_count"] == 3  # a.py, b.py, c.py deduplicated
+
+    def test_nonexistent_file(self):
+        result = hook.extract_file_history_stats("/nonexistent.jsonl")
+        assert result == {"snapshot_count": 0, "tracked_files_count": 0}
+
+
+# ---------------------------------------------------------------------------
 # extract_pr_links
 # ---------------------------------------------------------------------------
 
@@ -2010,3 +2094,215 @@ class TestSubagentNewFields:
         usage_details = gen_events[0]["body"]["usageDetails"]
         assert usage_details["cache_5m"] == 0
         assert usage_details["cache_1h"] == 100
+
+
+# ---------------------------------------------------------------------------
+# extract_stop_hook_stats
+# ---------------------------------------------------------------------------
+
+class TestExtractStopHookStats:
+    def test_empty_when_no_entries(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        f.write_text(json.dumps({"type": "user"}) + "\n")
+        result = hook.extract_stop_hook_stats(str(f))
+        assert result == {
+            "total_hook_fires": 0,
+            "total_duration_ms": 0,
+            "max_duration_ms": 0,
+            "hook_errors": 0,
+            "prevented_continuation_count": 0,
+        }
+
+    def test_aggregates_single_fire(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        entry = {
+            "type": "system",
+            "subtype": "stop_hook_summary",
+            "hookCount": 1,
+            "hookInfos": [{"command": "python3 langfuse-hook.py", "durationMs": 300}],
+            "hookErrors": [],
+            "preventedContinuation": False,
+        }
+        f.write_text(json.dumps(entry) + "\n")
+        result = hook.extract_stop_hook_stats(str(f))
+        assert result["total_hook_fires"] == 1
+        assert result["total_duration_ms"] == 300
+        assert result["max_duration_ms"] == 300
+        assert result["hook_errors"] == 0
+        assert result["prevented_continuation_count"] == 0
+
+    def test_aggregates_multiple_fires(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        entries = [
+            {
+                "type": "system",
+                "subtype": "stop_hook_summary",
+                "hookCount": 1,
+                "hookInfos": [{"command": "cmd", "durationMs": 200}],
+                "hookErrors": [],
+                "preventedContinuation": False,
+            },
+            {
+                "type": "system",
+                "subtype": "stop_hook_summary",
+                "hookCount": 1,
+                "hookInfos": [{"command": "cmd", "durationMs": 500}],
+                "hookErrors": ["some error"],
+                "preventedContinuation": True,
+            },
+        ]
+        f.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        result = hook.extract_stop_hook_stats(str(f))
+        assert result["total_hook_fires"] == 2
+        assert result["total_duration_ms"] == 700
+        assert result["max_duration_ms"] == 500
+        assert result["hook_errors"] == 1
+        assert result["prevented_continuation_count"] == 1
+
+    def test_multiple_hooks_per_fire(self, tmp_path):
+        """Multiple hookInfos entries in one fire — sum all durations."""
+        f = tmp_path / "t.jsonl"
+        entry = {
+            "type": "system",
+            "subtype": "stop_hook_summary",
+            "hookCount": 2,
+            "hookInfos": [
+                {"command": "hook-a", "durationMs": 100},
+                {"command": "hook-b", "durationMs": 150},
+            ],
+            "hookErrors": [],
+            "preventedContinuation": False,
+        }
+        f.write_text(json.dumps(entry) + "\n")
+        result = hook.extract_stop_hook_stats(str(f))
+        assert result["total_duration_ms"] == 250
+        assert result["max_duration_ms"] == 150
+
+    def test_nonexistent_file(self):
+        result = hook.extract_stop_hook_stats("/nonexistent.jsonl")
+        assert result["total_hook_fires"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Trace name precedence (process_session integration)
+# ---------------------------------------------------------------------------
+
+class TestTraceNamePrecedence:
+    """Verify trace_name precedence: customTitle > agent_name > first_prompt > repo/branch."""
+
+    def _make_transcript(self, tmp_path, entries):
+        f = tmp_path / "t.jsonl"
+        f.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        return str(f)
+
+    def _get_trace_event(self, tmp_path, monkeypatch, entries, cwd=""):
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        monkeypatch.setattr(hook, "STATE_DIR", str(state_dir))
+
+        path = self._make_transcript(tmp_path, entries)
+        captured = []
+        monkeypatch.setattr(hook, "send_to_langfuse", lambda b: captured.extend(b) or True)
+        hook.process_session("test-session-001", path, cwd)
+        return next((e for e in captured if e.get("type") == "trace-create"), None)
+
+    def _base_entries(self):
+        return [
+            {
+                "type": "user",
+                "message": {"role": "user", "content": "hello world prompt"},
+                "timestamp": "2026-04-23T10:00:00Z",
+                "cwd": "/repo",
+                "gitBranch": "main",
+                "version": "2.1.112",
+                "entrypoint": "cli",
+            },
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": "I can help with that.",
+                    "model": "claude-sonnet-4-6",
+                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                },
+                "timestamp": "2026-04-23T10:00:01Z",
+            },
+        ]
+
+    def test_agent_name_beats_first_prompt(self, tmp_path, monkeypatch):
+        entries = self._base_entries() + [
+            {"type": "agent-name", "agentName": "my-stable-task-name"},
+        ]
+        evt = self._get_trace_event(tmp_path, monkeypatch, entries, cwd="/repo")
+        assert evt["body"]["name"] == "my-stable-task-name"
+
+    def test_custom_title_beats_agent_name(self, tmp_path, monkeypatch):
+        entries = self._base_entries() + [
+            {"type": "custom-title", "customTitle": "user-set-title"},
+            {"type": "agent-name", "agentName": "auto-generated-name"},
+        ]
+        evt = self._get_trace_event(tmp_path, monkeypatch, entries, cwd="/repo")
+        assert evt["body"]["name"] == "user-set-title"
+
+    def test_first_prompt_when_no_agent_name(self, tmp_path, monkeypatch):
+        entries = self._base_entries()
+        evt = self._get_trace_event(tmp_path, monkeypatch, entries, cwd="/repo")
+        assert evt["body"]["name"] == "hello world prompt"
+
+    def test_repo_branch_fallback_when_no_prompt(self, tmp_path, monkeypatch):
+        # Synthetic prompt (XML-wrapper) is skipped by _SYNTHETIC_PROMPT_RE, leaving
+        # first_real_prompt empty — trace name falls back to repo/branch.
+        entries = [
+            {
+                "type": "user",
+                "message": {"role": "user", "content": "<system-reminder>do nothing</system-reminder>"},
+                "timestamp": "2026-04-23T10:00:00Z",
+                "cwd": "/home/user/myrepo",
+                "gitBranch": "feat/improve-search",
+                "version": "2.1.112",
+                "entrypoint": "cli",
+            },
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": "Done.",
+                    "model": "claude-sonnet-4-6",
+                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                },
+                "timestamp": "2026-04-23T10:00:01Z",
+            },
+        ]
+        evt = self._get_trace_event(tmp_path, monkeypatch, entries, cwd="/home/user/myrepo")
+        assert evt["body"]["name"] == "myrepo/feat/improve-search"
+
+    def test_agent_name_tag_added_when_present(self, tmp_path, monkeypatch):
+        entries = self._base_entries() + [
+            {"type": "agent-name", "agentName": "my-task"},
+        ]
+        evt = self._get_trace_event(tmp_path, monkeypatch, entries, cwd="/repo")
+        assert "agent-name:my-task" in evt["body"]["tags"]
+
+    def test_agent_name_tag_absent_when_missing(self, tmp_path, monkeypatch):
+        entries = self._base_entries()
+        evt = self._get_trace_event(tmp_path, monkeypatch, entries, cwd="/repo")
+        assert not any(t.startswith("agent-name:") for t in evt["body"]["tags"])
+
+    def test_file_snapshots_in_metadata_when_present(self, tmp_path, monkeypatch):
+        entries = self._base_entries() + [
+            {
+                "type": "file-history-snapshot",
+                "snapshot": {"trackedFileBackups": {"src/a.py": "x"}, "timestamp": "t1"},
+                "isSnapshotUpdate": False,
+            },
+        ]
+        evt = self._get_trace_event(tmp_path, monkeypatch, entries, cwd="/repo")
+        fs = evt["body"]["metadata"]["file_snapshots"]
+        assert fs is not None
+        assert fs["snapshot_count"] == 1
+        assert fs["tracked_files_count"] == 1
+
+    def test_file_snapshots_absent_from_metadata_when_missing(self, tmp_path, monkeypatch):
+        entries = self._base_entries()
+        evt = self._get_trace_event(tmp_path, monkeypatch, entries, cwd="/repo")
+        assert evt["body"]["metadata"].get("file_snapshots") is None
