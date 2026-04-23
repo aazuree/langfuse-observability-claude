@@ -133,16 +133,20 @@ Each trace is enriched with:
 - `has-errors` — present if API errors occurred during the session
 - `permission:<mode>` — current permission mode (`default`, `acceptEdits`, `plan`, `bypassPermissions`)
 - `pr:<N>` — one tag per PR linked from the session (via `pr-link` transcript entries)
+- `agent-name:{slug}` — present when `type: "agent-name"` entry exists (e.g., `agent-name:langfuse-usagedetails-fix`)
 
 **Trace Name precedence:**
 1. `customTitle` from `type: "custom-title"` (user-set via in-CLI title command)
-2. Legacy `slug` field (only present in v2.1.111 and earlier transcripts)
-3. Truncated first user prompt (80 chars)
-4. `"Claude Code Session"` fallback
+2. `agentName` from `type: "agent-name"` (auto-generated mid-session slug, e.g. `langfuse-usagedetails-fix`)
+3. Truncated first non-synthetic user prompt (80 chars)
+4. `{repo_name}/{git_branch}` composite — stable fallback when prompt is empty
+5. `"Claude Code Session"` hardcoded fallback
 
 The auto-generated 3-word slug (e.g. `goofy-frolicking-dove`) was removed from
-JSONL transcripts in Claude Code v2.1.112. We now derive the trace name from the
-custom title when set, otherwise from the first prompt.
+JSONL transcripts in Claude Code v2.1.112. The `agent-name` entry (~30% into a session)
+provides a stable, descriptive slug once the model identifies the task. Early hook fires
+use the first prompt; once `agent-name` appears, subsequent fires update the trace name
+via Langfuse's upsert-on-id behaviour.
 
 **Trace Metadata** (structured key-value on trace):
 - `git_branch`, `cli_version`, `entrypoint`, `repo_name`, `cwd`
@@ -152,6 +156,9 @@ custom title when set, otherwise from the first prompt.
 - `permission_mode` — last permission mode observed
 - `pr_links` — list of `{number, url, repository, timestamp}` from `pr-link` entries
 - `away_summaries` — list of `{content, timestamp}` from `system/away_summary` entries
+- `agent_name` — auto-generated session slug from `type: "agent-name"` entry (null when absent)
+- `file_snapshots` — `{snapshot_count, tracked_files_count}` from `file-history-snapshot` entries (null when no snapshots)
+- `stop_hook` — `{total_hook_fires, total_duration_ms, max_duration_ms, hook_errors, prevented_continuation_count}` from `system/stop_hook_summary` entries (null when none)
 
 Extracted from the first `type: "user"` entry in the JSONL transcript via `extract_session_metadata()`.
 API errors extracted from `type: "system"` / `subtype: "api_error"` entries via `extract_api_errors()`.
