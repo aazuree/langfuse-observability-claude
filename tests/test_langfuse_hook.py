@@ -2287,3 +2287,22 @@ class TestTraceNamePrecedence:
         entries = self._base_entries()
         evt = self._get_trace_event(tmp_path, monkeypatch, entries, cwd="/repo")
         assert not any(t.startswith("agent-name:") for t in evt["body"]["tags"])
+
+    def test_file_snapshots_in_metadata_when_present(self, tmp_path, monkeypatch):
+        entries = self._base_entries() + [
+            {
+                "type": "file-history-snapshot",
+                "snapshot": {"trackedFileBackups": {"src/a.py": "x"}, "timestamp": "t1"},
+                "isSnapshotUpdate": False,
+            },
+        ]
+        evt = self._get_trace_event(tmp_path, monkeypatch, entries, cwd="/repo")
+        fs = evt["body"]["metadata"]["file_snapshots"]
+        assert fs is not None
+        assert fs["snapshot_count"] == 1
+        assert fs["tracked_files_count"] == 1
+
+    def test_file_snapshots_absent_from_metadata_when_missing(self, tmp_path, monkeypatch):
+        entries = self._base_entries()
+        evt = self._get_trace_event(tmp_path, monkeypatch, entries, cwd="/repo")
+        assert evt["body"]["metadata"].get("file_snapshots") is None

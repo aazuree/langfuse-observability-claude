@@ -1181,7 +1181,6 @@ def build_hook_score_events(
 def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
     """Core processing logic for a single session transcript."""
     prev_offset = load_state(session_id)
-    slug = extract_slug(transcript_path)
     custom_title = extract_custom_title(transcript_path)
     permission_mode = extract_permission_mode(transcript_path)
     pr_links = extract_pr_links(transcript_path)
