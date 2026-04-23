@@ -449,6 +449,20 @@ def extract_custom_title(transcript_path: str) -> str:
     return ""
 
 
+def extract_agent_name(transcript_path: str) -> str:
+    """First non-empty agentName from type: 'agent-name' entries.
+
+    Written mid-session (~30% through) once the model identifies the task.
+    Absent in sessions that ended before Claude generated a name.
+    """
+    for entry in _iter_transcript(transcript_path):
+        if entry.get("type") == "agent-name":
+            name = entry.get("agentName", "")
+            if name:
+                return name
+    return ""
+
+
 def extract_permission_mode(transcript_path: str) -> str:
     """Most recent permission-mode entry. The mode can change mid-session."""
     last = ""

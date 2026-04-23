@@ -533,6 +533,39 @@ class TestExtractPermissionMode:
 
 
 # ---------------------------------------------------------------------------
+# extract_agent_name
+# ---------------------------------------------------------------------------
+
+class TestExtractAgentName:
+    def test_returns_first_agent_name(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        entries = [
+            {"type": "user"},
+            {"type": "agent-name", "agentName": "langfuse-usagedetails-fix"},
+            {"type": "agent-name", "agentName": "second-name"},
+        ]
+        f.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        assert hook.extract_agent_name(str(f)) == "langfuse-usagedetails-fix"
+
+    def test_no_agent_name_entry(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        f.write_text(json.dumps({"type": "user"}) + "\n")
+        assert hook.extract_agent_name(str(f)) == ""
+
+    def test_skips_empty_agent_name(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        entries = [
+            {"type": "agent-name", "agentName": ""},
+            {"type": "agent-name", "agentName": "real-name"},
+        ]
+        f.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        assert hook.extract_agent_name(str(f)) == "real-name"
+
+    def test_nonexistent_file(self):
+        assert hook.extract_agent_name("/nonexistent.jsonl") == ""
+
+
+# ---------------------------------------------------------------------------
 # extract_pr_links
 # ---------------------------------------------------------------------------
 
