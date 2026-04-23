@@ -2094,3 +2094,90 @@ class TestSubagentNewFields:
         usage_details = gen_events[0]["body"]["usageDetails"]
         assert usage_details["cache_5m"] == 0
         assert usage_details["cache_1h"] == 100
+
+
+# ---------------------------------------------------------------------------
+# extract_stop_hook_stats
+# ---------------------------------------------------------------------------
+
+class TestExtractStopHookStats:
+    def test_empty_when_no_entries(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        f.write_text(json.dumps({"type": "user"}) + "\n")
+        result = hook.extract_stop_hook_stats(str(f))
+        assert result == {
+            "total_hook_fires": 0,
+            "total_duration_ms": 0,
+            "max_duration_ms": 0,
+            "hook_errors": 0,
+            "prevented_continuation_count": 0,
+        }
+
+    def test_aggregates_single_fire(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        entry = {
+            "type": "system",
+            "subtype": "stop_hook_summary",
+            "hookCount": 1,
+            "hookInfos": [{"command": "python3 langfuse-hook.py", "durationMs": 300}],
+            "hookErrors": [],
+            "preventedContinuation": False,
+        }
+        f.write_text(json.dumps(entry) + "\n")
+        result = hook.extract_stop_hook_stats(str(f))
+        assert result["total_hook_fires"] == 1
+        assert result["total_duration_ms"] == 300
+        assert result["max_duration_ms"] == 300
+        assert result["hook_errors"] == 0
+        assert result["prevented_continuation_count"] == 0
+
+    def test_aggregates_multiple_fires(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        entries = [
+            {
+                "type": "system",
+                "subtype": "stop_hook_summary",
+                "hookCount": 1,
+                "hookInfos": [{"command": "cmd", "durationMs": 200}],
+                "hookErrors": [],
+                "preventedContinuation": False,
+            },
+            {
+                "type": "system",
+                "subtype": "stop_hook_summary",
+                "hookCount": 1,
+                "hookInfos": [{"command": "cmd", "durationMs": 500}],
+                "hookErrors": ["some error"],
+                "preventedContinuation": True,
+            },
+        ]
+        f.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        result = hook.extract_stop_hook_stats(str(f))
+        assert result["total_hook_fires"] == 2
+        assert result["total_duration_ms"] == 700
+        assert result["max_duration_ms"] == 500
+        assert result["hook_errors"] == 1
+        assert result["prevented_continuation_count"] == 1
+
+    def test_multiple_hooks_per_fire(self, tmp_path):
+        """Multiple hookInfos entries in one fire — sum all durations."""
+        f = tmp_path / "t.jsonl"
+        entry = {
+            "type": "system",
+            "subtype": "stop_hook_summary",
+            "hookCount": 2,
+            "hookInfos": [
+                {"command": "hook-a", "durationMs": 100},
+                {"command": "hook-b", "durationMs": 150},
+            ],
+            "hookErrors": [],
+            "preventedContinuation": False,
+        }
+        f.write_text(json.dumps(entry) + "\n")
+        result = hook.extract_stop_hook_stats(str(f))
+        assert result["total_duration_ms"] == 250
+        assert result["max_duration_ms"] == 150
+
+    def test_nonexistent_file(self):
+        result = hook.extract_stop_hook_stats("/nonexistent.jsonl")
+        assert result["total_hook_fires"] == 0

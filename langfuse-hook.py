@@ -482,6 +482,40 @@ def extract_file_history_stats(transcript_path: str) -> dict:
     return {"snapshot_count": snapshot_count, "tracked_files_count": len(all_paths)}
 
 
+def extract_stop_hook_stats(transcript_path: str) -> dict:
+    """Aggregate stats from system/stop_hook_summary entries.
+
+    Sums duration and error counts across all stop hook fires in the session.
+    max_duration_ms tracks the single slowest hook execution across all fires.
+    """
+    total_fires = 0
+    total_duration = 0
+    max_duration = 0
+    total_errors = 0
+    prevented_count = 0
+
+    for entry in _iter_transcript(transcript_path):
+        if entry.get("type") != "system" or entry.get("subtype") != "stop_hook_summary":
+            continue
+        total_fires += 1
+        for hook_info in entry.get("hookInfos", []):
+            d = hook_info.get("durationMs", 0)
+            total_duration += d
+            if d > max_duration:
+                max_duration = d
+        total_errors += len(entry.get("hookErrors", []))
+        if entry.get("preventedContinuation", False):
+            prevented_count += 1
+
+    return {
+        "total_hook_fires": total_fires,
+        "total_duration_ms": total_duration,
+        "max_duration_ms": max_duration,
+        "hook_errors": total_errors,
+        "prevented_continuation_count": prevented_count,
+    }
+
+
 def extract_permission_mode(transcript_path: str) -> str:
     """Most recent permission-mode entry. The mode can change mid-session."""
     last = ""
