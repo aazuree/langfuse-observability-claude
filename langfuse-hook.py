@@ -1186,6 +1186,9 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
     permission_mode = extract_permission_mode(transcript_path)
     pr_links = extract_pr_links(transcript_path)
     away_summaries = extract_away_summaries(transcript_path)
+    agent_name = extract_agent_name(transcript_path)
+    file_history_stats = extract_file_history_stats(transcript_path)
+    stop_hook_stats = extract_stop_hook_stats(transcript_path)
     entries, total_lines = parse_transcript(transcript_path, skip_lines=prev_offset)
 
     if not entries:
@@ -1243,8 +1246,8 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
     # For trace naming, skip synthetic stubs (slash commands, local-command
     # output, system reminders, prompt-submit hooks) which all start with an
     # XML-like wrapper tag. Real user prompts are plain text. Falls back to
-    # the raw first prompt if every turn is a stub.
-    first_real_prompt = first_user_input
+    # repo/branch when every turn is a stub.
+    first_real_prompt = ""
     for t in turns:
         ui = (t.get("user_input") or "").strip()
         if ui and not _SYNTHETIC_PROMPT_RE.match(ui):
@@ -1253,11 +1256,12 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
 
     trace_ts = turns[0].get("start_time") or now
 
-    # Trace name precedence: custom title > legacy slug > truncated first prompt
+    # Trace name precedence: custom title > agent name > first prompt > repo/branch
     trace_name = (
         custom_title
-        or slug
+        or agent_name
         or truncate(redact_secrets(first_real_prompt), 80).strip()
+        or f"{repo_name}/{session_meta.get('gitBranch', '')}".strip("/")
         or "Claude Code Session"
     )
 
@@ -1292,6 +1296,9 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
                 "permission_mode": permission_mode or None,
                 "pr_links": pr_links or None,
                 "away_summaries": away_summaries or None,
+                "agent_name": agent_name or None,
+                "file_snapshots": file_history_stats if file_history_stats["snapshot_count"] > 0 else None,
+                "stop_hook": stop_hook_stats if stop_hook_stats["total_hook_fires"] > 0 else None,
             },
             "tags": [t for t in [
                 "claude-code",
@@ -1301,6 +1308,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
                 "fast" if has_fast else None,
                 "has-errors" if has_errors else None,
                 f"permission:{permission_mode}" if permission_mode else None,
+                f"agent-name:{agent_name}" if agent_name else None,
                 *pr_tags,
             ] if t],
         },

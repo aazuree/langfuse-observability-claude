@@ -2181,3 +2181,109 @@ class TestExtractStopHookStats:
     def test_nonexistent_file(self):
         result = hook.extract_stop_hook_stats("/nonexistent.jsonl")
         assert result["total_hook_fires"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Trace name precedence (process_session integration)
+# ---------------------------------------------------------------------------
+
+class TestTraceNamePrecedence:
+    """Verify trace_name precedence: customTitle > agent_name > first_prompt > repo/branch."""
+
+    def _make_transcript(self, tmp_path, entries):
+        f = tmp_path / "t.jsonl"
+        f.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        return str(f)
+
+    def _get_trace_event(self, tmp_path, monkeypatch, entries, cwd=""):
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        monkeypatch.setattr(hook, "STATE_DIR", str(state_dir))
+
+        path = self._make_transcript(tmp_path, entries)
+        captured = []
+        monkeypatch.setattr(hook, "send_to_langfuse", lambda b: captured.extend(b) or True)
+        hook.process_session("test-session-001", path, cwd)
+        return next((e for e in captured if e.get("type") == "trace-create"), None)
+
+    def _base_entries(self):
+        return [
+            {
+                "type": "user",
+                "message": {"role": "user", "content": "hello world prompt"},
+                "timestamp": "2026-04-23T10:00:00Z",
+                "cwd": "/repo",
+                "gitBranch": "main",
+                "version": "2.1.112",
+                "entrypoint": "cli",
+            },
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": "I can help with that.",
+                    "model": "claude-sonnet-4-6",
+                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                },
+                "timestamp": "2026-04-23T10:00:01Z",
+            },
+        ]
+
+    def test_agent_name_beats_first_prompt(self, tmp_path, monkeypatch):
+        entries = self._base_entries() + [
+            {"type": "agent-name", "agentName": "my-stable-task-name"},
+        ]
+        evt = self._get_trace_event(tmp_path, monkeypatch, entries, cwd="/repo")
+        assert evt["body"]["name"] == "my-stable-task-name"
+
+    def test_custom_title_beats_agent_name(self, tmp_path, monkeypatch):
+        entries = self._base_entries() + [
+            {"type": "custom-title", "customTitle": "user-set-title"},
+            {"type": "agent-name", "agentName": "auto-generated-name"},
+        ]
+        evt = self._get_trace_event(tmp_path, monkeypatch, entries, cwd="/repo")
+        assert evt["body"]["name"] == "user-set-title"
+
+    def test_first_prompt_when_no_agent_name(self, tmp_path, monkeypatch):
+        entries = self._base_entries()
+        evt = self._get_trace_event(tmp_path, monkeypatch, entries, cwd="/repo")
+        assert evt["body"]["name"] == "hello world prompt"
+
+    def test_repo_branch_fallback_when_no_prompt(self, tmp_path, monkeypatch):
+        # Synthetic prompt (XML-wrapper) is skipped by _SYNTHETIC_PROMPT_RE, leaving
+        # first_real_prompt empty — trace name falls back to repo/branch.
+        entries = [
+            {
+                "type": "user",
+                "message": {"role": "user", "content": "<system-reminder>do nothing</system-reminder>"},
+                "timestamp": "2026-04-23T10:00:00Z",
+                "cwd": "/home/user/myrepo",
+                "gitBranch": "feat/improve-search",
+                "version": "2.1.112",
+                "entrypoint": "cli",
+            },
+            {
+                "type": "assistant",
+                "message": {
+                    "role": "assistant",
+                    "content": "Done.",
+                    "model": "claude-sonnet-4-6",
+                    "usage": {"input_tokens": 10, "output_tokens": 5},
+                },
+                "timestamp": "2026-04-23T10:00:01Z",
+            },
+        ]
+        evt = self._get_trace_event(tmp_path, monkeypatch, entries, cwd="/home/user/myrepo")
+        assert evt["body"]["name"] == "myrepo/feat/improve-search"
+
+    def test_agent_name_tag_added_when_present(self, tmp_path, monkeypatch):
+        entries = self._base_entries() + [
+            {"type": "agent-name", "agentName": "my-task"},
+        ]
+        evt = self._get_trace_event(tmp_path, monkeypatch, entries, cwd="/repo")
+        assert "agent-name:my-task" in evt["body"]["tags"]
+
+    def test_agent_name_tag_absent_when_missing(self, tmp_path, monkeypatch):
+        entries = self._base_entries()
+        evt = self._get_trace_event(tmp_path, monkeypatch, entries, cwd="/repo")
+        assert not any(t.startswith("agent-name:") for t in evt["body"]["tags"])
