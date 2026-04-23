@@ -463,6 +463,25 @@ def extract_agent_name(transcript_path: str) -> str:
     return ""
 
 
+def extract_file_history_stats(transcript_path: str) -> dict:
+    """Aggregate stats from file-history-snapshot entries.
+
+    Returns snapshot_count (total entries) and tracked_files_count
+    (unique file paths across all trackedFileBackups dicts).
+    File paths themselves are not captured to avoid leaking sensitive names.
+    """
+    snapshot_count = 0
+    all_paths: set[str] = set()
+    for entry in _iter_transcript(transcript_path):
+        if entry.get("type") != "file-history-snapshot":
+            continue
+        snapshot_count += 1
+        backups = entry.get("snapshot", {}).get("trackedFileBackups", {})
+        if isinstance(backups, dict):
+            all_paths.update(backups.keys())
+    return {"snapshot_count": snapshot_count, "tracked_files_count": len(all_paths)}
+
+
 def extract_permission_mode(transcript_path: str) -> str:
     """Most recent permission-mode entry. The mode can change mid-session."""
     last = ""

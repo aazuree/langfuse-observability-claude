@@ -566,6 +566,57 @@ class TestExtractAgentName:
 
 
 # ---------------------------------------------------------------------------
+# extract_file_history_stats
+# ---------------------------------------------------------------------------
+
+class TestExtractFileHistoryStats:
+    def test_empty_when_no_entries(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        f.write_text(json.dumps({"type": "user"}) + "\n")
+        result = hook.extract_file_history_stats(str(f))
+        assert result == {"snapshot_count": 0, "tracked_files_count": 0}
+
+    def test_counts_snapshots(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        entries = [
+            {"type": "file-history-snapshot", "snapshot": {"trackedFileBackups": {}, "timestamp": "t1"}, "isSnapshotUpdate": False},
+            {"type": "file-history-snapshot", "snapshot": {"trackedFileBackups": {}, "timestamp": "t2"}, "isSnapshotUpdate": True},
+        ]
+        f.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        result = hook.extract_file_history_stats(str(f))
+        assert result["snapshot_count"] == 2
+
+    def test_deduplicates_file_paths(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        entries = [
+            {
+                "type": "file-history-snapshot",
+                "snapshot": {
+                    "trackedFileBackups": {"src/a.py": "content", "src/b.py": "content"},
+                    "timestamp": "t1",
+                },
+                "isSnapshotUpdate": False,
+            },
+            {
+                "type": "file-history-snapshot",
+                "snapshot": {
+                    "trackedFileBackups": {"src/a.py": "updated", "src/c.py": "content"},
+                    "timestamp": "t2",
+                },
+                "isSnapshotUpdate": True,
+            },
+        ]
+        f.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        result = hook.extract_file_history_stats(str(f))
+        assert result["snapshot_count"] == 2
+        assert result["tracked_files_count"] == 3  # a.py, b.py, c.py deduplicated
+
+    def test_nonexistent_file(self):
+        result = hook.extract_file_history_stats("/nonexistent.jsonl")
+        assert result == {"snapshot_count": 0, "tracked_files_count": 0}
+
+
+# ---------------------------------------------------------------------------
 # extract_pr_links
 # ---------------------------------------------------------------------------
 
