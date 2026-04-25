@@ -1234,6 +1234,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
     total_tool_calls = sum(len(t["tool_calls"]) for t in turns)
     total_cost = 0.0
     subagent_cost_summaries = []
+    sa_state = load_subagent_state(session_id)
 
     first_user_input = turns[0]["user_input"] if turns else ""
     last_assistant_output = ""
@@ -1452,7 +1453,6 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
 
         # Discover and ingest subagents for this turn
         if agent_tool_uses_this_turn:
-            sa_state = load_subagent_state(session_id)
             matches = discover_subagents(transcript_path, agent_tool_uses_this_turn)
             for sa_id, sa_path, sa_desc, sa_type, sa_tc_idx in matches:
                 sa_prev_offset = sa_state.get(sa_id, {}).get("offset", 0)
@@ -1469,7 +1469,20 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
                     prior_turn_count=sa_prior_turns,
                 )
                 batch.extend(sa_events)
-                sa_state[sa_id] = {"offset": sa_new_offset, "turn_count": sa_new_tc, "status": sa_status}
+                _prev = sa_state.get(sa_id, {})
+                sa_state[sa_id] = {
+                    "offset": sa_new_offset,
+                    "turn_count": sa_new_tc,
+                    "status": sa_status,
+                    "total_cost": round(_prev.get("total_cost", 0.0) + sa_cost["total_cost"], 6),
+                    "total_tokens": _prev.get("total_tokens", 0) + sa_cost["total_tokens"],
+                    "cost_breakdown": {
+                        k: round(_prev.get("cost_breakdown", {}).get(k, 0.0) + v, 6)
+                        for k, v in sa_cost["cost_breakdown"].items()
+                    },
+                    "description": sa_desc,
+                    "subagent_type": sa_type,
+                }
 
                 # Enrich Agent tool span metadata
                 for evt in batch:
@@ -1478,17 +1491,27 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
                             "subagent_id": sa_id,
                             "subagent_type": sa_type,
                             "subagent_description": sa_desc,
-                            "subagent_cost": sa_cost["total_cost"],
+                            "subagent_cost": sa_state[sa_id]["total_cost"],
                             "subagent_tokens": sa_cost["total_tokens"],
                             "subagent_status": sa_status,
                         })
                         break
 
-                subagent_cost_summaries.append({
-                    **sa_cost, "description": sa_desc, "subagent_type": sa_type,
-                })
-
             save_subagent_state(session_id, sa_state)
+
+    # Rebuild subagent_cost_summaries from all known agents (cumulative across fires)
+    # and store cumulative parent cost in sa_state for future fires.
+    _known_agents = {k: v for k, v in sa_state.items()
+                     if k != "_parent" and isinstance(v, dict)}
+    if _known_agents:
+        subagent_cost_summaries = [
+            {"agent_id": aid, **state} for aid, state in _known_agents.items()
+        ]
+        cumulative_parent_cost = sa_state.get("_parent", {}).get("total_cost", 0.0) + total_cost
+        sa_state["_parent"] = {"total_cost": round(cumulative_parent_cost, 6)}
+        save_subagent_state(session_id, sa_state)
+    else:
+        cumulative_parent_cost = total_cost
 
     # Add subagent cost summary to trace
     if subagent_cost_summaries:
@@ -1498,8 +1521,8 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
                 evt["body"]["metadata"]["subagent_costs"] = {
                     "agents": subagent_cost_summaries,
                     "total_subagent_cost": round(total_subagent_cost, 6),
-                    "parent_cost": round(total_cost, 6),
-                    "harness_total_cost": round(total_cost + total_subagent_cost, 6),
+                    "parent_cost": round(cumulative_parent_cost, 6),
+                    "harness_total_cost": round(cumulative_parent_cost + total_subagent_cost, 6),
                 }
                 evt["body"]["tags"].append("has-subagents")
                 evt["body"]["tags"].append(f"subagents:{len(subagent_cost_summaries)}")
@@ -1511,7 +1534,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
         session_id=session_id,
         first_user_input=first_user_input,
         turns=turns,
-        total_cost=total_cost,
+        total_cost=cumulative_parent_cost,
     )
     batch.extend(score_events)
 
