@@ -29,7 +29,7 @@ SK=$(grep '^LANGFUSE_INIT_PROJECT_SECRET_KEY=' .env | cut -d= -f2)
 LANGFUSE_PUBLIC_KEY=$PK LANGFUSE_SECRET_KEY=$SK python3 langfuse-hook.py --reprocess
 ```
 
-- **Dashboard**: http://localhost:3000
+- **Dashboard**: http://localhost:3100
 - **Hook log**: `~/.claude/langfuse-hook.log` (auto-rotates at 10 MB)
 - **State files**: `~/.claude/langfuse-state/<session_id>.offset` (parent), `<session_id>.subagents.json` (subagents)
 
@@ -39,7 +39,7 @@ LANGFUSE_PUBLIC_KEY=$PK LANGFUSE_SECRET_KEY=$SK python3 langfuse-hook.py --repro
 Claude Code CLI
     | (Stop hook fires after each response)
     v
-langfuse-hook.py --> POST --> Langfuse API (localhost:3000)
+langfuse-hook.py --> POST --> Langfuse API (localhost:3100)
                                   |
                     PostgreSQL, ClickHouse, Redis, MinIO
 ```
@@ -64,7 +64,7 @@ setup.sh                         # One-command setup (generates .env, starts ser
 .env.example                     # Template for environment variables
 .env                             # Generated secrets (gitignored)
 tests/
-  test_langfuse_hook.py          # Core hook unit tests (166 tests)
+  test_langfuse_hook.py          # Core hook unit tests (168 tests)
   test_hook_scores.py            # Hook-level score classifier tests
   test_subagent_tracking.py      # Subagent cost tracking tests
   test_eval_hook.py              # LLM-as-a-Judge evaluator tests

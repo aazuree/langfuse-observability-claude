@@ -12,7 +12,7 @@ invocation only sends new messages.
 Environment variables:
   LANGFUSE_PUBLIC_KEY  - Langfuse project public key
   LANGFUSE_SECRET_KEY  - Langfuse project secret key
-  LANGFUSE_HOST        - Langfuse base URL (default: http://localhost:3000)
+  LANGFUSE_HOST        - Langfuse base URL (default: http://localhost:3100)
 """
 
 import hashlib
@@ -31,7 +31,7 @@ from urllib.request import Request, urlopen
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from langfuse_common import log as common_log, make_auth_header, redact_secrets
 
-LANGFUSE_HOST = os.environ.get("LANGFUSE_HOST", "http://localhost:3000")
+LANGFUSE_HOST = os.environ.get("LANGFUSE_HOST", "http://localhost:3100")
 LANGFUSE_PUBLIC_KEY = os.environ.get("LANGFUSE_PUBLIC_KEY", "")
 LANGFUSE_SECRET_KEY = os.environ.get("LANGFUSE_SECRET_KEY", "")
 INGESTION_URL = f"{LANGFUSE_HOST}/api/public/ingestion"

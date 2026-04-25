@@ -20,7 +20,7 @@ import sys
 from urllib.request import Request, urlopen
 from urllib.error import URLError
 
-LANGFUSE_HOST = os.environ.get("LANGFUSE_HOST", "http://localhost:3000")
+LANGFUSE_HOST = os.environ.get("LANGFUSE_HOST", "http://localhost:3100")
 LANGFUSE_PUBLIC_KEY = os.environ.get("LANGFUSE_PUBLIC_KEY", "")
 LANGFUSE_SECRET_KEY = os.environ.get("LANGFUSE_SECRET_KEY", "")
 
