@@ -31,7 +31,7 @@ The setup script:
 3. Starts Langfuse via Docker Compose (6 services)
 4. Backs up existing `~/.claude/settings.json` (if present) and configures the `Stop` hook
 
-**Dashboard**: http://localhost:3000
+**Dashboard**: http://localhost:3100
 **Login**: the credentials you entered during setup
 
 ## Prerequisites
@@ -48,7 +48,7 @@ Claude Code CLI
       |
       | (Stop hook fires after each response)
       v
-langfuse-hook.py  ──POST──>  Langfuse API (localhost:3000)
+langfuse-hook.py  ──POST──>  Langfuse API (localhost:3100)
                                     |
                               ┌─────┴─────┐
                               │  Langfuse  │
@@ -92,12 +92,12 @@ The hook script (`langfuse-hook.py`) is invoked by Claude Code after each assist
 
 | Service | Port | Access |
 |---------|------|--------|
-| langfuse-web | 3000 | localhost only |
-| langfuse-worker | 3030 | localhost only |
-| postgres | 5432 | localhost only |
-| clickhouse | 8123, 9000 | localhost only |
-| redis | 6379 | localhost only |
-| minio | 9090 | localhost only |
+| langfuse-web | 3100 | localhost only |
+| langfuse-worker | 3130 | localhost only |
+| postgres | 5532 | localhost only |
+| clickhouse | 8223, 9100 | localhost only |
+| redis | 6479 | localhost only |
+| minio | 9190 | localhost only |
 
 ## Operations
 
@@ -116,7 +116,7 @@ docker compose logs langfuse-web -f
 tail -f ~/.claude/langfuse-hook.log
 
 # Query traces (use the project keys printed during setup)
-curl -s http://localhost:3000/api/public/traces \
+curl -s http://localhost:3100/api/public/traces \
   -u "YOUR_PUBLIC_KEY:YOUR_SECRET_KEY"
 ```
 

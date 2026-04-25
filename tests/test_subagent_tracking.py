@@ -429,3 +429,174 @@ def test_process_session_with_subagent(tmp_path, monkeypatch):
 
     sa_state = langfuse_hook.load_subagent_state("test-session")
     assert "impl-agent" in sa_state
+
+
+def test_harness_cost_accumulates_across_hook_fires(tmp_path, monkeypatch):
+    """harness_total_cost equals cumulative cost across multiple hook fires."""
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    monkeypatch.setattr(langfuse_hook, "STATE_DIR", str(state_dir))
+    sent_batches = []
+    monkeypatch.setattr(
+        langfuse_hook, "send_to_langfuse", lambda batch: sent_batches.append(batch) or True
+    )
+
+    session_dir = tmp_path / "projects" / "test-project"
+    session_dir.mkdir(parents=True)
+    transcript_path = session_dir / "fire-session.jsonl"
+
+    # Fire 1 entries: user → agent dispatch → tool result
+    fire1_entries = [
+        {
+            "type": "user", "uuid": "u1", "timestamp": "2026-04-25T10:00:00+00:00",
+            "sessionId": "fire-session", "cwd": "/home/test/project",
+            "version": "2.1.86", "gitBranch": "main", "entrypoint": "cli",
+            "message": {"role": "user", "content": "Do the thing"},
+        },
+        {
+            "type": "assistant", "uuid": "a1", "timestamp": "2026-04-25T10:00:02+00:00",
+            "message": {
+                "id": "msg-fire-1", "role": "assistant", "model": "claude-sonnet-4-6",
+                "content": [
+                    {"type": "text", "text": "Dispatching subagent."},
+                    {
+                        "type": "tool_use", "id": "tool-agent-1", "name": "Agent",
+                        "input": {
+                            "description": "Run task", "subagent_type": "general-purpose",
+                            "prompt": "do it",
+                        },
+                    },
+                ],
+                "usage": {
+                    "input_tokens": 50, "output_tokens": 20,
+                    "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
+                },
+            },
+        },
+        {
+            "type": "user", "uuid": "u2", "timestamp": "2026-04-25T10:01:00+00:00",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "tool-agent-1",
+                 "content": [{"type": "text", "text": "Done."}]}
+            ]},
+        },
+    ]
+    transcript_path.write_text("\n".join(json.dumps(e) for e in fire1_entries) + "\n")
+
+    subagent_dir = session_dir / "fire-session" / "subagents"
+    subagent_dir.mkdir(parents=True)
+    _make_full_subagent_jsonl(subagent_dir, "run-agent", "2026-04-25T10:00:03+00:00")
+
+    # First hook fire
+    langfuse_hook.process_session("fire-session", str(transcript_path), "/home/test/project")
+    assert len(sent_batches) == 1, "Expected exactly 1 batch after fire 1"
+
+    fire1_trace = next(e for e in sent_batches[0] if e["type"] == "trace-create")
+    fire1_costs = fire1_trace["body"]["metadata"]["subagent_costs"]
+    fire1_harness = fire1_costs["harness_total_cost"]
+    fire1_parent = fire1_costs["parent_cost"]
+    fire1_subagent = fire1_costs["total_subagent_cost"]
+    assert fire1_harness > 0
+    assert fire1_parent > 0
+    assert fire1_subagent > 0
+    assert abs(fire1_harness - (fire1_parent + fire1_subagent)) < 1e-9
+
+    # Append one more parent turn (no new subagent activity)
+    with open(transcript_path, "a") as f:
+        f.write(json.dumps({
+            "type": "user", "uuid": "u3", "timestamp": "2026-04-25T10:02:00+00:00",
+            "message": {"role": "user", "content": "One more question"},
+        }) + "\n")
+        f.write(json.dumps({
+            "type": "assistant", "uuid": "a2", "timestamp": "2026-04-25T10:02:05+00:00",
+            "message": {
+                "id": "msg-fire-2", "role": "assistant", "model": "claude-sonnet-4-6",
+                "content": [{"type": "text", "text": "Answer."}],
+                "usage": {
+                    "input_tokens": 60, "output_tokens": 30,
+                    "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
+                },
+            },
+        }) + "\n")
+
+    # Second hook fire
+    langfuse_hook.process_session("fire-session", str(transcript_path), "/home/test/project")
+    assert len(sent_batches) == 2, "Expected exactly 2 batches after fire 2"
+
+    fire2_trace = next(e for e in sent_batches[1] if e["type"] == "trace-create")
+    fire2_costs = fire2_trace["body"]["metadata"]["subagent_costs"]
+    fire2_harness = fire2_costs["harness_total_cost"]
+    fire2_parent = fire2_costs["parent_cost"]
+    fire2_subagent = fire2_costs["total_subagent_cost"]
+
+    # Parent cost grows (new turn was added); subagent cost is unchanged
+    assert fire2_parent > fire1_parent, "parent_cost must grow across fires"
+    assert abs(fire2_subagent - fire1_subagent) < 1e-9, "subagent cost must not change in fire 2"
+    # harness_total must be the running cumulative
+    assert abs(fire2_harness - (fire2_parent + fire2_subagent)) < 1e-9
+    assert fire2_harness > fire1_harness, "harness_total must grow across fires"
+    # Agent must still appear in the agents list even with no new turns
+    agents = fire2_costs["agents"]
+    assert any(a["agent_id"] == "run-agent" for a in agents), \
+        "run-agent must appear in agents list even in fire 2"
+
+
+def test_parent_cost_stored_in_sa_state(tmp_path, monkeypatch):
+    """After processing a session with subagents, sa_state stores _parent.total_cost."""
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    monkeypatch.setattr(langfuse_hook, "STATE_DIR", str(state_dir))
+    monkeypatch.setattr(langfuse_hook, "send_to_langfuse", lambda batch: True)
+
+    session_dir = tmp_path / "projects" / "test-project"
+    session_dir.mkdir(parents=True)
+    transcript_path = session_dir / "parent-cost-session.jsonl"
+
+    entries = [
+        {
+            "type": "user", "uuid": "u1", "timestamp": "2026-04-25T10:00:00+00:00",
+            "sessionId": "parent-cost-session", "cwd": "/home/test/project",
+            "version": "2.1.86", "gitBranch": "main", "entrypoint": "cli",
+            "message": {"role": "user", "content": "Do the thing"},
+        },
+        {
+            "type": "assistant", "uuid": "a1", "timestamp": "2026-04-25T10:00:02+00:00",
+            "message": {
+                "id": "msg-pc-1", "role": "assistant", "model": "claude-sonnet-4-6",
+                "content": [
+                    {"type": "text", "text": "Dispatching."},
+                    {
+                        "type": "tool_use", "id": "tool-agent-1", "name": "Agent",
+                        "input": {
+                            "description": "Run task", "subagent_type": "general-purpose",
+                            "prompt": "do it",
+                        },
+                    },
+                ],
+                "usage": {
+                    "input_tokens": 50, "output_tokens": 20,
+                    "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
+                },
+            },
+        },
+        {
+            "type": "user", "uuid": "u2", "timestamp": "2026-04-25T10:01:00+00:00",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "tool-agent-1",
+                 "content": [{"type": "text", "text": "Done."}]}
+            ]},
+        },
+    ]
+    transcript_path.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+
+    subagent_dir = session_dir / "parent-cost-session" / "subagents"
+    subagent_dir.mkdir(parents=True)
+    _make_full_subagent_jsonl(subagent_dir, "pc-agent", "2026-04-25T10:00:03+00:00")
+
+    langfuse_hook.process_session(
+        "parent-cost-session", str(transcript_path), "/home/test/project"
+    )
+
+    sa_state = langfuse_hook.load_subagent_state("parent-cost-session")
+    assert "_parent" in sa_state, "sa_state must contain _parent key after processing"
+    assert sa_state["_parent"]["total_cost"] > 0, "_parent.total_cost must be positive"
