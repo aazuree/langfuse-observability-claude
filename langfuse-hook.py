@@ -1492,7 +1492,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
                             "subagent_type": sa_type,
                             "subagent_description": sa_desc,
                             "subagent_cost": sa_state[sa_id]["total_cost"],
-                            "subagent_tokens": sa_cost["total_tokens"],
+                            "subagent_tokens": sa_state[sa_id]["total_tokens"],
                             "subagent_status": sa_status,
                         })
                         break
