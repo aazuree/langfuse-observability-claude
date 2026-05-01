@@ -74,7 +74,8 @@ setup.sh                         # One-command setup (generates .env, starts ser
 .env.example                     # Template for environment variables
 .env                             # Generated secrets (gitignored)
 tests/
-  test_langfuse_hook.py          # Core hook unit tests (168 tests)
+  test_langfuse_hook.py          # Core hook unit tests (184 tests)
+  test_session_hooks.py          # SessionStart + StopFailure hook tests
   test_hook_scores.py            # Hook-level score classifier tests
   test_subagent_tracking.py      # Subagent cost tracking tests
   test_eval_hook.py              # LLM-as-a-Judge evaluator tests

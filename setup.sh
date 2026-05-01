@@ -207,7 +207,7 @@ for hook_group in settings.get('hooks', {}).get('Stop', []):
 # Register SessionStart and StopFailure hooks for session-start-hook.py
 session_hook_cmd = '''$SESSION_HOOK_CMD'''
 for event_name in ('SessionStart', 'StopFailure'):
-    event_hooks = settings['hooks'].setdefault(event_name, [])
+    event_hooks = settings.setdefault('hooks', {}).setdefault(event_name, [])
     already = any(
         'session-start-hook.py' in h.get('command', '')
         for group in event_hooks
