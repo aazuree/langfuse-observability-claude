@@ -1468,13 +1468,13 @@ class TestProcessSession:
         assert len(sent_batches) == 1
         batch = sent_batches[0]
 
-        # Should have: 1 trace + 1 generation + 5 scores = 7 events
+        # Should have: 1 trace + 1 generation + 7 scores = 9 events
         trace_events = [e for e in batch if e["type"] == "trace-create"]
         gen_events = [e for e in batch if e["type"] == "generation-create"]
         score_events = [e for e in batch if e["type"] == "score-create"]
         assert len(trace_events) == 1
         assert len(gen_events) == 1
-        assert len(score_events) == 5
+        assert len(score_events) == 7
 
         # Trace metadata
         trace = trace_events[0]["body"]
@@ -2306,3 +2306,106 @@ class TestTraceNamePrecedence:
         entries = self._base_entries()
         evt = self._get_trace_event(tmp_path, monkeypatch, entries, cwd="/repo")
         assert evt["body"]["metadata"].get("file_snapshots") is None
+
+
+# ---------------------------------------------------------------------------
+# calculate_tool_diversity
+# ---------------------------------------------------------------------------
+
+class TestCalculateToolDiversity:
+    def _turns(self, tool_names_per_turn):
+        return [
+            {"tool_calls": [{"name": n} for n in names]}
+            for names in tool_names_per_turn
+        ]
+
+    def test_all_same_tool(self):
+        turns = self._turns([["Bash", "Bash", "Bash"]])
+        assert hook.calculate_tool_diversity(turns) == round(1/3, 4)
+
+    def test_all_unique_tools(self):
+        turns = self._turns([["Bash", "Read", "Write"]])
+        assert hook.calculate_tool_diversity(turns) == 1.0
+
+    def test_no_tool_calls(self):
+        turns = [{"tool_calls": []}]
+        assert hook.calculate_tool_diversity(turns) == 0.0
+
+    def test_empty_turns(self):
+        assert hook.calculate_tool_diversity([]) == 0.0
+
+    def test_tools_across_multiple_turns(self):
+        turns = self._turns([["Bash", "Bash"], ["Read"]])
+        assert hook.calculate_tool_diversity(turns) == round(2/3, 4)
+
+    def test_single_tool_single_call(self):
+        turns = self._turns([["Bash"]])
+        assert hook.calculate_tool_diversity(turns) == 1.0
+
+
+# ---------------------------------------------------------------------------
+# detect_compaction
+# ---------------------------------------------------------------------------
+
+class TestDetectCompaction:
+    def _write_transcript(self, entries, tmp_path):
+        p = tmp_path / "session.jsonl"
+        p.write_text("\n".join(json.dumps(e) for e in entries))
+        return str(p)
+
+    def test_no_compaction(self, tmp_path):
+        entries = [{"type": "user", "message": {"role": "user", "content": "hi"}}]
+        path = self._write_transcript(entries, tmp_path)
+        assert hook.detect_compaction(path) is False
+
+    def test_compact_subtype(self, tmp_path):
+        entries = [{"type": "system", "subtype": "compact"}]
+        path = self._write_transcript(entries, tmp_path)
+        assert hook.detect_compaction(path) is True
+
+    def test_compaction_subtype(self, tmp_path):
+        entries = [{"type": "system", "subtype": "compaction"}]
+        path = self._write_transcript(entries, tmp_path)
+        assert hook.detect_compaction(path) is True
+
+    def test_summary_type(self, tmp_path):
+        entries = [{"type": "summary", "summary": "..."}]
+        path = self._write_transcript(entries, tmp_path)
+        assert hook.detect_compaction(path) is True
+
+    def test_missing_file(self):
+        assert hook.detect_compaction("/nonexistent/path.jsonl") is False
+
+
+class TestBuildHookScoreEventsNewScores:
+    def _turns(self, tool_names_per_turn):
+        return [
+            {"tool_calls": [{"name": n} for n in names],
+             "usage": {"input": 0, "output": 0, "total": 0, "cache_read": 0, "cache_creation": 0}}
+            for names in tool_names_per_turn
+        ]
+
+    def test_tool_diversity_score_present(self, tmp_path):
+        transcript = tmp_path / "s.jsonl"
+        transcript.write_text("")
+        turns = self._turns([["Bash", "Read"]])
+        events = hook.build_hook_score_events("t1", "s1", "fix bug", turns, 0.05, str(transcript))
+        names = {e["body"]["name"] for e in events}
+        assert "tool_diversity" in names
+        assert "compaction_occurred" in names
+
+    def test_compaction_occurred_true(self, tmp_path):
+        transcript = tmp_path / "s.jsonl"
+        transcript.write_text(json.dumps({"type": "system", "subtype": "compact"}))
+        turns = self._turns([["Bash"]])
+        events = hook.build_hook_score_events("t1", "s1", "fix bug", turns, 0.05, str(transcript))
+        comp_event = next(e for e in events if e["body"]["name"] == "compaction_occurred")
+        assert comp_event["body"]["value"] == 1
+
+    def test_tool_diversity_zero_no_tools(self, tmp_path):
+        transcript = tmp_path / "s.jsonl"
+        transcript.write_text("")
+        turns = [{"tool_calls": [], "usage": {"input": 0, "output": 0, "total": 0, "cache_read": 0, "cache_creation": 0}}]
+        events = hook.build_hook_score_events("t1", "s1", "hi", turns, 0.0, str(transcript))
+        div_event = next(e for e in events if e["body"]["name"] == "tool_diversity")
+        assert div_event["body"]["value"] == 0.0

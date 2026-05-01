@@ -1091,6 +1091,34 @@ def compute_cache_hit_rate(turns: list[dict]) -> float:
     return round(cache_read / denominator, 4)
 
 
+def calculate_tool_diversity(turns: list[dict]) -> float:
+    """Measure tool-call diversity across all turns.
+
+    Returns unique_tool_names / total_tool_calls, rounded to 4 decimal places.
+    0.0 when there are no tool calls or turns is empty.
+    """
+    all_calls = [tc["name"] for t in turns for tc in t.get("tool_calls", [])]
+    if not all_calls:
+        return 0.0
+    return round(len(set(all_calls)) / len(all_calls), 4)
+
+
+def detect_compaction(transcript_path: str) -> bool:
+    """Return True if the transcript contains a compaction event.
+
+    Matches: type=="summary" OR (type=="system" AND "compact" in subtype.lower()).
+    Returns False when transcript_path is empty or the file does not exist.
+    """
+    for entry in _iter_transcript(transcript_path):
+        etype = entry.get("type", "")
+        subtype = entry.get("subtype", "")
+        if etype == "summary":
+            return True
+        if etype == "system" and "compact" in subtype.lower():
+            return True
+    return False
+
+
 def classify_cost_tier(total_cost: float) -> str:
     """Classify session cost into a tier for dashboard filtering.
 
@@ -1110,12 +1138,14 @@ def build_hook_score_events(
     first_user_input: str,
     turns: list[dict],
     total_cost: float,
+    transcript_path: str = "",
 ) -> list[dict]:
     """Build score-create events for the ingestion batch.
 
-    Returns 5 events: session_type (CATEGORICAL), token_efficiency (NUMERIC),
+    Returns 7 events: session_type (CATEGORICAL), token_efficiency (NUMERIC),
     task_completed (BOOLEAN as int 0/1), cache_hit_rate (NUMERIC),
-    cost_tier (CATEGORICAL).
+    cost_tier (CATEGORICAL), tool_diversity (NUMERIC),
+    compaction_occurred (BOOLEAN as int 0/1).
     """
     now = datetime.now(timezone.utc).isoformat()
 
@@ -1150,6 +1180,16 @@ def build_hook_score_events(
             "name": "cost_tier",
             "dataType": "CATEGORICAL",
             "value": cost_tier,
+        },
+        {
+            "name": "tool_diversity",
+            "dataType": "NUMERIC",
+            "value": calculate_tool_diversity(turns),
+        },
+        {
+            "name": "compaction_occurred",
+            "dataType": "BOOLEAN",
+            "value": 1 if detect_compaction(transcript_path) else 0,
         },
     ]
 
@@ -1535,6 +1575,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
         first_user_input=first_user_input,
         turns=turns,
         total_cost=cumulative_parent_cost,
+        transcript_path=transcript_path,
     )
     batch.extend(score_events)
 

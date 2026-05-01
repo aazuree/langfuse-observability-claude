@@ -258,7 +258,7 @@ def test_cost_tier_expensive():
 # --- build_hook_score_events ---
 
 def test_build_hook_score_events_returns_five_events():
-    """Should produce exactly 5 score-create events."""
+    """Should produce exactly 7 score-create events."""
     events = hook.build_hook_score_events(
         trace_id="trace-abc",
         session_id="abc",
@@ -269,9 +269,9 @@ def test_build_hook_score_events_returns_five_events():
                 "tool_calls": []}],
         total_cost=0.05,
     )
-    assert len(events) == 5
+    assert len(events) == 7
     names = {e["body"]["name"] for e in events}
-    assert names == {"session_type", "token_efficiency", "task_completed", "cache_hit_rate", "cost_tier"}
+    assert names == {"session_type", "token_efficiency", "task_completed", "cache_hit_rate", "cost_tier", "tool_diversity", "compaction_occurred"}
 
 
 def test_build_hook_score_events_types():
