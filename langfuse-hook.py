@@ -24,7 +24,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 # Ensure langfuse_common can be imported from the same directory
@@ -61,6 +61,9 @@ DEFAULT_MODEL = "claude-opus-4-6"
 
 # Pro subscription: $0 marginal cost. Set to True to report equivalent API cost instead.
 REPORT_API_EQUIVALENT_COST = True
+
+# Dataset name for auto-capturing expensive sessions
+EXPENSIVE_DATASET_NAME = "expensive-sessions"
 
 
 def log(msg: str) -> None:
@@ -1569,6 +1572,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
                 break
 
     # Hook-level scores (trace-level)
+    cost_tier = classify_cost_tier(cumulative_parent_cost)
     score_events = build_hook_score_events(
         trace_id=trace_id,
         session_id=session_id,
@@ -1584,7 +1588,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
     save_state(session_id, total_lines)
 
     # Auto-capture expensive sessions into dataset for offline evaluation
-    if classify_cost_tier(cumulative_parent_cost) == "expensive":
+    if cost_tier == "expensive":
         if ensure_dataset(EXPENSIVE_DATASET_NAME):
             add_to_dataset(
                 EXPENSIVE_DATASET_NAME,
@@ -1616,9 +1620,6 @@ def delete_trace(trace_id: str) -> None:
         pass
 
 
-EXPENSIVE_DATASET_NAME = "expensive-sessions"
-
-
 def ensure_dataset(name: str) -> bool:
     """Create dataset if it doesn't exist. Returns True on success or already-exists."""
     check_url = f"{LANGFUSE_HOST}/api/public/datasets/{name}"
@@ -1631,7 +1632,7 @@ def ensure_dataset(name: str) -> bool:
         with urlopen(check_req, timeout=10):
             return True  # dataset exists
     except URLError as e:
-        if not (hasattr(e, "code") and e.code == 404):
+        if not (isinstance(e, HTTPError) and e.code == 404):
             log(f"ensure_dataset: check failed for '{name}': {e}")
             return False
 
