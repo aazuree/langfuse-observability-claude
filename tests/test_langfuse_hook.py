@@ -2376,6 +2376,9 @@ class TestDetectCompaction:
     def test_missing_file(self):
         assert hook.detect_compaction("/nonexistent/path.jsonl") is False
 
+    def test_empty_path_returns_false(self):
+        assert hook.detect_compaction("") is False
+
 
 class TestBuildHookScoreEventsNewScores:
     def _turns(self, tool_names_per_turn):
@@ -2393,6 +2396,9 @@ class TestBuildHookScoreEventsNewScores:
         names = {e["body"]["name"] for e in events}
         assert "tool_diversity" in names
         assert "compaction_occurred" in names
+        # Empty transcript → no compaction
+        comp_event = next(e for e in events if e["body"]["name"] == "compaction_occurred")
+        assert comp_event["body"]["value"] == 0
 
     def test_compaction_occurred_true(self, tmp_path):
         transcript = tmp_path / "s.jsonl"
