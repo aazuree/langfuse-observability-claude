@@ -217,3 +217,99 @@ def test_evaluators_reduced_to_two():
     assert len(mod.EVALUATORS) == 2
     names = [e["name"] for e in mod.EVALUATORS]
     assert names == ["task_completion", "response_quality"]
+
+
+class TestFetchGenerationsV2:
+    """Verify cursor-based pagination replaces page-based for v2 endpoint."""
+
+    def test_single_page_no_cursor(self):
+        """Single page response with nextCursor=None returns all items in one call."""
+        import json as _json
+        import unittest.mock as _mock
+
+        mod = _load_module()
+
+        responses = [
+            {"data": [{"id": "obs1"}, {"id": "obs2"}], "meta": {"nextCursor": None}},
+        ]
+        call_count = {"n": 0}
+
+        def fake_urlopen(req, timeout):
+            body = _json.dumps(responses[call_count["n"]]).encode()
+            call_count["n"] += 1
+            ctx = _mock.MagicMock()
+            ctx.__enter__ = lambda s: s
+            ctx.__exit__ = lambda s, *a: False
+            ctx.read = lambda: body
+            ctx.status = 200
+            return ctx
+
+        with _mock.patch("eval_hook.urlopen", fake_urlopen):
+            result = mod.fetch_generations("trace-123")
+        assert len(result) == 2
+        assert call_count["n"] == 1
+
+    def test_two_pages_cursor_chained(self):
+        """Two pages joined via nextCursor — second call includes cursor param."""
+        import json as _json
+        import unittest.mock as _mock
+
+        mod = _load_module()
+
+        responses = [
+            {"data": [{"id": "obs1"}], "meta": {"nextCursor": "cursor-abc"}},
+            {"data": [{"id": "obs2"}], "meta": {"nextCursor": None}},
+        ]
+        call_count = {"n": 0}
+        captured_urls = []
+
+        def fake_urlopen(req, timeout):
+            captured_urls.append(req.full_url)
+            body = _json.dumps(responses[call_count["n"]]).encode()
+            call_count["n"] += 1
+            ctx = _mock.MagicMock()
+            ctx.__enter__ = lambda s: s
+            ctx.__exit__ = lambda s, *a: False
+            ctx.read = lambda: body
+            ctx.status = 200
+            return ctx
+
+        with _mock.patch("eval_hook.urlopen", fake_urlopen):
+            result = mod.fetch_generations("trace-123")
+        assert len(result) == 2
+        assert call_count["n"] == 2
+        assert "cursor=cursor-abc" in captured_urls[1]
+        assert "/v2/observations" in captured_urls[0]
+
+    def test_v2_404_falls_back_to_v1(self):
+        """When v2 returns 404, falls back to v1 page-based endpoint."""
+        import json as _json
+        import unittest.mock as _mock
+        from urllib.error import HTTPError
+
+        mod = _load_module()
+
+        call_count = {"n": 0}
+        captured_urls = []
+
+        def fake_urlopen(req, timeout):
+            captured_urls.append(req.full_url)
+            call_count["n"] += 1
+            if "/v2/" in req.full_url:
+                raise HTTPError(req.full_url, 404, "Not Found", {}, None)
+            # v1 response
+            body = _json.dumps({"data": [{"id": "obs1"}], "meta": {"totalPages": 1}}).encode()
+            ctx = _mock.MagicMock()
+            ctx.__enter__ = lambda s: s
+            ctx.__exit__ = lambda s, *a: False
+            ctx.read = lambda: body
+            ctx.status = 200
+            return ctx
+
+        with _mock.patch("eval_hook.urlopen", fake_urlopen):
+            result = mod.fetch_generations("trace-123")
+        assert len(result) == 1
+        assert result[0]["id"] == "obs1"
+        # First call was v2, second was v1
+        assert "/v2/" in captured_urls[0]
+        assert "/v2/" not in captured_urls[1]
