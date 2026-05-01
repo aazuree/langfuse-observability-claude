@@ -37,11 +37,20 @@ LANGFUSE_PUBLIC_KEY=$PK LANGFUSE_SECRET_KEY=$SK python3 langfuse-hook.py --repro
 
 ```
 Claude Code CLI
+    | (SessionStart hook fires immediately on session open)
+    v
+session-start-hook.py --> POST --> Langfuse API (localhost:3100)
+                          (trace-create: source + model tags)
+
     | (Stop hook fires after each response)
     v
 langfuse-hook.py --> POST --> Langfuse API (localhost:3100)
                                   |
                     PostgreSQL, ClickHouse, Redis, MinIO
+
+    | (StopFailure hook fires when a turn ends in API error)
+    v
+session-start-hook.py --> POST --> Langfuse API (trace-update: stop-failure tag)
 ```
 
 All services bound to `127.0.0.1` only. API key never leaves the machine.
@@ -57,6 +66,7 @@ All services bound to `127.0.0.1` only. API key never leaves the machine.
 
 ```
 langfuse-hook.py                 # Core hook script (~1400 lines) - parses transcripts, sends to Langfuse
+session-start-hook.py            # SessionStart + StopFailure hook - creates early traces, tags failures
 eval-hook.py                     # LLM-as-a-Judge evaluator (~630 lines) - evaluates traces via claude CLI
 backfill-score-observations.py   # One-time backfill script - re-posts trace scores with observationId
 docker-compose.yml               # Full Langfuse stack (6 services)
@@ -64,7 +74,8 @@ setup.sh                         # One-command setup (generates .env, starts ser
 .env.example                     # Template for environment variables
 .env                             # Generated secrets (gitignored)
 tests/
-  test_langfuse_hook.py          # Core hook unit tests (168 tests)
+  test_langfuse_hook.py          # Core hook unit tests (184 tests)
+  test_session_hooks.py          # SessionStart + StopFailure hook tests
   test_hook_scores.py            # Hook-level score classifier tests
   test_subagent_tracking.py      # Subagent cost tracking tests
   test_eval_hook.py              # LLM-as-a-Judge evaluator tests
@@ -313,6 +324,8 @@ Five heuristic scores are automatically attached to every trace during ingestion
 | `task_completed` | Boolean | true/false | Last turn error/question detection |
 | `cache_hit_rate` | Numeric | 0.0-1.0 | cache_read / (cache_read + cache_creation) |
 | `cost_tier` | Categorical | cheap, moderate, expensive | Total session cost bucketing |
+| `tool_diversity` | Numeric | 0.0-1.0 | unique_tools / total_tool_calls |
+| `compaction_occurred` | Boolean | 0/1 | Any context compaction in session |
 
 These are deterministic (no LLM calls) and run on every Stop hook invocation.
 Scores use deterministic UUIDs so re-ingestion (`--reprocess`) updates rather than duplicates.
@@ -341,3 +354,14 @@ filter by `cache_read > 0` to identify sessions with actual cache activity.
 **`cost_tier`** — Buckets session cost for dashboard filtering. `cheap` (< $0.10), `moderate` ($0.10–$1.00),
 `expensive` (≥ $1.00). Enables one-click filtering to find expensive sessions or identify
 cost trends across models.
+
+## Auto-Dataset Capture
+
+Expensive sessions (`cost_tier = expensive`, ≥ $1.00) are automatically added
+to a Langfuse dataset named `expensive-sessions`. Each item stores the first
+user prompt as `input` and the last assistant response as `expectedOutput`.
+
+Use the dataset in the Langfuse UI for:
+- Offline evaluation experiments (compare prompt versions)
+- Regression testing when changing models or system prompts
+- Cost analysis across expensive workloads

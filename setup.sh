@@ -174,6 +174,8 @@ mkdir -p "$HOME/.claude"
 HOOK_CMD="LANGFUSE_PUBLIC_KEY=$PROJECT_PK LANGFUSE_SECRET_KEY=$PROJECT_SK python3 $HOOK_SCRIPT"
 EVAL_SCRIPT="$SCRIPT_DIR/eval-hook.py"
 EVAL_HOOK_CMD="LANGFUSE_PUBLIC_KEY=$PROJECT_PK LANGFUSE_SECRET_KEY=$PROJECT_SK python3 $EVAL_SCRIPT --score"
+SESSION_HOOK_SCRIPT="$SCRIPT_DIR/session-start-hook.py"
+SESSION_HOOK_CMD="LANGFUSE_PUBLIC_KEY=$PROJECT_PK LANGFUSE_SECRET_KEY=$PROJECT_SK python3 $SESSION_HOOK_SCRIPT"
 
 # Read scoring preference from .env (set during initial setup)
 ENABLE_SCORING=$(grep '^ENABLE_SCORING=' "$ENV_FILE" 2>/dev/null | cut -d= -f2 || echo "n")
@@ -202,6 +204,17 @@ for hook_group in settings.get('hooks', {}).get('Stop', []):
     # Remove eval hook if scoring disabled
     if not enable_scoring and has_eval:
         hook_group['hooks'] = [h for h in hooks if 'eval-hook.py' not in h.get('command', '')]
+# Register SessionStart and StopFailure hooks for session-start-hook.py
+session_hook_cmd = '''$SESSION_HOOK_CMD'''
+for event_name in ('SessionStart', 'StopFailure'):
+    event_hooks = settings.setdefault('hooks', {}).setdefault(event_name, [])
+    already = any(
+        'session-start-hook.py' in h.get('command', '')
+        for group in event_hooks
+        for h in group.get('hooks', [])
+    )
+    if not already:
+        event_hooks.append({'hooks': [{'type': 'command', 'command': session_hook_cmd}]})
 with open('$CLAUDE_SETTINGS', 'w') as f:
     json.dump(settings, f, indent=2)
     f.write('\n')
@@ -245,11 +258,31 @@ else
           }
         ]
       }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$SESSION_HOOK_CMD"
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$SESSION_HOOK_CMD"
+          }
+        ]
+      }
     ]
   }
 }
 SETTINGS
-        echo "       Created with Stop hook + scoring hook."
+        echo "       Created with Stop hook + scoring hook + SessionStart/StopFailure hooks."
     else
         cat > "$CLAUDE_SETTINGS" <<SETTINGS
 {
@@ -263,11 +296,31 @@ SETTINGS
           }
         ]
       }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$SESSION_HOOK_CMD"
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "$SESSION_HOOK_CMD"
+          }
+        ]
+      }
     ]
   }
 }
 SETTINGS
-        echo "       Created with Stop hook (scoring disabled)."
+        echo "       Created with Stop hook (scoring disabled) + SessionStart/StopFailure hooks."
     fi
 fi
 

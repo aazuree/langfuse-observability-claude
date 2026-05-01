@@ -212,30 +212,70 @@ def get_unscored_traces(args: argparse.Namespace) -> list[dict]:
 
 
 def fetch_generations(trace_id: str) -> list[dict]:
-    """Fetch all GENERATION observations for a trace.
+    """Fetch all GENERATION observations for a trace using v2 cursor pagination.
 
-    Returns list of observation dicts from the Langfuse API.
-    Each dict has id, input, output, name, metadata, etc.
+    Falls back to v1 page-based if v2 endpoint returns 404 (older Langfuse).
     """
-    url = (
-        f"{LANGFUSE_HOST}/api/public/observations"
-        f"?traceId={trace_id}&type=GENERATION"
-    )
-    req = Request(
-        url,
-        headers={
-            "Authorization": make_auth_header(),
-            "Accept": "application/json",
-        },
-        method="GET",
-    )
-    try:
-        with urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode())
-        return data.get("data", [])
-    except URLError as e:
-        log(f"Failed to fetch observations for {trace_id}: {e}")
-        return []
+    results = []
+    cursor = None
+    use_v2 = True
+
+    while True:
+        if use_v2:
+            url = (
+                f"{LANGFUSE_HOST}/api/public/v2/observations"
+                f"?traceId={trace_id}&type=GENERATION&limit=50"
+            )
+            if cursor:
+                url += f"&cursor={cursor}"
+        else:
+            page = getattr(fetch_generations, "_page", 1)
+            url = (
+                f"{LANGFUSE_HOST}/api/public/observations"
+                f"?traceId={trace_id}&type=GENERATION&limit=50&page={page}"
+            )
+
+        req = Request(
+            url,
+            headers={
+                "Authorization": make_auth_header(),
+                "Accept": "application/json",
+            },
+            method="GET",
+        )
+        try:
+            with urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode())
+        except URLError as e:
+            if hasattr(e, "code") and e.code == 404 and use_v2:
+                log(f"v2 observations API not available, falling back to v1 for {trace_id}")
+                use_v2 = False
+                fetch_generations._page = 1
+                continue
+            log(f"Failed to fetch observations for {trace_id}: {e}")
+            break
+
+        batch = data.get("data", [])
+        results.extend(batch)
+
+        if not batch:
+            break
+
+        if use_v2:
+            cursor = data.get("meta", {}).get("nextCursor")
+            if not cursor:
+                break
+        else:
+            meta = data.get("meta", {})
+            page = getattr(fetch_generations, "_page", 1)
+            if page >= meta.get("totalPages", 1):
+                break
+            fetch_generations._page = page + 1
+
+    if hasattr(fetch_generations, "_page"):
+        del fetch_generations._page
+
+    return results
 
 
 # ---------------------------------------------------------------------------
