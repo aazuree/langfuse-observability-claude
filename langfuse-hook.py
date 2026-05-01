@@ -1583,6 +1583,16 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
         log(f"[WARN] Some events failed to send for session {session_id}")
     save_state(session_id, total_lines)
 
+    # Auto-capture expensive sessions into dataset for offline evaluation
+    if classify_cost_tier(cumulative_parent_cost) == "expensive":
+        if ensure_dataset(EXPENSIVE_DATASET_NAME):
+            add_to_dataset(
+                EXPENSIVE_DATASET_NAME,
+                trace_id,
+                redact_secrets(truncate(first_user_input, MAX_TEXT)) or "",
+                redact_secrets(truncate(last_assistant_output, MAX_TEXT)) or "",
+            )
+
     tool_span_count = sum(len(t["tool_calls"]) for t in turns)
     log(
         f"Sent {len(batch)} events for session {session_id}: "
@@ -1604,6 +1614,70 @@ def delete_trace(trace_id: str) -> None:
             pass
     except URLError:
         pass
+
+
+EXPENSIVE_DATASET_NAME = "expensive-sessions"
+
+
+def ensure_dataset(name: str) -> bool:
+    """Create dataset if it doesn't exist. Returns True on success or already-exists."""
+    check_url = f"{LANGFUSE_HOST}/api/public/datasets/{name}"
+    check_req = Request(
+        check_url,
+        headers={"Authorization": make_auth_header(), "Accept": "application/json"},
+        method="GET",
+    )
+    try:
+        with urlopen(check_req, timeout=10):
+            return True  # dataset exists
+    except URLError as e:
+        if not (hasattr(e, "code") and e.code == 404):
+            log(f"ensure_dataset: check failed for '{name}': {e}")
+            return False
+
+    payload = json.dumps({"name": name, "description": "Auto-captured expensive Claude Code sessions"}).encode()
+    create_req = Request(
+        f"{LANGFUSE_HOST}/api/public/datasets",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": make_auth_header(),
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(create_req, timeout=10):
+            log(f"ensure_dataset: created dataset '{name}'")
+            return True
+    except URLError as e:
+        log(f"ensure_dataset: create failed for '{name}': {e}")
+        return False
+
+
+def add_to_dataset(dataset_name: str, trace_id: str, input_text: str, output_text: str) -> bool:
+    """Add a trace as a dataset item. Returns True on success."""
+    payload = json.dumps({
+        "datasetName": dataset_name,
+        "sourceTraceId": trace_id,
+        "input": input_text,
+        "expectedOutput": output_text,
+    }).encode()
+    req = Request(
+        f"{LANGFUSE_HOST}/api/public/dataset-items",
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": make_auth_header(),
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=10):
+            log(f"add_to_dataset: added trace {trace_id} to '{dataset_name}'")
+            return True
+    except URLError as e:
+        log(f"add_to_dataset: failed for {trace_id}: {e}")
+        return False
 
 
 def reprocess_all() -> None:

@@ -2415,3 +2415,72 @@ class TestBuildHookScoreEventsNewScores:
         events = hook.build_hook_score_events("t1", "s1", "hi", turns, 0.0, str(transcript))
         div_event = next(e for e in events if e["body"]["name"] == "tool_diversity")
         assert div_event["body"]["value"] == 0.0
+
+
+class TestEnsureDataset:
+    def test_creates_dataset_on_404(self, monkeypatch):
+        """When GET returns 404, POST to create the dataset."""
+        from urllib.error import HTTPError
+        create_called = {"url": None, "body": None}
+
+        def fake_urlopen(req, timeout):
+            if req.get_method() == "GET":
+                raise HTTPError(req.full_url, 404, "Not Found", {}, None)
+            create_called["url"] = req.full_url
+            create_called["body"] = json.loads(req.data.decode())
+            resp = mock.MagicMock(
+                __enter__=lambda s: s,
+                __exit__=lambda s, *a: False,
+                read=lambda: b'{"id": "ds-1"}',
+                status=201,
+            )
+            return resp
+
+        monkeypatch.setattr(hook, "urlopen", fake_urlopen)
+        monkeypatch.setattr(langfuse_common, "LANGFUSE_PUBLIC_KEY", "pk-test")
+        monkeypatch.setattr(langfuse_common, "LANGFUSE_SECRET_KEY", "sk-test")
+        result = hook.ensure_dataset("expensive-sessions")
+        assert result is True
+        assert create_called["body"]["name"] == "expensive-sessions"
+
+    def test_returns_true_if_already_exists(self, monkeypatch):
+        """GET returning 200 means dataset exists — no POST needed."""
+        def fake_urlopen(req, timeout):
+            resp = mock.MagicMock(
+                __enter__=lambda s: s,
+                __exit__=lambda s, *a: False,
+                read=lambda: b'{"id": "ds-1", "name": "expensive-sessions"}',
+                status=200,
+            )
+            return resp
+
+        monkeypatch.setattr(hook, "urlopen", fake_urlopen)
+        monkeypatch.setattr(langfuse_common, "LANGFUSE_PUBLIC_KEY", "pk-test")
+        monkeypatch.setattr(langfuse_common, "LANGFUSE_SECRET_KEY", "sk-test")
+        result = hook.ensure_dataset("expensive-sessions")
+        assert result is True
+
+
+class TestAddToDataset:
+    def test_posts_dataset_item(self, monkeypatch):
+        posted = {"body": None}
+
+        def fake_urlopen(req, timeout):
+            posted["body"] = json.loads(req.data.decode())
+            resp = mock.MagicMock(
+                __enter__=lambda s: s,
+                __exit__=lambda s, *a: False,
+                read=lambda: b'{"id": "item-1"}',
+                status=201,
+            )
+            return resp
+
+        monkeypatch.setattr(hook, "urlopen", fake_urlopen)
+        monkeypatch.setattr(langfuse_common, "LANGFUSE_PUBLIC_KEY", "pk-test")
+        monkeypatch.setattr(langfuse_common, "LANGFUSE_SECRET_KEY", "sk-test")
+        result = hook.add_to_dataset("expensive-sessions", "trace-abc", "fix bug", "done")
+        assert result is True
+        assert posted["body"]["datasetName"] == "expensive-sessions"
+        assert posted["body"]["sourceTraceId"] == "trace-abc"
+        assert posted["body"]["input"] == "fix bug"
+        assert posted["body"]["expectedOutput"] == "done"
