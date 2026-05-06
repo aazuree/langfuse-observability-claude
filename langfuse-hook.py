@@ -23,13 +23,12 @@ import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterator
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 # Ensure langfuse_common can be imported from the same directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from langfuse_common import log as common_log, make_auth_header, redact_secrets
+from langfuse_common import iter_transcript, log as common_log, make_auth_header, redact_secrets
 
 LANGFUSE_HOST = os.environ.get("LANGFUSE_HOST", "http://localhost:3100")
 LANGFUSE_PUBLIC_KEY = os.environ.get("LANGFUSE_PUBLIC_KEY", "")
@@ -41,8 +40,6 @@ STATE_DIR = os.path.expanduser("~/.claude/langfuse-state")
 
 MAX_TEXT = 10000
 MAX_TOOL_IO = 5000
-MAX_LOG_BYTES = 10 * 1024 * 1024  # 10 MB
-
 SAFE_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
 # Synthetic user-message wrappers (slash commands, local-command output,
@@ -423,28 +420,13 @@ def extract_slug(transcript_path: str) -> str:
     return ""
 
 
-def _iter_transcript(transcript_path: str) -> Iterator[dict]:
-    try:
-        with open(transcript_path) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    yield json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-    except (IOError, OSError):
-        # Can't open or read the transcript file
-        return
-
 
 def extract_custom_title(transcript_path: str) -> str:
     """First non-empty customTitle entry (v2.1.110+ transcripts).
 
     Set by the user via the in-CLI title command. Absent in most sessions.
     """
-    for entry in _iter_transcript(transcript_path):
+    for entry in iter_transcript(transcript_path):
         if entry.get("type") == "custom-title":
             title = entry.get("customTitle", "")
             if title:
@@ -458,7 +440,7 @@ def extract_agent_name(transcript_path: str) -> str:
     Written mid-session (~30% through) once the model identifies the task.
     Absent in sessions that ended before Claude generated a name.
     """
-    for entry in _iter_transcript(transcript_path):
+    for entry in iter_transcript(transcript_path):
         if entry.get("type") == "agent-name":
             name = entry.get("agentName", "")
             if name:
@@ -475,7 +457,7 @@ def extract_file_history_stats(transcript_path: str) -> dict:
     """
     snapshot_count = 0
     all_paths: set[str] = set()
-    for entry in _iter_transcript(transcript_path):
+    for entry in iter_transcript(transcript_path):
         if entry.get("type") != "file-history-snapshot":
             continue
         snapshot_count += 1
@@ -497,7 +479,7 @@ def extract_stop_hook_stats(transcript_path: str) -> dict:
     total_errors = 0
     prevented_count = 0
 
-    for entry in _iter_transcript(transcript_path):
+    for entry in iter_transcript(transcript_path):
         if entry.get("type") != "system" or entry.get("subtype") != "stop_hook_summary":
             continue
         total_fires += 1
@@ -522,7 +504,7 @@ def extract_stop_hook_stats(transcript_path: str) -> dict:
 def extract_permission_mode(transcript_path: str) -> str:
     """Most recent permission-mode entry. The mode can change mid-session."""
     last = ""
-    for entry in _iter_transcript(transcript_path):
+    for entry in iter_transcript(transcript_path):
         if entry.get("type") == "permission-mode":
             mode = entry.get("permissionMode", "")
             if mode:
@@ -533,7 +515,7 @@ def extract_permission_mode(transcript_path: str) -> str:
 def extract_pr_links(transcript_path: str) -> list:
     """All pr-link entries in chronological order."""
     out = []
-    for entry in _iter_transcript(transcript_path):
+    for entry in iter_transcript(transcript_path):
         if entry.get("type") == "pr-link":
             out.append({
                 "number": entry.get("prNumber"),
@@ -547,7 +529,7 @@ def extract_pr_links(transcript_path: str) -> list:
 def extract_away_summaries(transcript_path: str) -> list:
     """All system/away_summary entries — content written when user steps away."""
     out = []
-    for entry in _iter_transcript(transcript_path):
+    for entry in iter_transcript(transcript_path):
         if entry.get("type") == "system" and entry.get("subtype") == "away_summary":
             content = entry.get("content")
             if content:
@@ -695,8 +677,8 @@ def build_turns(entries: list[dict]) -> list[dict]:
         mid = me["message_id"]
         if mid not in msg_id_first_ts:
             msg_id_first_ts[mid] = me["timestamp"]
-        # Always overwrite — last one wins for usage
-        if me["usage"]:
+        # All entries for a given message_id carry identical usage since v2.1.97; first is fine
+        if me["usage"] and mid not in msg_id_final_usage:
             msg_id_final_usage[mid] = me["usage"]
 
     # Build turns
@@ -717,6 +699,7 @@ def build_turns(entries: list[dict]) -> list[dict]:
                     "user_input": text,
                     "assistant_output": "",
                     "tool_calls": [],
+                    "_seen_tool_ids": set(),
                     "start_time": me["timestamp"],
                     "end_time": me["timestamp"],
                     "first_token_time": None,
@@ -748,9 +731,13 @@ def build_turns(entries: list[dict]) -> list[dict]:
             if text.strip():
                 current_turn["assistant_output"] = text
 
-            # Collect tool uses
+            # Collect tool uses — skip duplicates (same tool_use_id in multiple streaming entries)
             for tu in extract_tool_uses(content):
                 tool_use_id = tu.get("id", "")
+                if tool_use_id and tool_use_id in current_turn["_seen_tool_ids"]:
+                    continue
+                if tool_use_id:
+                    current_turn["_seen_tool_ids"].add(tool_use_id)
                 tool_input = tu.get("input", {})
                 current_turn["tool_calls"].append({
                     "id": tool_use_id,
@@ -1044,7 +1031,7 @@ _QUESTION_PATTERNS = re.compile(
 )
 
 
-def classify_task_completed(turns: list[dict]) -> bool:
+def classify_task_completed(turns: list[dict], last_output: str = "") -> bool:
     """Heuristic: did the session likely complete its task?
 
     Checks the last turn's assistant output and tool results for error/failure
@@ -1054,7 +1041,7 @@ def classify_task_completed(turns: list[dict]) -> bool:
         return True  # no turns = nothing to fail
 
     last_turn = turns[-1]
-    last_output = last_turn.get("assistant_output", "")
+    last_output = last_output or last_turn.get("assistant_output", "")
 
     # Check if last output indicates failure
     if _FAILURE_PATTERNS.search(last_output):
@@ -1112,7 +1099,7 @@ def detect_compaction(transcript_path: str) -> bool:
     Matches: type=="summary" OR (type=="system" AND "compact" in subtype.lower()).
     Returns False when transcript_path is empty or the file does not exist.
     """
-    for entry in _iter_transcript(transcript_path):
+    for entry in iter_transcript(transcript_path):
         etype = entry.get("type", "")
         subtype = entry.get("subtype", "")
         if etype == "summary":
@@ -1142,6 +1129,7 @@ def build_hook_score_events(
     turns: list[dict],
     total_cost: float,
     transcript_path: str = "",
+    last_assistant_message: str = "",
 ) -> list[dict]:
     """Build score-create events for the ingestion batch.
 
@@ -1154,7 +1142,7 @@ def build_hook_score_events(
 
     session_type = classify_session_type(first_user_input)
     token_eff = calculate_token_efficiency(turns)
-    completed = classify_task_completed(turns)
+    completed = classify_task_completed(turns, last_assistant_message)
     cache_hit = compute_cache_hit_rate(turns)
     cost_tier = classify_cost_tier(total_cost)
 
@@ -1221,7 +1209,7 @@ def build_hook_score_events(
     return events
 
 
-def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
+def process_session(session_id: str, transcript_path: str, cwd: str, last_assistant_message: str = "") -> None:
     """Core processing logic for a single session transcript."""
     prev_offset = load_state(session_id)
     custom_title = extract_custom_title(transcript_path)
@@ -1280,11 +1268,12 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
     sa_state = load_subagent_state(session_id)
 
     first_user_input = turns[0]["user_input"] if turns else ""
-    last_assistant_output = ""
-    for t in reversed(turns):
-        if t["assistant_output"]:
-            last_assistant_output = t["assistant_output"]
-            break
+    last_assistant_output = last_assistant_message
+    if not last_assistant_output:
+        for t in reversed(turns):
+            if t["assistant_output"]:
+                last_assistant_output = t["assistant_output"]
+                break
 
     # For trace naming, skip synthetic stubs (slash commands, local-command
     # output, system reminders, prompt-submit hooks) which all start with an
@@ -1580,6 +1569,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str) -> None:
         turns=turns,
         total_cost=cumulative_parent_cost,
         transcript_path=transcript_path,
+        last_assistant_message=last_assistant_message,
     )
     batch.extend(score_events)
 
@@ -1746,6 +1736,7 @@ def main() -> None:
     session_id = sanitize_id(hook_input.get("session_id", "unknown"))
     transcript_path = hook_input.get("transcript_path", "")
     cwd = hook_input.get("cwd", "")
+    last_assistant_message = hook_input.get("last_assistant_message", "")
 
     if hook_input.get("stop_hook_active", False):
         return
@@ -1754,7 +1745,7 @@ def main() -> None:
         log("No transcript_path provided")
         return
 
-    process_session(session_id, transcript_path, cwd)
+    process_session(session_id, transcript_path, cwd, last_assistant_message)
 
 
 if __name__ == "__main__":

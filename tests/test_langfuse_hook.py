@@ -933,7 +933,7 @@ class TestBuildTurns:
         assert turns[1]["user_input"] == "Second question"
 
     def test_streaming_deduplication(self):
-        """Multiple assistant entries with same message_id: last usage wins."""
+        """Multiple assistant entries with same message_id: first usage wins (identical since v2.1.97)."""
         entries = [
             {
                 "type": "user",
@@ -948,8 +948,8 @@ class TestBuildTurns:
                     "role": "assistant",
                     "model": "claude-sonnet-4-6",
                     "content": [{"type": "text", "text": "H"}],
-                    "usage": {"input_tokens": 10, "output_tokens": 1,
-                              "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+                    "usage": {"input_tokens": 10, "output_tokens": 5,
+                              "cache_read_input_tokens": 100, "cache_creation_input_tokens": 0},
                 },
             },
             {
@@ -967,7 +967,7 @@ class TestBuildTurns:
         ]
         turns = hook.build_turns(entries)
         assert len(turns) == 1
-        # Last usage wins for deduplicated message
+        # All entries carry identical usage since v2.1.97; first is taken
         assert turns[0]["usage"]["output"] == 5
         assert turns[0]["usage"]["cache_read"] == 100
         # Last text content wins
