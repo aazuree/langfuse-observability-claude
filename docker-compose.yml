@@ -5,7 +5,7 @@
 # External connections from other machines will not be able to reach these services directly.
 services:
   langfuse-worker:
-    image: docker.io/langfuse/langfuse-worker:3.163.0
+    image: docker.io/langfuse/langfuse-worker:3.172.1
     restart: always
     depends_on: &langfuse-depends-on
       postgres:
@@ -67,7 +67,7 @@ services:
       SMTP_CONNECTION_URL: ${SMTP_CONNECTION_URL:-}
 
   langfuse-web:
-    image: docker.io/langfuse/langfuse:3.163.0
+    image: docker.io/langfuse/langfuse:3.172.1
     restart: always
     depends_on: *langfuse-depends-on
     ports:
@@ -86,7 +86,7 @@ services:
       LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-}
 
   clickhouse:
-    image: docker.io/clickhouse/clickhouse-server:26.3
+    image: docker.io/clickhouse/clickhouse-server:26.3.9.8
     restart: always
     user: "101:101"
     environment:
@@ -128,7 +128,7 @@ services:
       start_period: 1s
 
   redis:
-    image: docker.io/redis:7.4.1
+    image: docker.io/redis:7.4.8
     restart: always
     # CHANGEME: row below to secure redis password
     command: >

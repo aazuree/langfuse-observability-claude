@@ -56,7 +56,6 @@ LANGFUSE_SECRET_KEY = os.environ.get("LANGFUSE_SECRET_KEY", "")
 LOG_FILE = os.path.expanduser("~/.claude/langfuse-eval.log")
 STATE_DIR = os.path.expanduser("~/.claude/langfuse-state/eval")
 
-MAX_LOG_BYTES = 10 * 1024 * 1024  # 10 MB
 EVAL_DELAY_SECONDS = 1  # delay between CLI calls
 CLI_TIMEOUT_SECONDS = 30  # timeout for claude CLI invocations
 

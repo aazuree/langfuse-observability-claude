@@ -355,23 +355,31 @@ class TestParseTranscript:
 class TestState:
     def test_load_missing_state_returns_zero(self, tmp_path, monkeypatch):
         monkeypatch.setattr(hook, "STATE_DIR", str(tmp_path))
-        assert hook.load_state("nonexistent") == 0
+        assert hook.load_state("nonexistent") == (0, 0)
 
     def test_save_and_load_roundtrip(self, tmp_path, monkeypatch):
         monkeypatch.setattr(hook, "STATE_DIR", str(tmp_path))
-        hook.save_state("test-session", 42)
-        assert hook.load_state("test-session") == 42
+        hook.save_state("test-session", 42, 3)
+        assert hook.load_state("test-session") == (42, 3)
 
-    def test_state_file_is_offset(self, tmp_path, monkeypatch):
+    def test_state_file_is_json(self, tmp_path, monkeypatch):
         monkeypatch.setattr(hook, "STATE_DIR", str(tmp_path))
-        hook.save_state("my-session", 100)
+        hook.save_state("my-session", 100, 7)
         assert (tmp_path / "my-session.offset").exists()
-        assert (tmp_path / "my-session.offset").read_text().strip() == "100"
+        data = json.loads((tmp_path / "my-session.offset").read_text())
+        assert data == {"lines": 100, "turns": 7}
 
     def test_corrupt_state_returns_zero(self, tmp_path, monkeypatch):
         monkeypatch.setattr(hook, "STATE_DIR", str(tmp_path))
         (tmp_path / "bad.offset").write_text("not a number")
-        assert hook.load_state("bad") == 0
+        assert hook.load_state("bad") == (0, 0)
+
+    def test_legacy_plain_int_state_backward_compat(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(hook, "STATE_DIR", str(tmp_path))
+        (tmp_path / "legacy.offset").write_text("52")
+        line_offset, turn_count = hook.load_state("legacy")
+        assert line_offset == 52
+        assert turn_count == 0  # unknown from legacy format
 
 
 # ---------------------------------------------------------------------------
@@ -933,7 +941,7 @@ class TestBuildTurns:
         assert turns[1]["user_input"] == "Second question"
 
     def test_streaming_deduplication(self):
-        """Multiple assistant entries with same message_id: last usage wins."""
+        """Multiple assistant entries with same message_id: first usage wins (identical since v2.1.97)."""
         entries = [
             {
                 "type": "user",
@@ -948,8 +956,8 @@ class TestBuildTurns:
                     "role": "assistant",
                     "model": "claude-sonnet-4-6",
                     "content": [{"type": "text", "text": "H"}],
-                    "usage": {"input_tokens": 10, "output_tokens": 1,
-                              "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+                    "usage": {"input_tokens": 10, "output_tokens": 5,
+                              "cache_read_input_tokens": 100, "cache_creation_input_tokens": 0},
                 },
             },
             {
@@ -967,7 +975,7 @@ class TestBuildTurns:
         ]
         turns = hook.build_turns(entries)
         assert len(turns) == 1
-        # Last usage wins for deduplicated message
+        # All entries carry identical usage since v2.1.97; first is taken
         assert turns[0]["usage"]["output"] == 5
         assert turns[0]["usage"]["cache_read"] == 100
         # Last text content wins
@@ -1441,7 +1449,7 @@ class TestProcessSession:
         monkeypatch.setattr(hook, "STATE_DIR", str(state_dir))
 
         sent_batches = []
-        monkeypatch.setattr(hook, "send_to_langfuse", lambda batch: sent_batches.append(batch))
+        monkeypatch.setattr(hook, "send_to_langfuse", lambda batch: sent_batches.append(batch) or True)
 
         entries = [
             {
@@ -1492,7 +1500,7 @@ class TestProcessSession:
         monkeypatch.setattr(hook, "STATE_DIR", str(state_dir))
 
         sent_batches = []
-        monkeypatch.setattr(hook, "send_to_langfuse", lambda batch: sent_batches.append(batch))
+        monkeypatch.setattr(hook, "send_to_langfuse", lambda batch: sent_batches.append(batch) or True)
 
         entries = [
             {
@@ -1525,7 +1533,7 @@ class TestProcessSession:
         monkeypatch.setattr(hook, "STATE_DIR", str(state_dir))
 
         sent_batches = []
-        monkeypatch.setattr(hook, "send_to_langfuse", lambda batch: sent_batches.append(batch))
+        monkeypatch.setattr(hook, "send_to_langfuse", lambda batch: sent_batches.append(batch) or True)
 
         f = tmp_path / "session.jsonl"
 
@@ -1572,13 +1580,79 @@ class TestProcessSession:
         hook.process_session("inc-sess", str(f), "/test")
         assert len(sent_batches) == 2
 
+        # Turn names must be sequential (1, 2) not based on line offset (1, 3, 5…)
+        all_gen_names = [
+            evt["body"]["name"]
+            for batch in sent_batches
+            for evt in batch
+            if evt["type"] == "generation-create"
+        ]
+        assert any(n.startswith("Turn 1:") for n in all_gen_names)
+        assert any(n.startswith("Turn 2:") for n in all_gen_names)
+        assert not any(n.startswith("Turn 3:") for n in all_gen_names)
+
+    def test_turn_count_tracks_independently_of_line_offset(self, tmp_path, monkeypatch):
+        """Turn names stay sequential even when each turn spans many JSONL lines."""
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        monkeypatch.setattr(hook, "STATE_DIR", str(state_dir))
+
+        sent_batches = []
+        monkeypatch.setattr(hook, "send_to_langfuse", lambda batch: sent_batches.append(batch) or True)
+
+        f = tmp_path / "session.jsonl"
+
+        def make_turn(user_text, assistant_text, msg_id, ts_base):
+            return [
+                {"type": "user", "timestamp": f"{ts_base}:00+00:00",
+                 "message": {"role": "user", "content": user_text}},
+                {"type": "assistant", "timestamp": f"{ts_base}:01+00:00",
+                 "message": {
+                     "id": msg_id, "role": "assistant", "model": "claude-sonnet-4-6",
+                     "content": [{"type": "text", "text": assistant_text}],
+                     "usage": {"input_tokens": 10, "output_tokens": 5,
+                               "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+                 }},
+            ]
+
+        # Fire 1: turn 1
+        fire1 = make_turn("Q1", "A1", "msg-1", "2026-03-29T10:00")
+        f.write_text("\n".join(json.dumps(e) for e in fire1) + "\n")
+        hook.process_session("tc-sess", str(f), "/test")
+
+        # Fire 2: turn 2 (appended)
+        fire2 = make_turn("Q2", "A2", "msg-2", "2026-03-29T10:01")
+        with open(str(f), "a") as fh:
+            for e in fire2:
+                fh.write(json.dumps(e) + "\n")
+        hook.process_session("tc-sess", str(f), "/test")
+
+        # Fire 3: turn 3 (appended)
+        fire3 = make_turn("Q3", "A3", "msg-3", "2026-03-29T10:02")
+        with open(str(f), "a") as fh:
+            for e in fire3:
+                fh.write(json.dumps(e) + "\n")
+        hook.process_session("tc-sess", str(f), "/test")
+
+        assert len(sent_batches) == 3
+        gen_names = [
+            evt["body"]["name"]
+            for batch in sent_batches
+            for evt in batch
+            if evt["type"] == "generation-create"
+        ]
+        # Must be exactly Turn 1, Turn 2, Turn 3 — not Turn 1, Turn 3, Turn 5
+        assert gen_names[0].startswith("Turn 1:")
+        assert gen_names[1].startswith("Turn 2:")
+        assert gen_names[2].startswith("Turn 3:")
+
     def test_tool_spans_created(self, tmp_path, monkeypatch):
         state_dir = tmp_path / "state"
         state_dir.mkdir()
         monkeypatch.setattr(hook, "STATE_DIR", str(state_dir))
 
         sent_batches = []
-        monkeypatch.setattr(hook, "send_to_langfuse", lambda batch: sent_batches.append(batch))
+        monkeypatch.setattr(hook, "send_to_langfuse", lambda batch: sent_batches.append(batch) or True)
 
         entries = [
             {
@@ -1623,7 +1697,7 @@ class TestProcessSession:
         monkeypatch.setattr(hook, "STATE_DIR", str(state_dir))
 
         sent_batches = []
-        monkeypatch.setattr(hook, "send_to_langfuse", lambda batch: sent_batches.append(batch))
+        monkeypatch.setattr(hook, "send_to_langfuse", lambda batch: sent_batches.append(batch) or True)
 
         entries = [
             {
@@ -1653,7 +1727,7 @@ class TestProcessSession:
         monkeypatch.setattr(hook, "STATE_DIR", str(state_dir))
 
         sent_batches = []
-        monkeypatch.setattr(hook, "send_to_langfuse", lambda batch: sent_batches.append(batch))
+        monkeypatch.setattr(hook, "send_to_langfuse", lambda batch: sent_batches.append(batch) or True)
 
         entries = [
             {
@@ -1756,7 +1830,7 @@ class TestProcessSessionNewFields:
         monkeypatch.setattr(hook, "STATE_DIR", str(state_dir))
 
         sent_batches = []
-        monkeypatch.setattr(hook, "send_to_langfuse", lambda batch: sent_batches.append(batch))
+        monkeypatch.setattr(hook, "send_to_langfuse", lambda batch: sent_batches.append(batch) or True)
 
         entries = [
             {
@@ -1816,7 +1890,7 @@ class TestProcessSessionNewFields:
         monkeypatch.setattr(hook, "STATE_DIR", str(state_dir))
 
         sent_batches = []
-        monkeypatch.setattr(hook, "send_to_langfuse", lambda batch: sent_batches.append(batch))
+        monkeypatch.setattr(hook, "send_to_langfuse", lambda batch: sent_batches.append(batch) or True)
 
         entries = [
             {
@@ -1961,7 +2035,7 @@ class TestProcessSessionApiErrors:
         monkeypatch.setattr(hook, "STATE_DIR", str(state_dir))
 
         sent_batches = []
-        monkeypatch.setattr(hook, "send_to_langfuse", lambda batch: sent_batches.append(batch))
+        monkeypatch.setattr(hook, "send_to_langfuse", lambda batch: sent_batches.append(batch) or True)
 
         entries = [
             {
@@ -2014,7 +2088,7 @@ class TestProcessSessionApiErrors:
         monkeypatch.setattr(hook, "STATE_DIR", str(state_dir))
 
         sent_batches = []
-        monkeypatch.setattr(hook, "send_to_langfuse", lambda batch: sent_batches.append(batch))
+        monkeypatch.setattr(hook, "send_to_langfuse", lambda batch: sent_batches.append(batch) or True)
 
         entries = [
             {

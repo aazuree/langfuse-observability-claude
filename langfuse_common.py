@@ -5,9 +5,11 @@ Centralizes secret redaction, logging, and authentication to prevent duplication
 """
 
 import base64
+import json
 import os
 import re
 from datetime import datetime, timezone
+from typing import Iterator
 
 LANGFUSE_PUBLIC_KEY = os.environ.get("LANGFUSE_PUBLIC_KEY", "")
 LANGFUSE_SECRET_KEY = os.environ.get("LANGFUSE_SECRET_KEY", "")
@@ -21,6 +23,22 @@ SECRET_PATTERNS = [
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"),
     re.compile(r"(?i)Bearer\s+[a-zA-Z0-9._\-/+=]{20,}"),
 ]
+
+
+def iter_transcript(transcript_path: str) -> Iterator[dict]:
+    """Yield parsed JSONL entries from a Claude Code transcript file."""
+    try:
+        with open(transcript_path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    yield json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+    except (IOError, OSError):
+        return
 
 
 def log(log_file: str, msg: str) -> None:
