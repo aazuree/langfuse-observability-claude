@@ -102,26 +102,35 @@ def send_to_langfuse(batch: list[dict]) -> bool:
             with urlopen(req, timeout=15) as resp:
                 body = resp.read().decode()
                 log(f"Langfuse response ({resp.status}): {body[:200]}")
-        except URLError as e:
+        except (URLError, TimeoutError, OSError) as e:
             log(f"Failed to send to Langfuse: {e}")
             success = False
     return success
 
 
-def load_state(session_id: str) -> int:
+def load_state(session_id: str) -> tuple[int, int]:
+    """Return (line_offset, turn_count). Handles legacy plain-int state files."""
     Path(STATE_DIR).mkdir(parents=True, exist_ok=True)
     state_file = os.path.join(STATE_DIR, f"{session_id}.offset")
     try:
-        return int(Path(state_file).read_text().strip())
+        content = Path(state_file).read_text().strip()
+        try:
+            data = json.loads(content)
+            if isinstance(data, dict):
+                return data["lines"], data["turns"]
+            # Legacy format: json.loads("52") → int 52
+            return int(data), 0
+        except (json.JSONDecodeError, KeyError):
+            # Legacy format: non-JSON plain integer string
+            return int(content), 0
     except (IOError, OSError, ValueError):
-        # File doesn't exist, can't be read, or content isn't a valid integer
-        return 0
+        return 0, 0
 
 
-def save_state(session_id: str, offset: int) -> None:
+def save_state(session_id: str, line_offset: int, turn_count: int) -> None:
     Path(STATE_DIR).mkdir(parents=True, exist_ok=True)
     state_file = os.path.join(STATE_DIR, f"{session_id}.offset")
-    Path(state_file).write_text(str(offset))
+    Path(state_file).write_text(json.dumps({"lines": line_offset, "turns": turn_count}))
 
 
 def load_subagent_state(session_id: str) -> dict:
@@ -554,7 +563,8 @@ def parse_transcript(transcript_path: str, skip_lines: int = 0) -> tuple[list[di
                     continue
                 try:
                     entries.append(json.loads(line))
-                except json.JSONDecodeError:
+                except json.JSONDecodeError as e:
+                    log(f"[WARN] Skipping malformed JSON at line {total} in {transcript_path}: {e}")
                     continue
     except (IOError, OSError) as e:
         # Can't open or read the transcript file
@@ -1211,7 +1221,7 @@ def build_hook_score_events(
 
 def process_session(session_id: str, transcript_path: str, cwd: str, last_assistant_message: str = "") -> None:
     """Core processing logic for a single session transcript."""
-    prev_offset = load_state(session_id)
+    prev_line_offset, prev_turn_count = load_state(session_id)
     custom_title = extract_custom_title(transcript_path)
     permission_mode = extract_permission_mode(transcript_path)
     pr_links = extract_pr_links(transcript_path)
@@ -1219,11 +1229,11 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
     agent_name = extract_agent_name(transcript_path)
     file_history_stats = extract_file_history_stats(transcript_path)
     stop_hook_stats = extract_stop_hook_stats(transcript_path)
-    entries, total_lines = parse_transcript(transcript_path, skip_lines=prev_offset)
+    entries, total_lines = parse_transcript(transcript_path, skip_lines=prev_line_offset)
 
     if not entries:
-        log(f"No new entries for session {session_id} (offset {prev_offset}, total {total_lines})")
-        save_state(session_id, total_lines)
+        log(f"No new entries for session {session_id} (offset {prev_line_offset}, total {total_lines})")
+        save_state(session_id, total_lines, prev_turn_count)
         return
 
     now = datetime.now(timezone.utc).isoformat()
@@ -1235,7 +1245,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
     turns = build_turns(entries)
     if not turns:
         log(f"No turns found in {len(entries)} new entries")
-        save_state(session_id, total_lines)
+        save_state(session_id, total_lines, prev_turn_count)
         return
 
     api_errors = extract_api_errors(entries)
@@ -1349,7 +1359,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
     # 2. Generation + spans per turn
     for turn_idx, turn in enumerate(turns):
         # Deterministic IDs so re-ingestion updates rather than duplicates
-        turn_id = uuid.uuid5(uuid.NAMESPACE_URL, f"{session_id}:turn:{prev_offset + turn_idx}")
+        turn_id = uuid.uuid5(uuid.NAMESPACE_URL, f"{session_id}:turn:{prev_turn_count + turn_idx}")
         gen_id = f"gen-{turn_id}"
 
         start_time = turn["start_time"]
@@ -1396,7 +1406,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
         gen_body = {
             "id": gen_id,
             "traceId": trace_id,
-            "name": f"Turn {prev_offset + turn_idx + 1}: {redact_secrets(truncate(turn['user_input'], 80))}",
+            "name": f"Turn {prev_turn_count + turn_idx + 1}: {redact_secrets(truncate(turn['user_input'], 80))}",
             "model": model,
             "input": redact_secrets(truncate(turn["user_input"], MAX_TEXT)) or None,
             "output": redact_secrets(truncate(turn["assistant_output"], MAX_TEXT)) or None,
@@ -1529,8 +1539,6 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                         })
                         break
 
-            save_subagent_state(session_id, sa_state)
-
     # Rebuild subagent_cost_summaries from all known agents (cumulative across fires)
     # and store cumulative parent cost in sa_state for future fires.
     _known_agents = {k: v for k, v in sa_state.items()
@@ -1541,7 +1549,6 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
         ]
         cumulative_parent_cost = sa_state.get("_parent", {}).get("total_cost", 0.0) + total_cost
         sa_state["_parent"] = {"total_cost": round(cumulative_parent_cost, 6)}
-        save_subagent_state(session_id, sa_state)
     else:
         cumulative_parent_cost = total_cost
 
@@ -1573,9 +1580,19 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
     )
     batch.extend(score_events)
 
-    if not send_to_langfuse(batch):
-        log(f"[WARN] Some events failed to send for session {session_id}")
-    save_state(session_id, total_lines)
+    new_turn_count = prev_turn_count + len(turns)
+    tool_span_count = sum(len(t["tool_calls"]) for t in turns)
+    summary = (
+        f"{len(batch)} events for session {session_id}: "
+        f"{len(turns)} turns, {tool_span_count} tool spans, "
+        f"{total_tokens} tokens (lines {prev_line_offset+1}-{total_lines})"
+    )
+    if send_to_langfuse(batch):
+        save_state(session_id, total_lines, new_turn_count)
+        save_subagent_state(session_id, sa_state)
+        log(f"Sent {summary}")
+    else:
+        log(f"[WARN] Send failed — {summary}; state not advanced, will retry next fire")
 
     # Auto-capture expensive sessions into dataset for offline evaluation
     if cost_tier == "expensive":
@@ -1586,13 +1603,6 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 redact_secrets(truncate(first_user_input, MAX_TEXT)) or "",
                 redact_secrets(truncate(last_assistant_output, MAX_TEXT)) or "",
             )
-
-    tool_span_count = sum(len(t["tool_calls"]) for t in turns)
-    log(
-        f"Sent {len(batch)} events for session {session_id}: "
-        f"{len(turns)} turns, {tool_span_count} tool spans, "
-        f"{total_tokens} tokens (lines {prev_offset+1}-{total_lines})"
-    )
 
 
 def delete_trace(trace_id: str) -> None:
@@ -1606,7 +1616,7 @@ def delete_trace(trace_id: str) -> None:
     try:
         with urlopen(req, timeout=15):
             pass
-    except URLError:
+    except (URLError, TimeoutError, OSError):
         pass
 
 
@@ -1621,7 +1631,7 @@ def ensure_dataset(name: str) -> bool:
     try:
         with urlopen(check_req, timeout=10):
             return True  # dataset exists
-    except URLError as e:
+    except (URLError, TimeoutError, OSError) as e:
         if not (isinstance(e, HTTPError) and e.code == 404):
             log(f"ensure_dataset: check failed for '{name}': {e}")
             return False
@@ -1640,7 +1650,7 @@ def ensure_dataset(name: str) -> bool:
         with urlopen(create_req, timeout=10):
             log(f"ensure_dataset: created dataset '{name}'")
             return True
-    except URLError as e:
+    except (URLError, TimeoutError, OSError) as e:
         log(f"ensure_dataset: create failed for '{name}': {e}")
         return False
 
@@ -1666,7 +1676,7 @@ def add_to_dataset(dataset_name: str, trace_id: str, input_text: str, output_tex
         with urlopen(req, timeout=10):
             log(f"add_to_dataset: added trace {trace_id} to '{dataset_name}'")
             return True
-    except URLError as e:
+    except (URLError, TimeoutError, OSError) as e:
         log(f"add_to_dataset: failed for {trace_id}: {e}")
         return False
 

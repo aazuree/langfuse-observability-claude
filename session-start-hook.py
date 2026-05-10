@@ -21,7 +21,7 @@ from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from langfuse_common import log as common_log, make_auth_header
+from langfuse_common import iter_transcript, log as common_log, make_auth_header
 
 LANGFUSE_HOST = os.environ.get("LANGFUSE_HOST", "http://localhost:3100")
 LANGFUSE_PUBLIC_KEY = os.environ.get("LANGFUSE_PUBLIC_KEY", "")
@@ -49,26 +49,10 @@ def derive_model_family(model: str) -> str:
     return "unknown"
 
 
-def _iter_transcript(transcript_path: str):
-    """Yield parsed JSONL entries from transcript file."""
-    try:
-        with open(transcript_path) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    yield json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-    except (IOError, OSError):
-        return
-
-
 def extract_last_api_error(transcript_path: str) -> dict:
     """Return the last api_error entry's error fields, or empty dict."""
     last = {}
-    for entry in _iter_transcript(transcript_path):
+    for entry in iter_transcript(transcript_path):
         if entry.get("type") == "system" and entry.get("subtype") == "api_error":
             err = entry.get("error", {})
             last = {

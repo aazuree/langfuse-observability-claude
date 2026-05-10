@@ -357,7 +357,7 @@ def test_process_session_with_subagent(tmp_path, monkeypatch):
     monkeypatch.setattr(langfuse_hook, "STATE_DIR", str(state_dir))
 
     sent_batches = []
-    monkeypatch.setattr(langfuse_hook, "send_to_langfuse", lambda batch: sent_batches.append(batch))
+    monkeypatch.setattr(langfuse_hook, "send_to_langfuse", lambda batch: sent_batches.append(batch) or True)
 
     session_dir = tmp_path / "projects" / "test-project"
     session_dir.mkdir(parents=True)
@@ -600,3 +600,98 @@ def test_parent_cost_stored_in_sa_state(tmp_path, monkeypatch):
     sa_state = langfuse_hook.load_subagent_state("parent-cost-session")
     assert "_parent" in sa_state, "sa_state must contain _parent key after processing"
     assert sa_state["_parent"]["total_cost"] > 0, "_parent.total_cost must be positive"
+
+
+def test_subagent_state_not_saved_on_send_failure(tmp_path, monkeypatch):
+    """Regression: subagent state must not advance when send_to_langfuse fails.
+
+    If sa_state is saved before the send, a retry fire sees offset=EOF for
+    the subagent transcript and emits zero subagent events — silently dropping
+    all subagent observations from the trace.
+    """
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    monkeypatch.setattr(langfuse_hook, "STATE_DIR", str(state_dir))
+
+    # First call fails, second succeeds
+    call_count = {"n": 0}
+    def mock_send(batch):
+        call_count["n"] += 1
+        return call_count["n"] > 1
+
+    monkeypatch.setattr(langfuse_hook, "send_to_langfuse", mock_send)
+
+    session_dir = tmp_path / "projects" / "test-project"
+    session_dir.mkdir(parents=True)
+    transcript_path = session_dir / "retry-session.jsonl"
+
+    entries = [
+        {
+            "type": "user", "uuid": "u1", "timestamp": "2026-03-29T10:00:00+00:00",
+            "sessionId": "retry-session", "cwd": "/home/test/project",
+            "version": "2.1.86", "gitBranch": "main", "entrypoint": "cli",
+            "message": {"role": "user", "content": "Do the thing"},
+        },
+        {
+            "type": "assistant", "uuid": "a1", "timestamp": "2026-03-29T10:00:02+00:00",
+            "message": {
+                "id": "msg-retry-1", "role": "assistant", "model": "claude-sonnet-4-6",
+                "content": [
+                    {"type": "text", "text": "Dispatching subagent."},
+                    {
+                        "type": "tool_use", "id": "tool-agent-retry", "name": "Agent",
+                        "input": {
+                            "description": "Retry subagent task",
+                            "subagent_type": "general-purpose",
+                            "prompt": "do it",
+                        },
+                    },
+                ],
+                "usage": {
+                    "input_tokens": 50, "output_tokens": 20,
+                    "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
+                },
+            },
+        },
+        {
+            "type": "user", "uuid": "u2", "timestamp": "2026-03-29T10:01:00+00:00",
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "tool-agent-retry",
+                 "content": [{"type": "text", "text": "Done."}]}
+            ]},
+        },
+    ]
+    transcript_path.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+
+    subagent_dir = session_dir / "retry-session" / "subagents"
+    subagent_dir.mkdir(parents=True)
+    _make_full_subagent_jsonl(subagent_dir, "retry-agent", "2026-03-29T10:00:03+00:00")
+
+    # Fire 1: send fails — sa_state must NOT be written
+    langfuse_hook.process_session("retry-session", str(transcript_path), "/home/test/project")
+    assert call_count["n"] == 1
+
+    sa_state_after_fail = langfuse_hook.load_subagent_state("retry-session")
+    assert sa_state_after_fail == {}, (
+        "sa_state must be empty after a failed send — "
+        "saving it early would cause the retry to skip subagent events"
+    )
+
+    # Fire 2: send succeeds — subagent events must appear
+    sent_batches = []
+    def mock_send_success(batch):
+        sent_batches.append(batch)
+        return True
+
+    monkeypatch.setattr(langfuse_hook, "send_to_langfuse", mock_send_success)
+    langfuse_hook.process_session("retry-session", str(transcript_path), "/home/test/project")
+
+    assert len(sent_batches) == 1
+    all_events = sent_batches[0]
+    gen_events = [e for e in all_events if e["type"] == "generation-create"]
+    subagent_gens = [e for e in gen_events if "parentObservationId" in e["body"]
+                     and e["body"]["parentObservationId"].startswith("span-")]
+    assert len(subagent_gens) >= 1, (
+        "Retry fire must include subagent generation events — "
+        "if sa_state was saved on fire 1, ingest_subagent returns empty on fire 2"
+    )

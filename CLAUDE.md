@@ -74,7 +74,7 @@ setup.sh                         # One-command setup (generates .env, starts ser
 .env.example                     # Template for environment variables
 .env                             # Generated secrets (gitignored)
 tests/
-  test_langfuse_hook.py          # Core hook unit tests (184 tests)
+  test_langfuse_hook.py          # Core hook unit tests (186 tests)
   test_session_hooks.py          # SessionStart + StopFailure hook tests
   test_hook_scores.py            # Hook-level score classifier tests
   test_subagent_tracking.py      # Subagent cost tracking tests
@@ -94,7 +94,7 @@ uv run pytest tests/ -k "discover" -v  # Run tests matching pattern
 ## Code Conventions
 
 - **No external Python dependencies** - stdlib only (urllib, json, base64, uuid, pathlib)
-- Constants at top of `langfuse-hook.py`: `MAX_TEXT=10000`, `MAX_TOOL_IO=5000`, `MAX_LOG_BYTES=10MB`
+- Constants at top of `langfuse-hook.py`: `MAX_TEXT=10000`, `MAX_TOOL_IO=5000`. Log rotation threshold: `MAX_LOG_BYTES=10MB` in `langfuse_common.py`
 - Secret redaction via `SECRET_PATTERNS` regex list before any data leaves the machine
 - Session IDs sanitized via `sanitize_id()` to prevent path traversal
 - Incremental processing: state files track processed line offsets per session
@@ -240,7 +240,7 @@ Trace (parent session)
 
 **Exclusions:** `aside_question` subagents are skipped (internal sidechain queries).
 
-**State:** Subagent offsets stored in `~/.claude/langfuse-state/<session_id>.subagents.json` (separate from parent `.offset` for rollback safety).
+**State:** Subagent offsets stored in `~/.claude/langfuse-state/<session_id>.subagents.json`. Both state files are saved atomically with the main `.offset` — only on successful send — so a timeout retry re-ingests subagent events rather than skipping them.
 
 **Tags:** Traces with subagents get `has-subagents` and `subagents:{count}` tags for dashboard filtering.
 
