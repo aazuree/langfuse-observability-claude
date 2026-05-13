@@ -306,7 +306,13 @@ def ingest_subagent(
         model = turn.get("model", "claude-sonnet-4-6") or "claude-sonnet-4-6"
 
         turn_cost, input_cost, output_cost, cost_details = calculate_turn_cost(
-            usage, model, turn.get("cache_ephemeral_5m", 0), turn.get("cache_ephemeral_1h", 0)
+            usage,
+            model,
+            turn.get("cache_ephemeral_5m", 0),
+            turn.get("cache_ephemeral_1h", 0),
+            speed=turn.get("speed", ""),
+            inference_geo=turn.get("inference_geo", ""),
+            web_search_requests=turn.get("web_search_requests", 0),
         )
 
         total_cost += turn_cost
@@ -912,11 +918,34 @@ def extract_cwd(transcript_path: str) -> str:
     return ""
 
 
-def calculate_turn_cost(usage: dict, model: str, cache_5m: int = 0, cache_1h: int = 0) -> tuple:
+# Fast mode (research preview): Opus 4.6/4.7 only. 6x base rates.
+# Source: platform.claude.com/docs/en/about-claude/pricing#fast-mode-pricing
+FAST_MODE_MULTIPLIER = 6.0
+# Data residency: inference_geo="us" on Opus 4.6+/Sonnet 4.6+. 1.1x all categories.
+# Source: platform.claude.com/docs/en/about-claude/pricing#data-residency-pricing
+US_GEO_MULTIPLIER = 1.1
+# Web search: $10 per 1,000 server-side search requests.
+# Source: platform.claude.com/docs/en/about-claude/pricing#web-search-tool
+WEB_SEARCH_COST_PER_REQUEST = 0.01
+
+
+def calculate_turn_cost(
+    usage: dict,
+    model: str,
+    cache_5m: int = 0,
+    cache_1h: int = 0,
+    speed: str = "",
+    inference_geo: str = "",
+    web_search_requests: int = 0,
+) -> tuple:
     """Calculate cost for a turn's token usage.
 
     cache_5m / cache_1h: per-tier cache creation token counts (from usageDetails).
     When provided, costs are split by tier; otherwise all cache_creation billed at 5m rate.
+
+    speed: "fast" applies 6x premium (Opus 4.6/4.7 only per spec).
+    inference_geo: "us" applies 1.1x multiplier on Opus 4.6+/Sonnet 4.6+.
+    web_search_requests: server-side web search calls, billed at $10/1000.
 
     Returns: (turn_cost, input_cost, output_cost, cost_details)
     """
@@ -925,9 +954,11 @@ def calculate_turn_cost(usage: dict, model: str, cache_5m: int = 0, cache_1h: in
 
     m = model.lower()
     # Pricing per 1M tokens: (input, output, cache_read, cache_write_5m, cache_write_1h)
-    # Source: platform.claude.com/docs/en/about-claude/pricing (verified 2026-04-17)
+    # Source: platform.claude.com/docs/en/about-claude/pricing (verified 2026-05-13)
     # When a new model releases, its name will fall through to Sonnet pricing and log a warning.
     # Update this function + CLAUDE.md Cost Model table when that happens.
+    supports_inference_geo = False  # Only Opus 4.6+/Sonnet 4.6+ accept inference_geo
+    supports_fast_mode = False      # Only Opus 4.6/4.7 support /fast
     if "haiku" in m:
         if "haiku-4" in m:                          # Haiku 4.5+
             p_in, p_out, p_cr, p_cc5, p_cc1 = 1.00, 5.00, 0.10, 1.25, 2.00
@@ -938,14 +969,35 @@ def calculate_turn_cost(usage: dict, model: str, cache_5m: int = 0, cache_1h: in
     elif "opus" in m:
         if any(x in m for x in ("opus-4-5", "opus-4-6", "opus-4-7")):  # Opus 4.5 / 4.6 / 4.7
             p_in, p_out, p_cr, p_cc5, p_cc1 = 5.0, 25.0, 0.50, 6.25, 10.0
+            if any(x in m for x in ("opus-4-6", "opus-4-7")):
+                supports_inference_geo = True
+                supports_fast_mode = True
         else:                                        # Opus 4.1, 4.0, 3 (legacy)
             p_in, p_out, p_cr, p_cc5, p_cc1 = 15.0, 75.0, 1.50, 18.75, 30.0
     elif "sonnet" in m:                              # Sonnet (all versions)
         p_in, p_out, p_cr, p_cc5, p_cc1 = 3.0, 15.0, 0.30, 3.75, 6.00
+        if "sonnet-4-6" in m:
+            supports_inference_geo = True
     else:
         log(f"[WARN] calculate_turn_cost: unrecognised model '{model}' — cost reported as $0. "
             "Update calculate_turn_cost() and CLAUDE.md if this is a new Anthropic model.")
         return 0.0, 0.0, 0.0, {}
+
+    # Fast mode 6x premium (Opus 4.6/4.7 only). Multipliers stack on top per spec.
+    if speed == "fast" and supports_fast_mode:
+        p_in *= FAST_MODE_MULTIPLIER
+        p_out *= FAST_MODE_MULTIPLIER
+        p_cr *= FAST_MODE_MULTIPLIER
+        p_cc5 *= FAST_MODE_MULTIPLIER
+        p_cc1 *= FAST_MODE_MULTIPLIER
+
+    # Data residency 1.1x (Opus 4.6+/Sonnet 4.6+). Stacks on top of fast mode.
+    if inference_geo.lower() == "us" and supports_inference_geo:
+        p_in *= US_GEO_MULTIPLIER
+        p_out *= US_GEO_MULTIPLIER
+        p_cr *= US_GEO_MULTIPLIER
+        p_cc5 *= US_GEO_MULTIPLIER
+        p_cc1 *= US_GEO_MULTIPLIER
 
     # Cache creation cost: use per-tier breakdown when available
     if cache_5m or cache_1h:
@@ -953,21 +1005,22 @@ def calculate_turn_cost(usage: dict, model: str, cache_5m: int = 0, cache_1h: in
     else:
         cc_cost = usage["cache_creation"] * p_cc5 / 1_000_000
 
-    input_cost = (
-        usage["input"] * p_in / 1_000_000
-        + usage["cache_read"] * p_cr / 1_000_000
-        + cc_cost
-    )
+    input_token_cost = usage["input"] * p_in / 1_000_000
+    cache_read_cost = usage["cache_read"] * p_cr / 1_000_000
+    web_search_cost = web_search_requests * WEB_SEARCH_COST_PER_REQUEST
+    input_cost = input_token_cost + cache_read_cost + cc_cost
     output_cost = usage["output"] * p_out / 1_000_000
-    turn_cost = input_cost + output_cost
+    turn_cost = input_cost + output_cost + web_search_cost
 
     cost_details = {
-        "input": usage["input"] * p_in / 1_000_000,
+        "input": input_token_cost,
         "output": output_cost,
-        "cache_read_input_tokens": usage["cache_read"] * p_cr / 1_000_000,
+        "cache_read_input_tokens": cache_read_cost,
         "cache_creation_input_tokens": cc_cost,
         "total": turn_cost,
     }
+    if web_search_cost > 0:
+        cost_details["web_search"] = web_search_cost
     return turn_cost, input_cost, output_cost, cost_details
 
 
@@ -1389,7 +1442,13 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
 
         # Cost: $0 for Pro subscription
         turn_cost, input_cost, output_cost, cost_details = calculate_turn_cost(
-            usage, model, turn.get("cache_ephemeral_5m", 0), turn.get("cache_ephemeral_1h", 0)
+            usage,
+            model,
+            turn.get("cache_ephemeral_5m", 0),
+            turn.get("cache_ephemeral_1h", 0),
+            speed=turn.get("speed", ""),
+            inference_geo=turn.get("inference_geo", ""),
+            web_search_requests=turn.get("web_search_requests", 0),
         )
         total_cost += turn_cost
 
