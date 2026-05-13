@@ -574,6 +574,111 @@ class TestExtractAgentName:
 
 
 # ---------------------------------------------------------------------------
+# extract_ai_title
+# ---------------------------------------------------------------------------
+
+class TestExtractAiTitle:
+    def test_returns_first_ai_title(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        entries = [
+            {"type": "user"},
+            {"type": "ai-title", "aiTitle": "otel feature parity audit"},
+            {"type": "ai-title", "aiTitle": "stale-second"},
+        ]
+        f.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        assert hook.extract_ai_title(str(f)) == "otel feature parity audit"
+
+    def test_no_ai_title_entry(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        f.write_text(json.dumps({"type": "user"}) + "\n")
+        assert hook.extract_ai_title(str(f)) == ""
+
+    def test_skips_empty_ai_title(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        entries = [
+            {"type": "ai-title", "aiTitle": ""},
+            {"type": "ai-title", "aiTitle": "real-title"},
+        ]
+        f.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        assert hook.extract_ai_title(str(f)) == "real-title"
+
+    def test_nonexistent_file(self):
+        assert hook.extract_ai_title("/nonexistent.jsonl") == ""
+
+
+# ---------------------------------------------------------------------------
+# extract_session_kind
+# ---------------------------------------------------------------------------
+
+class TestExtractSessionKind:
+    def test_returns_first_session_kind(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        entries = [
+            {"type": "user", "sessionKind": "bg"},
+            {"type": "user", "sessionKind": "fg"},
+        ]
+        f.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        assert hook.extract_session_kind(str(f)) == "bg"
+
+    def test_defaults_to_fg_when_absent(self, tmp_path):
+        # Older transcripts don't carry sessionKind at all
+        f = tmp_path / "t.jsonl"
+        f.write_text(json.dumps({"type": "user"}) + "\n")
+        assert hook.extract_session_kind(str(f)) == "fg"
+
+    def test_skips_empty_values(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        entries = [
+            {"type": "user", "sessionKind": ""},
+            {"type": "user", "sessionKind": "fg"},
+        ]
+        f.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        assert hook.extract_session_kind(str(f)) == "fg"
+
+    def test_nonexistent_file(self):
+        assert hook.extract_session_kind("/nonexistent.jsonl") == "fg"
+
+
+# ---------------------------------------------------------------------------
+# extract_attachments
+# ---------------------------------------------------------------------------
+
+class TestExtractAttachments:
+    def test_counts_and_groups_by_type(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        entries = [
+            {"type": "attachment", "attachment": {"type": "hook_success"}},
+            {"type": "attachment", "attachment": {"type": "hook_success"}},
+            {"type": "attachment", "attachment": {"type": "file"}},
+            {"type": "user"},
+        ]
+        f.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        result = hook.extract_attachments(str(f))
+        assert result == {"count": 3, "by_type": {"hook_success": 2, "file": 1}}
+
+    def test_empty_when_no_attachments(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        f.write_text(json.dumps({"type": "user"}) + "\n")
+        assert hook.extract_attachments(str(f)) == {}
+
+    def test_missing_attachment_type_labelled_unknown(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        # Malformed entry: 'attachment' field missing/null
+        entries = [
+            {"type": "attachment"},
+            {"type": "attachment", "attachment": None},
+            {"type": "attachment", "attachment": {}},
+        ]
+        f.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        result = hook.extract_attachments(str(f))
+        assert result["count"] == 3
+        assert result["by_type"]["unknown"] == 3
+
+    def test_nonexistent_file(self):
+        assert hook.extract_attachments("/nonexistent.jsonl") == {}
+
+
+# ---------------------------------------------------------------------------
 # extract_file_history_stats
 # ---------------------------------------------------------------------------
 
