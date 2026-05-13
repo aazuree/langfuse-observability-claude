@@ -815,6 +815,121 @@ class TestCalculateTurnCost:
         assert abs(cost - (inp_cost + out_cost)) < 0.0001
         assert abs(details["total"] - cost) < 0.0001
 
+    # ----- Fast mode 6x premium (Opus 4.6/4.7 only) -----
+
+    def test_fast_mode_opus_4_7_applies_6x(self):
+        usage = self._usage(inp=1_000_000, out=1_000_000)
+        cost, inp_cost, out_cost, details = hook.calculate_turn_cost(
+            usage, "claude-opus-4-7", speed="fast"
+        )
+        assert abs(inp_cost - 30.0) < 0.001   # $5 * 6
+        assert abs(out_cost - 150.0) < 0.001  # $25 * 6
+
+    def test_fast_mode_opus_4_6_applies_6x(self):
+        usage = self._usage(inp=1_000_000, out=0)
+        cost, *_ = hook.calculate_turn_cost(usage, "claude-opus-4-6", speed="fast")
+        assert abs(cost - 30.0) < 0.001
+
+    def test_fast_mode_cache_read_scaled(self):
+        # Cache read: $0.50 base * 6 = $3.00 per 1M
+        usage = self._usage(cache_read=1_000_000)
+        cost, *_, details = hook.calculate_turn_cost(usage, "claude-opus-4-7", speed="fast")
+        assert abs(details["cache_read_input_tokens"] - 3.0) < 0.001
+
+    def test_fast_mode_cache_write_tiered_scaled(self):
+        # 5m: $6.25 * 6 = $37.50; 1h: $10 * 6 = $60
+        usage = self._usage(cache_creation=2_000_000)
+        cost, *_, details = hook.calculate_turn_cost(
+            usage, "claude-opus-4-7",
+            cache_5m=1_000_000, cache_1h=1_000_000, speed="fast",
+        )
+        expected = 37.5 + 60.0
+        assert abs(details["cache_creation_input_tokens"] - expected) < 0.01
+
+    def test_fast_mode_ignored_for_opus_4_5(self):
+        # Opus 4.5 not eligible for fast mode per spec
+        usage = self._usage(inp=1_000_000, out=0)
+        cost, *_ = hook.calculate_turn_cost(usage, "claude-opus-4-5-20251101", speed="fast")
+        assert abs(cost - 5.0) < 0.001  # base rate, no premium
+
+    def test_fast_mode_ignored_for_sonnet(self):
+        usage = self._usage(inp=1_000_000, out=0)
+        cost, *_ = hook.calculate_turn_cost(usage, "claude-sonnet-4-6", speed="fast")
+        assert abs(cost - 3.0) < 0.001  # base rate
+
+    # ----- Data residency 1.1x (Opus 4.6+/Sonnet 4.6+) -----
+
+    def test_inference_geo_us_opus_4_7_applies_1_1x(self):
+        usage = self._usage(inp=1_000_000, out=0)
+        cost, *_ = hook.calculate_turn_cost(usage, "claude-opus-4-7", inference_geo="us")
+        assert abs(cost - 5.5) < 0.001  # $5 * 1.1
+
+    def test_inference_geo_us_sonnet_4_6_applies_1_1x(self):
+        usage = self._usage(inp=1_000_000, out=1_000_000)
+        cost, inp_cost, out_cost, _ = hook.calculate_turn_cost(
+            usage, "claude-sonnet-4-6", inference_geo="us"
+        )
+        assert abs(inp_cost - 3.3) < 0.001    # $3 * 1.1
+        assert abs(out_cost - 16.5) < 0.001   # $15 * 1.1
+
+    def test_inference_geo_us_case_insensitive(self):
+        usage = self._usage(inp=1_000_000, out=0)
+        cost, *_ = hook.calculate_turn_cost(usage, "claude-opus-4-6", inference_geo="US")
+        assert abs(cost - 5.5) < 0.001
+
+    def test_inference_geo_global_no_multiplier(self):
+        usage = self._usage(inp=1_000_000, out=0)
+        cost, *_ = hook.calculate_turn_cost(usage, "claude-opus-4-7", inference_geo="global")
+        assert abs(cost - 5.0) < 0.001
+
+    def test_inference_geo_us_ignored_for_opus_4_5(self):
+        # Opus 4.5 does not support inference_geo per spec
+        usage = self._usage(inp=1_000_000, out=0)
+        cost, *_ = hook.calculate_turn_cost(
+            usage, "claude-opus-4-5-20251101", inference_geo="us"
+        )
+        assert abs(cost - 5.0) < 0.001  # base rate
+
+    def test_inference_geo_us_ignored_for_sonnet_4_5(self):
+        usage = self._usage(inp=1_000_000, out=0)
+        cost, *_ = hook.calculate_turn_cost(
+            usage, "claude-sonnet-4-5-20250929", inference_geo="us"
+        )
+        assert abs(cost - 3.0) < 0.001  # base rate
+
+    def test_fast_mode_and_inference_geo_stack(self):
+        # 6x * 1.1x = 6.6x
+        usage = self._usage(inp=1_000_000, out=0)
+        cost, *_ = hook.calculate_turn_cost(
+            usage, "claude-opus-4-7", speed="fast", inference_geo="us"
+        )
+        assert abs(cost - 33.0) < 0.001  # $5 * 6 * 1.1
+
+    # ----- Web search billing $10/1000 -----
+
+    def test_web_search_billing(self):
+        usage = self._usage()
+        cost, _inp, _out, details = hook.calculate_turn_cost(
+            usage, "claude-sonnet-4-6", web_search_requests=5
+        )
+        assert abs(cost - 0.05) < 0.0001
+        assert abs(details["web_search"] - 0.05) < 0.0001
+
+    def test_web_search_added_to_total(self):
+        usage = self._usage(inp=1_000_000, out=0)
+        cost, _inp, _out, details = hook.calculate_turn_cost(
+            usage, "claude-sonnet-4-6", web_search_requests=10
+        )
+        # input $3 + web $0.10 = $3.10
+        assert abs(cost - 3.10) < 0.001
+        assert abs(details["web_search"] - 0.10) < 0.001
+        assert abs(details["total"] - 3.10) < 0.001
+
+    def test_no_web_search_no_field(self):
+        usage = self._usage(inp=1_000_000, out=0)
+        cost, _inp, _out, details = hook.calculate_turn_cost(usage, "claude-sonnet-4-6")
+        assert "web_search" not in details
+
 
 # ---------------------------------------------------------------------------
 # build_turns

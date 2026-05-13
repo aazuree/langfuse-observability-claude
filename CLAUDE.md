@@ -112,7 +112,7 @@ uv run pytest tests/ -k "discover" -v  # Run tests matching pattern
 
 ## Cost Model
 
-Pricing is model-aware (per 1M tokens). Source: [platform.claude.com/docs/en/about-claude/pricing](https://platform.claude.com/docs/en/about-claude/pricing) (last verified 2026-04-17).
+Pricing is model-aware (per 1M tokens). Source: [platform.claude.com/docs/en/about-claude/pricing](https://platform.claude.com/docs/en/about-claude/pricing) (last verified 2026-05-13).
 
 | Model | Input | Output | Cache Read | Cache Write 5m | Cache Write 1h |
 |-------|-------|--------|------------|----------------|----------------|
@@ -126,6 +126,20 @@ Pricing is model-aware (per 1M tokens). Source: [platform.claude.com/docs/en/abo
 **Opus 4.7 tokenizer note:** Opus 4.7 ships with a new tokenizer that may produce up to 35% more tokens for the same input text vs. prior models. Per-token rates are unchanged, but absolute session cost for equivalent workloads on 4.7 can be meaningfully higher than on 4.6.
 
 Cache write cost is split by tier when `cache_5m` / `cache_1h` are available in `usageDetails`; otherwise all cache_create is billed at the 5m rate.
+
+### Pricing Multipliers
+
+These stack multiplicatively on the base rates above (and apply uniformly across input, output, cache read, and cache write tiers):
+
+- **Fast mode (`speed="fast"`)**: 6x premium on Opus 4.6 / 4.7 only (per spec — Opus 4.5 and Sonnet/Haiku are ineligible). Other models with `speed="fast"` keep base rates.
+- **Data residency (`inference_geo="us"`)**: 1.1x on Opus 4.6+/Sonnet 4.6+. Other models do not support the `inference_geo` parameter; multiplier is not applied.
+- **Fast + US-geo stack**: 6x × 1.1x = 6.6x.
+
+### Server-side Tool Billing
+
+- **Web search**: $0.01 per request (`$10 / 1,000 searches`). Billed via `costDetails.web_search` line item using `web_search_requests` from `usage.server_tool_use`. Added to turn total.
+- **Web fetch**: free (token cost only).
+- **Code execution**: $0.05/container-hour after 1,550 free hours/org/month. Not currently emitted by Claude Code; not billed.
 
 Set `REPORT_API_EQUIVALENT_COST = False` in `langfuse-hook.py` to report $0.
 
