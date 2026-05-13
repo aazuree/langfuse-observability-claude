@@ -159,13 +159,15 @@ Each trace is enriched with:
 - `permission:<mode>` — current permission mode (`default`, `acceptEdits`, `plan`, `bypassPermissions`)
 - `pr:<N>` — one tag per PR linked from the session (via `pr-link` transcript entries)
 - `agent-name:{slug}` — present when `type: "agent-name"` entry exists (e.g., `agent-name:langfuse-usagedetails-fix`)
+- `session-kind:{bg|fg}` — background job vs interactive foreground session (from `sessionKind` field on transcript entries; defaults to `fg` when absent on older transcripts)
 
 **Trace Name precedence:**
 1. `customTitle` from `type: "custom-title"` (user-set via in-CLI title command)
-2. `agentName` from `type: "agent-name"` (auto-generated mid-session slug, e.g. `langfuse-usagedetails-fix`)
-3. Truncated first non-synthetic user prompt (80 chars)
-4. `{repo_name}/{git_branch}` composite — stable fallback when prompt is empty
-5. `"Claude Code Session"` hardcoded fallback
+2. `aiTitle` from `type: "ai-title"` (Claude-generated short title once enough session context exists)
+3. `agentName` from `type: "agent-name"` (auto-generated mid-session slug, e.g. `langfuse-usagedetails-fix`)
+4. Truncated first non-synthetic user prompt (80 chars)
+5. `{repo_name}/{git_branch}` composite — stable fallback when prompt is empty
+6. `"Claude Code Session"` hardcoded fallback
 
 The auto-generated 3-word slug (e.g. `goofy-frolicking-dove`) was removed from
 JSONL transcripts in Claude Code v2.1.112. The `agent-name` entry (~30% into a session)
@@ -182,14 +184,18 @@ via Langfuse's upsert-on-id behaviour.
 - `pr_links` — list of `{number, url, repository, timestamp}` from `pr-link` entries
 - `away_summaries` — list of `{content, timestamp}` from `system/away_summary` entries
 - `agent_name` — auto-generated session slug from `type: "agent-name"` entry (null when absent)
+- `ai_title` — Claude-generated short title from `type: "ai-title"` entry (null when absent)
+- `session_kind` — `bg` or `fg` from `sessionKind` field (defaults to `fg`)
+- `attachments` — `{count, by_type}` summary of `type: "attachment"` entries (hook outputs, file/image attachments). Only counts + types are captured; payloads are not (PII + size). Null when no attachments.
 - `file_snapshots` — `{snapshot_count, tracked_files_count}` from `file-history-snapshot` entries (null when no snapshots)
 - `stop_hook` — `{total_hook_fires, total_duration_ms, max_duration_ms, hook_errors, prevented_continuation_count}` from `system/stop_hook_summary` entries (null when none)
 
 Extracted from the first `type: "user"` entry in the JSONL transcript via `extract_session_metadata()`.
 API errors extracted from `type: "system"` / `subtype: "api_error"` entries via `extract_api_errors()`.
-Custom title, permission mode, PR links, and away summaries are extracted via
-`extract_custom_title()`, `extract_permission_mode()`, `extract_pr_links()`,
-and `extract_away_summaries()` respectively.
+Custom title, AI title, agent name, session kind, attachments, permission mode, PR links,
+and away summaries are extracted via `extract_custom_title()`, `extract_ai_title()`,
+`extract_agent_name()`, `extract_session_kind()`, `extract_attachments()`,
+`extract_permission_mode()`, `extract_pr_links()`, and `extract_away_summaries()` respectively.
 
 **Per-Generation Metadata** (on each generation):
 - `speed` — `standard` or `fast` (from `/fast` toggle)

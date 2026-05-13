@@ -463,6 +463,56 @@ def extract_agent_name(transcript_path: str) -> str:
     return ""
 
 
+def extract_ai_title(transcript_path: str) -> str:
+    """First non-empty aiTitle from type: 'ai-title' entries.
+
+    Claude Code generates a short human-readable title once it has enough
+    context to summarise the session (typically several turns in). The same
+    title is written on every subsequent turn; first non-empty wins.
+    Absent in sessions that ended before a title was produced.
+    """
+    for entry in iter_transcript(transcript_path):
+        if entry.get("type") == "ai-title":
+            title = entry.get("aiTitle", "")
+            if title:
+                return title
+    return ""
+
+
+def extract_session_kind(transcript_path: str) -> str:
+    """First non-empty sessionKind value.
+
+    'bg' (background job) vs 'fg' (interactive foreground). Defaults to 'fg'
+    when no entry carries the field (older transcripts).
+    """
+    for entry in iter_transcript(transcript_path):
+        kind = entry.get("sessionKind", "")
+        if kind:
+            return kind
+    return "fg"
+
+
+def extract_attachments(transcript_path: str) -> dict:
+    """Count attachment entries and group by attachment.type.
+
+    Attachments include hook outputs, file contents the user dropped in, and
+    image pastes. Only counts + types are captured — payloads can be large
+    and may contain sensitive content. Returns {} when no attachments exist.
+    """
+    by_type: dict[str, int] = {}
+    total = 0
+    for entry in iter_transcript(transcript_path):
+        if entry.get("type") != "attachment":
+            continue
+        total += 1
+        att = entry.get("attachment", {}) or {}
+        att_type = att.get("type", "unknown") if isinstance(att, dict) else "unknown"
+        by_type[att_type] = by_type.get(att_type, 0) + 1
+    if total == 0:
+        return {}
+    return {"count": total, "by_type": by_type}
+
+
 def extract_file_history_stats(transcript_path: str) -> dict:
     """Aggregate stats from file-history-snapshot entries.
 
@@ -1280,6 +1330,9 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
     pr_links = extract_pr_links(transcript_path)
     away_summaries = extract_away_summaries(transcript_path)
     agent_name = extract_agent_name(transcript_path)
+    ai_title = extract_ai_title(transcript_path)
+    session_kind = extract_session_kind(transcript_path)
+    attachments = extract_attachments(transcript_path)
     file_history_stats = extract_file_history_stats(transcript_path)
     stop_hook_stats = extract_stop_hook_stats(transcript_path)
     entries, total_lines = parse_transcript(transcript_path, skip_lines=prev_line_offset)
@@ -1351,9 +1404,10 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
 
     trace_ts = turns[0].get("start_time") or now
 
-    # Trace name precedence: custom title > agent name > first prompt > repo/branch
+    # Trace name precedence: custom title > ai title > agent name > first prompt > repo/branch
     trace_name = (
         custom_title
+        or ai_title
         or agent_name
         or truncate(redact_secrets(first_real_prompt), 80).strip()
         or f"{repo_name}/{session_meta.get('gitBranch', '')}".strip("/")
@@ -1392,6 +1446,9 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 "pr_links": pr_links or None,
                 "away_summaries": away_summaries or None,
                 "agent_name": agent_name or None,
+                "ai_title": ai_title or None,
+                "session_kind": session_kind or None,
+                "attachments": attachments or None,
                 "file_snapshots": file_history_stats if file_history_stats["snapshot_count"] > 0 else None,
                 "stop_hook": stop_hook_stats if stop_hook_stats["total_hook_fires"] > 0 else None,
             },
@@ -1404,6 +1461,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 "has-errors" if has_errors else None,
                 f"permission:{permission_mode}" if permission_mode else None,
                 f"agent-name:{agent_name}" if agent_name else None,
+                f"session-kind:{session_kind}" if session_kind else None,
                 *pr_tags,
             ] if t],
         },
