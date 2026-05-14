@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared utilities for Langfuse hooks (langfuse-hook.py and eval-hook.py).
+"""Shared utilities for Langfuse hooks.
 
 Centralizes secret redaction, logging, and authentication to prevent duplication.
 """

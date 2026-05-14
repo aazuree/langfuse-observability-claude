@@ -15,7 +15,6 @@ Self-hosted Langfuse that captures every Claude Code interaction via the `Stop` 
 | Cost estimate (Anthropic API equivalent rates) | costDetails |
 | Per-subagent and total harness cost | Trace metadata |
 | Session grouping | Trace per session |
-| LLM-as-a-Judge evaluation | Scores (per observation) |
 
 ## Quick Start
 
@@ -66,13 +65,15 @@ langfuse-hook.py  ──POST──>  Langfuse API (localhost:3100)
 langfuse-observability/
 ├── docker-compose.yml     # Langfuse stack (6 services)
 ├── langfuse-hook.py       # Stop hook: transcript -> Langfuse ingestion
-├── eval-hook.py           # LLM-as-a-Judge evaluator (optional scoring)
+├── session-start-hook.py  # SessionStart + StopFailure hooks
 ├── setup.sh               # One-command setup (secrets, docker, hook config)
 ├── .env.example           # Template (safe to commit)
 ├── .env                   # Actual secrets (gitignored)
 ├── tests/
-│   ├── test_eval_hook.py          # Unit tests for eval-hook
-│   └── test_subagent_tracking.py  # Unit tests for subagent cost tracking
+│   ├── test_langfuse_hook.py      # Core hook unit tests
+│   ├── test_session_hooks.py      # SessionStart + StopFailure hook tests
+│   ├── test_hook_scores.py        # Hook-level score classifier tests
+│   └── test_subagent_tracking.py  # Subagent cost tracking tests
 └── README.md
 ```
 
@@ -163,23 +164,6 @@ This finds all transcript files, deletes any existing traces to avoid duplicates
 When Claude Code spawns subagents via the Agent tool, the hook automatically discovers their transcripts at `<session>/subagents/agent-{id}.jsonl`, correlates them by timestamp, and ingests them as nested generations/spans under the parent Agent tool span.
 
 Traces with subagents get `has-subagents` and `subagents:{count}` tags, and trace metadata includes a `subagent_costs` summary with per-agent cost breakdowns and total harness cost.
-
-## LLM-as-a-Judge Evaluation
-
-`eval-hook.py` scores each generation using Claude CLI (Haiku tier). Runs on-demand, not as part of the Stop hook:
-
-```bash
-PK=$(grep '^LANGFUSE_INIT_PROJECT_PUBLIC_KEY=' .env | cut -d= -f2)
-SK=$(grep '^LANGFUSE_INIT_PROJECT_SECRET_KEY=' .env | cut -d= -f2)
-
-# List unscored traces (safe, no LLM calls)
-LANGFUSE_PUBLIC_KEY=$PK LANGFUSE_SECRET_KEY=$SK python3 eval-hook.py
-
-# Score all unscored turns
-LANGFUSE_PUBLIC_KEY=$PK LANGFUSE_SECRET_KEY=$SK python3 eval-hook.py --score
-```
-
-Scores: `task_completion` (categorical) and `response_quality` (0.0-1.0), linked to individual observations.
 
 ## Running Tests
 
