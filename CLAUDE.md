@@ -187,6 +187,7 @@ via Langfuse's upsert-on-id behaviour.
 - `ai_title` — Claude-generated short title from `type: "ai-title"` entry (null when absent)
 - `session_kind` — `bg` or `fg` from `sessionKind` field (defaults to `fg`)
 - `attachments` — `{count, by_type}` summary of `type: "attachment"` entries (hook outputs, file/image attachments). Only counts + types are captured; payloads are not (PII + size). Null when no attachments.
+- `local_commands` — list of `{content, timestamp}` from `system/local_command` entries (slash-command stdout, e.g. `/compact` summaries). Wrapper tags stripped, content truncated to 200 chars and run through `redact_secrets`. Capped at 20 entries. Null when none.
 - `file_snapshots` — `{snapshot_count, tracked_files_count}` from `file-history-snapshot` entries (null when no snapshots)
 - `stop_hook` — `{total_hook_fires, total_duration_ms, max_duration_ms, hook_errors, prevented_continuation_count}` from `system/stop_hook_summary` entries (null when none)
 
@@ -203,6 +204,20 @@ and away summaries are extracted via `extract_custom_title()`, `extract_ai_title
 - `inference_geo` — inference region (e.g., `us-east-1`)
 - `request_ids` — list of Anthropic request IDs for server-side correlation
 - `web_search_requests`, `web_fetch_requests` — server-side tool use counts
+
+**OpenTelemetry GenAI semantic-convention aliases** (also on each generation):
+The hook emits standard `gen_ai.*` attributes so an OTLP collector or future
+Langfuse Claude Code mapping can consume traces without a custom transform.
+Zero behaviour change for the existing dashboard.
+- `gen_ai.system = "anthropic"`, `gen_ai.provider.name = "anthropic"`
+- `gen_ai.operation.name = "chat"`
+- `gen_ai.conversation.id` — session ID
+- `gen_ai.request.model`, `gen_ai.response.model`
+- `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`
+- `gen_ai.response.id` — first Anthropic request ID for the turn (omitted when absent)
+- `gen_ai.response.finish_reasons` — `[stop_reason]` (omitted when absent)
+
+Reference: [opentelemetry.io/docs/specs/semconv/gen-ai/](https://opentelemetry.io/docs/specs/semconv/gen-ai/)
 
 **Per-Generation usageDetails** (extended):
 - `cache_read` — cache read tokens (shared across tiers)
@@ -364,12 +379,13 @@ productive output sessions. Rounded to 4 decimal places.
 tool outputs for `[ERROR]` prefix. Returns `true` if no failure signals detected.
 
 **`cache_hit_rate`** — Measures cache warmth. Formula: `cache_read / (cache_read + cache_creation)`.
-0.0 = cold session (no prior cache), 1.0 = fully warm (all cache hits). Useful for identifying
-sessions that benefit from prompt caching vs. sessions that are doing cache initialization.
+0.0 = cache-miss session (only writes, no hits), 1.0 = fully warm (all cache hits). Useful for
+identifying sessions that benefit from prompt caching vs. sessions that are doing cache
+initialization.
 
-**Cache Hit Rate Edge Case:** Sessions with no cache activity (fresh session, no prior context)
-return 0.0, conflating with sessions that had cache misses. To distinguish in the Langfuse dashboard,
-filter by `cache_read > 0` to identify sessions with actual cache activity.
+Sessions with **no cache activity at all** (fresh session, no prior context) **omit the score
+entirely** rather than emitting 0.0 — this keeps them distinct from genuine cache-miss sessions
+in the dashboard. Filter by `cache_hit_rate IS NULL` to find cold sessions.
 
 **`cost_tier`** — Buckets session cost for dashboard filtering. `cheap` (< $0.10), `moderate` ($0.10–$1.00),
 `expensive` (≥ $1.00). Enables one-click filtering to find expensive sessions or identify
