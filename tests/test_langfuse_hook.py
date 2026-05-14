@@ -722,6 +722,135 @@ class TestExtractAttachments:
 
 
 # ---------------------------------------------------------------------------
+# extract_local_commands
+# ---------------------------------------------------------------------------
+
+class TestExtractLocalCommands:
+    def _entry(self, body, ts="2026-05-13T20:00:00Z"):
+        return {
+            "type": "system",
+            "subtype": "local_command",
+            "content": f"<local-command-stdout>{body}</local-command-stdout>",
+            "timestamp": ts,
+        }
+
+    def test_strips_wrapper_and_returns_body(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        entries = [self._entry("compaction summary text")]
+        f.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        out = hook.extract_local_commands(str(f))
+        assert len(out) == 1
+        assert out[0]["content"] == "compaction summary text"
+        assert out[0]["timestamp"] == "2026-05-13T20:00:00Z"
+
+    def test_skips_empty_wrapped_content(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        entries = [self._entry(""), self._entry("real output")]
+        f.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        out = hook.extract_local_commands(str(f))
+        assert len(out) == 1
+        assert out[0]["content"] == "real output"
+
+    def test_respects_max_entries(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        entries = [self._entry(f"output-{i}") for i in range(10)]
+        f.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        out = hook.extract_local_commands(str(f), max_entries=3)
+        assert len(out) == 3
+
+    def test_truncates_long_content(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        long_body = "x" * 1000
+        f.write_text(json.dumps(self._entry(long_body)) + "\n")
+        out = hook.extract_local_commands(str(f), max_content=50)
+        assert out[0]["content"].startswith("x" * 50)
+        assert "..." in out[0]["content"]
+
+    def test_ignores_other_system_subtypes(self, tmp_path):
+        f = tmp_path / "t.jsonl"
+        entries = [
+            {"type": "system", "subtype": "turn_duration", "content": "skip"},
+            {"type": "user"},
+        ]
+        f.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        assert hook.extract_local_commands(str(f)) == []
+
+    def test_nonexistent_file(self):
+        assert hook.extract_local_commands("/nonexistent.jsonl") == []
+
+
+# ---------------------------------------------------------------------------
+# _otel_genai_attrs (OpenTelemetry GenAI semantic-convention aliases)
+# ---------------------------------------------------------------------------
+
+class TestOtelGenAIAttrs:
+    def test_emits_required_attributes(self):
+        attrs = hook._otel_genai_attrs(
+            session_id="sess-123",
+            model="claude-opus-4-7",
+            usage={"input": 100, "output": 200},
+            request_ids=["req-abc"],
+            stop_reason="end_turn",
+        )
+        assert attrs["gen_ai.system"] == "anthropic"
+        assert attrs["gen_ai.provider.name"] == "anthropic"
+        assert attrs["gen_ai.operation.name"] == "chat"
+        assert attrs["gen_ai.conversation.id"] == "sess-123"
+        assert attrs["gen_ai.request.model"] == "claude-opus-4-7"
+        assert attrs["gen_ai.response.model"] == "claude-opus-4-7"
+        assert attrs["gen_ai.usage.input_tokens"] == 100
+        assert attrs["gen_ai.usage.output_tokens"] == 200
+        assert attrs["gen_ai.response.id"] == "req-abc"
+        assert attrs["gen_ai.response.finish_reasons"] == ["end_turn"]
+
+    def test_omits_response_id_when_no_request_ids(self):
+        attrs = hook._otel_genai_attrs(
+            session_id="s", model="m", usage={"input": 0, "output": 0},
+            request_ids=[], stop_reason="",
+        )
+        assert "gen_ai.response.id" not in attrs
+        assert "gen_ai.response.finish_reasons" not in attrs
+
+    def test_uses_first_request_id(self):
+        attrs = hook._otel_genai_attrs(
+            session_id="s", model="m", usage={"input": 0, "output": 0},
+            request_ids=["first", "second", "third"], stop_reason="",
+        )
+        assert attrs["gen_ai.response.id"] == "first"
+
+
+# ---------------------------------------------------------------------------
+# Opus pricing whitelist behaviour
+# ---------------------------------------------------------------------------
+
+class TestOpusPricingWhitelist:
+    def _usage(self, inp=1_000_000, out=0):
+        return {
+            "input": inp, "output": out, "total": inp + out,
+            "cache_read": 0, "cache_creation": 0,
+        }
+
+    def test_future_opus_falls_through_to_warning_not_legacy(self, monkeypatch):
+        """Hypothetical 'claude-opus-4-9' must NOT silently inherit the
+        legacy $15/$75 rate. It must hit the unknown-model WARN path so the
+        operator updates the table explicitly."""
+        warnings = []
+        monkeypatch.setattr(hook, "log", lambda msg: warnings.append(msg))
+        cost, *_ = hook.calculate_turn_cost(self._usage(), "claude-opus-4-9")
+        assert cost == 0.0
+        assert any("[WARN]" in w and "claude-opus-4-9" in w for w in warnings)
+
+    def test_legacy_opus_3_still_routes_correctly(self, monkeypatch):
+        warnings = []
+        monkeypatch.setattr(hook, "log", lambda msg: warnings.append(msg))
+        cost, inp, _out, _ = hook.calculate_turn_cost(
+            self._usage(), "claude-3-opus-20240229"
+        )
+        assert not any("[WARN]" in w for w in warnings)
+        assert abs(inp - 15.0) < 0.001  # legacy $15/MTok input
+
+
+# ---------------------------------------------------------------------------
 # extract_file_history_stats
 # ---------------------------------------------------------------------------
 

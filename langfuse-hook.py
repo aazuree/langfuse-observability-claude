@@ -344,6 +344,13 @@ def ingest_subagent(
             "request_ids": list(dict.fromkeys(turn.get("request_ids", []))),
             "web_search_requests": turn.get("web_search_requests", 0),
             "web_fetch_requests": turn.get("web_fetch_requests", 0),
+            **_otel_genai_attrs(
+                session_id=session_id,
+                model=model,
+                usage=usage,
+                request_ids=turn.get("request_ids", []),
+                stop_reason=turn.get("stop_reason", ""),
+            ),
         }
 
         events.append({
@@ -493,6 +500,37 @@ def extract_session_kind(transcript_path: str) -> str:
         if kind:
             return kind
     return "fg"
+
+
+_LOCAL_CMD_WRAPPER_RE = re.compile(
+    r"^\s*<local-command-(?:stdout|stderr)>(.*?)</local-command-(?:stdout|stderr)>\s*$",
+    re.DOTALL,
+)
+
+
+def extract_local_commands(transcript_path: str, max_entries: int = 20, max_content: int = 200) -> list:
+    """Collect non-empty system/local_command entries (slash-command output).
+
+    Strips the `<local-command-stdout>…</local-command-stdout>` wrapper,
+    runs the existing secret-redaction pass on the body, and caps both the
+    number of entries and per-entry length to keep trace metadata small.
+    """
+    out = []
+    for entry in iter_transcript(transcript_path):
+        if entry.get("type") != "system" or entry.get("subtype") != "local_command":
+            continue
+        content = entry.get("content", "") or ""
+        match = _LOCAL_CMD_WRAPPER_RE.match(content)
+        body = (match.group(1) if match else content).strip()
+        if not body:
+            continue
+        out.append({
+            "content": redact_secrets(truncate(body, max_content)),
+            "timestamp": entry.get("timestamp", ""),
+        })
+        if len(out) >= max_entries:
+            break
+    return out
 
 
 def extract_attachments(transcript_path: str) -> dict:
@@ -728,6 +766,7 @@ def build_turns(entries: list[dict]) -> list[dict]:
                 "model": msg.get("model", ""),
                 "usage": msg.get("usage", {}),
                 "request_id": entry.get("requestId", ""),
+                "stop_reason": msg.get("stop_reason", ""),
             })
         elif etype == "system" and entry.get("subtype") == "turn_duration":
             turn_durations.append(entry)
@@ -785,6 +824,7 @@ def build_turns(entries: list[dict]) -> list[dict]:
                     "usage": {"input": 0, "output": 0, "total": 0},
                     "api_call_ids": set(),
                     "messages": [me],
+                    "stop_reason": "",
                 }
             elif current_turn:
                 current_turn["messages"].append(me)
@@ -800,6 +840,11 @@ def build_turns(entries: list[dict]) -> list[dict]:
             # Track first token time (first assistant entry in this turn)
             if current_turn["first_token_time"] is None and me["timestamp"]:
                 current_turn["first_token_time"] = me["timestamp"]
+
+            # Latest non-empty stop_reason wins (final assistant entry in the
+            # turn carries the terminal reason: end_turn, tool_use, etc.)
+            if me.get("stop_reason"):
+                current_turn["stop_reason"] = me["stop_reason"]
 
             current_turn["end_time"] = me["timestamp"]
             current_turn["api_call_ids"].add(mid)
@@ -991,6 +1036,38 @@ US_GEO_MULTIPLIER = 1.1
 WEB_SEARCH_COST_PER_REQUEST = 0.01
 
 
+def _otel_genai_attrs(
+    session_id: str,
+    model: str,
+    usage: dict,
+    request_ids: list,
+    stop_reason: str,
+) -> dict:
+    """Emit OpenTelemetry GenAI semantic-convention aliases for a generation.
+
+    Lets an OTLP collector (or a future Langfuse mapping) read the trace
+    without a custom transform processor. Zero behaviour change for the
+    existing Langfuse dashboard.
+
+    Reference: https://opentelemetry.io/docs/specs/semconv/gen-ai/
+    """
+    attrs = {
+        "gen_ai.system": "anthropic",
+        "gen_ai.operation.name": "chat",
+        "gen_ai.provider.name": "anthropic",
+        "gen_ai.conversation.id": session_id,
+        "gen_ai.request.model": model,
+        "gen_ai.response.model": model,
+        "gen_ai.usage.input_tokens": usage.get("input", 0),
+        "gen_ai.usage.output_tokens": usage.get("output", 0),
+    }
+    if request_ids:
+        attrs["gen_ai.response.id"] = request_ids[0]
+    if stop_reason:
+        attrs["gen_ai.response.finish_reasons"] = [stop_reason]
+    return attrs
+
+
 def calculate_turn_cost(
     usage: dict,
     model: str,
@@ -1029,13 +1106,22 @@ def calculate_turn_cost(
         else:                                        # Haiku 3
             p_in, p_out, p_cr, p_cc5, p_cc1 = 0.25, 1.25, 0.03, 0.30, 0.50
     elif "opus" in m:
-        if any(x in m for x in ("opus-4-5", "opus-4-6", "opus-4-7")):  # Opus 4.5 / 4.6 / 4.7
+        # Whitelist of current Opus generations sharing the $5/$25 schedule.
+        # Substring matching previously over-billed any future "opus-4-8+"
+        # release at the legacy $15/$75 rate; whitelist forces the unknown-
+        # model WARN log to surface so the table can be updated explicitly.
+        if any(x in m for x in ("opus-4-5", "opus-4-6", "opus-4-7")):
             p_in, p_out, p_cr, p_cc5, p_cc1 = 5.0, 25.0, 0.50, 6.25, 10.0
             if any(x in m for x in ("opus-4-6", "opus-4-7")):
                 supports_inference_geo = True
                 supports_fast_mode = True
-        else:                                        # Opus 4.1, 4.0, 3 (legacy)
+        elif any(x in m for x in ("opus-4-1", "opus-4-20", "3-opus")):
+            # Opus 4.1, 4.0 (claude-opus-4-2025*), 3 (claude-3-opus-*) — legacy whitelist
             p_in, p_out, p_cr, p_cc5, p_cc1 = 15.0, 75.0, 1.50, 18.75, 30.0
+        else:
+            log(f"[WARN] calculate_turn_cost: unrecognised Opus variant '{model}' — cost reported as $0. "
+                "Update calculate_turn_cost() and CLAUDE.md if this is a new Anthropic model.")
+            return 0.0, 0.0, 0.0, {}
     elif "sonnet" in m:                              # Sonnet (all versions)
         p_in, p_out, p_cr, p_cc5, p_cc1 = 3.0, 15.0, 0.30, 3.75, 6.00
         if "sonnet-4-6" in m:
@@ -1186,22 +1272,23 @@ def classify_task_completed(turns: list[dict], last_output: str = "") -> bool:
     return True
 
 
-def compute_cache_hit_rate(turns: list[dict]) -> float:
+def compute_cache_hit_rate(turns: list[dict]) -> float | None:
     """Calculate cache hit rate: cache_read / (cache_read + cache_creation).
 
-    Returns 0.0 when denominator is 0 (no cache activity). This conflates
-    "cold session" (no cache activity yet) with "cache miss" scenarios.
-    In Langfuse dashboard, filter by cache_read > 0 to distinguish.
+    Returns None when there is no cache activity at all (fresh session, no
+    prior context). Previously this collapsed to 0.0 and was indistinguishable
+    from a fully-cold cache-miss session. Callers must filter None out before
+    emitting numeric scores; Langfuse rejects None numeric values.
     """
     if not turns:
-        return 0.0
+        return None
 
     cache_read = sum(turn.get("usage", {}).get("cache_read", 0) for turn in turns)
     cache_creation = sum(turn.get("usage", {}).get("cache_creation", 0) for turn in turns)
     denominator = cache_read + cache_creation
 
     if denominator == 0:
-        return 0.0  # No cache activity; see docstring
+        return None  # No cache activity at all — distinct from cache-miss
 
     return round(cache_read / denominator, 4)
 
@@ -1258,10 +1345,14 @@ def build_hook_score_events(
 ) -> list[dict]:
     """Build score-create events for the ingestion batch.
 
-    Returns 7 events: session_type (CATEGORICAL), token_efficiency (NUMERIC),
+    Returns up to 7 events: session_type (CATEGORICAL), token_efficiency (NUMERIC),
     task_completed (BOOLEAN as int 0/1), cache_hit_rate (NUMERIC),
     cost_tier (CATEGORICAL), tool_diversity (NUMERIC),
     compaction_occurred (BOOLEAN as int 0/1).
+
+    cache_hit_rate is omitted when there is no cache activity at all
+    (compute_cache_hit_rate returns None) so it stays distinguishable from
+    a fully-cache-miss session in the dashboard.
     """
     now = datetime.now(timezone.utc).isoformat()
 
@@ -1288,11 +1379,6 @@ def build_hook_score_events(
             "value": 1 if completed else 0,
         },
         {
-            "name": "cache_hit_rate",
-            "dataType": "NUMERIC",
-            "value": cache_hit,
-        },
-        {
             "name": "cost_tier",
             "dataType": "CATEGORICAL",
             "value": cost_tier,
@@ -1308,6 +1394,12 @@ def build_hook_score_events(
             "value": 1 if detect_compaction(transcript_path) else 0,
         },
     ]
+    if cache_hit is not None:
+        scores.append({
+            "name": "cache_hit_rate",
+            "dataType": "NUMERIC",
+            "value": cache_hit,
+        })
 
     events = []
     for score in scores:
@@ -1345,6 +1437,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
     ai_title = extract_ai_title(transcript_path)
     session_kind = extract_session_kind(transcript_path)
     attachments = extract_attachments(transcript_path)
+    local_commands = extract_local_commands(transcript_path)
     file_history_stats = extract_file_history_stats(transcript_path)
     stop_hook_stats = extract_stop_hook_stats(transcript_path)
     entries, total_lines, read_ok = parse_transcript(transcript_path, skip_lines=prev_line_offset)
@@ -1469,6 +1562,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 "ai_title": ai_title or None,
                 "session_kind": session_kind or None,
                 "attachments": attachments or None,
+                "local_commands": local_commands or None,
                 "file_snapshots": file_history_stats if file_history_stats["snapshot_count"] > 0 else None,
                 "stop_hook": stop_hook_stats if stop_hook_stats["total_hook_fires"] > 0 else None,
             },
@@ -1562,6 +1656,17 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 "request_ids": list(dict.fromkeys(turn.get("request_ids", []))),
                 "web_search_requests": turn.get("web_search_requests", 0),
                 "web_fetch_requests": turn.get("web_fetch_requests", 0),
+                # OpenTelemetry GenAI semantic-convention aliases. Zero behaviour
+                # change for Langfuse, but lets an OTLP collector (or future
+                # Langfuse mapping) consume the trace without a transform step.
+                # See: opentelemetry.io/docs/specs/semconv/gen-ai/
+                **_otel_genai_attrs(
+                    session_id=session_id,
+                    model=model,
+                    usage=usage,
+                    request_ids=turn.get("request_ids", []),
+                    stop_reason=turn.get("stop_reason", ""),
+                ),
             },
         }
 

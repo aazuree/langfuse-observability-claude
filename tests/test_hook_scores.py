@@ -194,9 +194,9 @@ def test_task_completed_tool_error_not_last():
 # --- compute_cache_hit_rate ---
 
 def test_cache_hit_rate_no_cache():
-    """Zero cache activity should return 0.0."""
+    """Zero cache activity returns None (distinct from cache-miss-only sessions)."""
     turns = [{"usage": {"cache_read": 0, "cache_creation": 0}}]
-    assert hook.compute_cache_hit_rate(turns) == 0.0
+    assert hook.compute_cache_hit_rate(turns) is None
 
 
 def test_cache_hit_rate_all_reads():
@@ -228,8 +228,8 @@ def test_cache_hit_rate_multi_turn():
 
 
 def test_cache_hit_rate_empty_turns():
-    """Empty turns list → 0.0."""
-    assert hook.compute_cache_hit_rate([]) == 0.0
+    """Empty turns list returns None — nothing to measure."""
+    assert hook.compute_cache_hit_rate([]) is None
 
 
 # --- classify_cost_tier ---
@@ -257,21 +257,39 @@ def test_cost_tier_expensive():
 
 # --- build_hook_score_events ---
 
-def test_build_hook_score_events_returns_five_events():
-    """Should produce exactly 7 score-create events."""
+def test_build_hook_score_events_omits_cache_hit_when_no_activity():
+    """No cache activity → cache_hit_rate omitted (distinct from cache-miss)."""
     events = hook.build_hook_score_events(
         trace_id="trace-abc",
         session_id="abc",
-                first_user_input="fix the login bug",
+        first_user_input="fix the login bug",
         turns=[{"usage": {"input": 100, "output": 200, "total": 300,
                            "cache_read": 0, "cache_creation": 0},
                 "assistant_output": "Done, fixed the bug.",
                 "tool_calls": []}],
         total_cost=0.05,
     )
+    assert len(events) == 6
+    names = {e["body"]["name"] for e in events}
+    assert names == {"session_type", "token_efficiency", "task_completed", "cost_tier", "tool_diversity", "compaction_occurred"}
+    assert "cache_hit_rate" not in names
+
+
+def test_build_hook_score_events_includes_cache_hit_when_active():
+    """With cache activity, all 7 scores emitted."""
+    events = hook.build_hook_score_events(
+        trace_id="trace-abc",
+        session_id="abc",
+        first_user_input="fix the login bug",
+        turns=[{"usage": {"input": 100, "output": 200, "total": 300,
+                           "cache_read": 500, "cache_creation": 500},
+                "assistant_output": "Done.",
+                "tool_calls": []}],
+        total_cost=0.05,
+    )
     assert len(events) == 7
     names = {e["body"]["name"] for e in events}
-    assert names == {"session_type", "token_efficiency", "task_completed", "cache_hit_rate", "cost_tier", "tool_diversity", "compaction_occurred"}
+    assert "cache_hit_rate" in names
 
 
 def test_build_hook_score_events_types():
