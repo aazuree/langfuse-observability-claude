@@ -303,10 +303,11 @@ class TestParseTranscript:
             {"type": "assistant", "message": {"role": "assistant", "content": "hi"}},
         ]
         f.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
-        result, total = hook.parse_transcript(str(f))
+        result, total, read_ok = hook.parse_transcript(str(f))
         assert total == 2
         assert len(result) == 2
         assert result[0]["type"] == "user"
+        assert read_ok is True
 
     def test_skip_lines(self, tmp_path):
         f = tmp_path / "test.jsonl"
@@ -316,36 +317,78 @@ class TestParseTranscript:
             {"type": "assistant", "message": {"content": "third"}},
         ]
         f.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
-        result, total = hook.parse_transcript(str(f), skip_lines=2)
+        result, total, read_ok = hook.parse_transcript(str(f), skip_lines=2)
         assert total == 3
         assert len(result) == 1
         assert result[0]["type"] == "assistant"
+        assert read_ok is True
 
     def test_invalid_json_skipped(self, tmp_path):
         f = tmp_path / "test.jsonl"
         f.write_text('{"type": "user"}\nnot json\n{"type": "assistant"}\n')
-        result, total = hook.parse_transcript(str(f))
+        result, total, read_ok = hook.parse_transcript(str(f))
         assert total == 3
         assert len(result) == 2  # invalid line skipped
+        assert read_ok is True
 
     def test_empty_lines_skipped(self, tmp_path):
         f = tmp_path / "test.jsonl"
         f.write_text('{"type": "user"}\n\n{"type": "assistant"}\n')
-        result, total = hook.parse_transcript(str(f))
+        result, total, read_ok = hook.parse_transcript(str(f))
         assert total == 3
         assert len(result) == 2
+        assert read_ok is True
 
-    def test_nonexistent_file(self):
-        result, total = hook.parse_transcript("/nonexistent/path.jsonl")
+    def test_nonexistent_file_signals_read_failure(self):
+        # Read failure must be distinguishable from "empty file" so the caller
+        # does not clobber the saved offset with 0 on a transient I/O error.
+        result, total, read_ok = hook.parse_transcript("/nonexistent/path.jsonl")
         assert result == []
         assert total == 0
+        assert read_ok is False
+
+    def test_empty_file_is_read_ok(self, tmp_path):
+        # Distinct from a read failure: file exists, has zero entries.
+        f = tmp_path / "empty.jsonl"
+        f.write_text("")
+        result, total, read_ok = hook.parse_transcript(str(f))
+        assert result == []
+        assert total == 0
+        assert read_ok is True
 
     def test_skip_all_lines(self, tmp_path):
         f = tmp_path / "test.jsonl"
         f.write_text('{"type": "user"}\n{"type": "assistant"}\n')
-        result, total = hook.parse_transcript(str(f), skip_lines=2)
+        result, total, read_ok = hook.parse_transcript(str(f), skip_lines=2)
         assert total == 2
         assert len(result) == 0
+        assert read_ok is True
+
+
+# ---------------------------------------------------------------------------
+# process_session — state save behaviour on transcript read failure
+# ---------------------------------------------------------------------------
+
+class TestProcessSessionStatePreservation:
+    def test_does_not_clobber_state_on_read_failure(self, tmp_path, monkeypatch):
+        """A transient transcript read failure (path moved, permission denied)
+        must NOT overwrite the existing line offset. Otherwise the next fire
+        would re-build every turn from scratch, racing with the async delete
+        pipeline and dropping observations."""
+        # Pre-existing state with a non-zero offset
+        sid = "test-read-fail-session"
+        monkeypatch.setattr(hook, "STATE_DIR", str(tmp_path / "state"))
+        from pathlib import Path
+        Path(hook.STATE_DIR).mkdir(parents=True, exist_ok=True)
+        hook.save_state(sid, line_offset=100, turn_count=5)
+
+        # Run process_session against a path that doesn't exist
+        hook.process_session(sid, "/nonexistent/missing.jsonl", cwd="")
+
+        # State must be UNCHANGED — not clobbered to lines:0
+        lines, turns = hook.load_state(sid)
+        assert lines == 100, "offset clobbered on read failure"
+        assert turns == 5, "turn count clobbered on read failure"
 
 
 # ---------------------------------------------------------------------------
@@ -1982,6 +2025,35 @@ class TestMain:
         monkeypatch.setattr("sys.argv", ["langfuse-hook.py", "--reprocess"])
         hook.main()
         assert called
+
+
+class TestReprocessAll:
+    def test_does_not_call_delete_trace(self, tmp_path, monkeypatch):
+        """delete_trace races with the new ingestion batch because Langfuse
+        processes deletes asynchronously. Reprocessing must rely on
+        deterministic UUID5 IDs to upsert in place instead."""
+        # Fake a single transcript under ~/.claude/projects/
+        projects = tmp_path / "claude" / "projects" / "fake-proj"
+        projects.mkdir(parents=True)
+        transcript = projects / "999aaaaa-bbbb-cccc-dddd-eeeeeeeeeeee.jsonl"
+        transcript.write_text(json.dumps({
+            "type": "user", "cwd": "/tmp", "version": "2.1.140",
+            "gitBranch": "main", "entrypoint": "cli",
+        }) + "\n")
+
+        monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+        monkeypatch.setattr(hook, "STATE_DIR", str(tmp_path / "state"))
+
+        delete_calls = []
+        monkeypatch.setattr(hook, "delete_trace", lambda tid: delete_calls.append(tid))
+        monkeypatch.setattr(hook, "process_session", lambda *a, **kw: None)
+
+        hook.reprocess_all()
+
+        assert delete_calls == [], (
+            "reprocess_all must not call delete_trace — the async cascade-delete "
+            "drops observations from the new ingest batch (see bug context)"
+        )
 
     def test_missing_keys_logs_and_returns(self, monkeypatch):
         monkeypatch.setattr(langfuse_common, "LANGFUSE_PUBLIC_KEY", "")

@@ -275,7 +275,10 @@ def ingest_subagent(
                   "turns": 0, "status": "partial",
                   "cost_breakdown": {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0}}
 
-    entries, total_lines = parse_transcript(transcript_path, skip_lines=subagent_offset)
+    entries, total_lines, read_ok = parse_transcript(transcript_path, skip_lines=subagent_offset)
+    if not read_ok:
+        # Preserve the prior offset on read failure so the next fire retries.
+        return [], empty_cost, subagent_offset, prior_turn_count, "partial"
     if not entries:
         return [], empty_cost, total_lines, prior_turn_count, "partial"
 
@@ -605,9 +608,17 @@ def extract_away_summaries(transcript_path: str) -> list:
     return out
 
 
-def parse_transcript(transcript_path: str, skip_lines: int = 0) -> tuple[list[dict], int]:
+def parse_transcript(transcript_path: str, skip_lines: int = 0) -> tuple[list[dict], int, bool]:
+    """Parse a JSONL transcript starting after `skip_lines`.
+
+    Returns (entries, total_lines, read_ok). read_ok=False signals an I/O
+    failure (file missing, permission denied, etc.); the caller should NOT
+    persist state in that case — a transient read failure must not clobber
+    the existing line offset.
+    """
     entries = []
     total = 0
+    read_ok = True
     try:
         with open(transcript_path) as f:
             for line in f:
@@ -625,7 +636,8 @@ def parse_transcript(transcript_path: str, skip_lines: int = 0) -> tuple[list[di
     except (IOError, OSError) as e:
         # Can't open or read the transcript file
         log(f"Failed to read transcript: {e}")
-    return entries, total
+        read_ok = False
+    return entries, total, read_ok
 
 
 def truncate(s: str, limit: int) -> str:
@@ -1335,7 +1347,15 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
     attachments = extract_attachments(transcript_path)
     file_history_stats = extract_file_history_stats(transcript_path)
     stop_hook_stats = extract_stop_hook_stats(transcript_path)
-    entries, total_lines = parse_transcript(transcript_path, skip_lines=prev_line_offset)
+    entries, total_lines, read_ok = parse_transcript(transcript_path, skip_lines=prev_line_offset)
+
+    if not read_ok:
+        # Transient read failure (file moved, permission denied, etc.).
+        # Do NOT call save_state — that would clobber the existing offset
+        # with 0 and force a full re-ingest (potentially racing with the
+        # async delete pipeline). Bail and retry on the next fire.
+        log(f"Skipping state save for {session_id} due to transcript read failure")
+        return
 
     if not entries:
         log(f"No new entries for session {session_id} (offset {prev_line_offset}, total {total_lines})")
@@ -1819,9 +1839,11 @@ def reprocess_all() -> None:
         slug = extract_slug(str(transcript)) or extract_custom_title(str(transcript))
         cwd = extract_cwd(str(transcript))
 
-        # Delete existing trace to avoid duplicates, then reset state
-        trace_id = f"trace-{session_id}"
-        delete_trace(trace_id)
+        # Reset state so process_session rebuilds the full turn list. We do NOT
+        # call delete_trace here: Langfuse processes deletes asynchronously and
+        # a cascade-delete arriving AFTER the new inserts wipes a subset of the
+        # freshly ingested observations. Re-ingestion with deterministic
+        # UUID5 event/observation IDs upserts existing rows cleanly.
         state_file = Path(STATE_DIR) / f"{session_id}.offset"
         if state_file.exists():
             state_file.unlink()
