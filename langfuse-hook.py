@@ -764,6 +764,8 @@ def build_turns(entries: list[dict]) -> list[dict]:
                 "usage": msg.get("usage", {}),
                 "request_id": entry.get("requestId", ""),
                 "stop_reason": msg.get("stop_reason", ""),
+                "attribution_skill": entry.get("attributionSkill", "") if etype == "assistant" else "",
+                "attribution_plugin": entry.get("attributionPlugin", "") if etype == "assistant" else "",
             })
         elif etype == "system" and entry.get("subtype") == "turn_duration":
             turn_durations.append(entry)
@@ -822,6 +824,10 @@ def build_turns(entries: list[dict]) -> list[dict]:
                     "api_call_ids": set(),
                     "messages": [me],
                     "stop_reason": "",
+                    "attribution_skill": "",
+                    "attribution_plugin": "",
+                    "attribution_skills_all": set(),
+                    "attribution_plugins_all": set(),
                 }
             elif current_turn:
                 current_turn["messages"].append(me)
@@ -842,6 +848,17 @@ def build_turns(entries: list[dict]) -> list[dict]:
             # turn carries the terminal reason: end_turn, tool_use, etc.)
             if me.get("stop_reason"):
                 current_turn["stop_reason"] = me["stop_reason"]
+
+            sk = me.get("attribution_skill", "")
+            pl = me.get("attribution_plugin", "")
+            if sk:
+                if not current_turn["attribution_skill"]:
+                    current_turn["attribution_skill"] = sk
+                current_turn["attribution_skills_all"].add(sk)
+            if pl:
+                if not current_turn["attribution_plugin"]:
+                    current_turn["attribution_plugin"] = pl
+                current_turn["attribution_plugins_all"].add(pl)
 
             current_turn["end_time"] = me["timestamp"]
             current_turn["api_call_ids"].add(mid)
@@ -923,6 +940,8 @@ def build_turns(entries: list[dict]) -> list[dict]:
         turn["cache_ephemeral_1h"] = cache_ephemeral_1h
         turn["request_ids"] = request_ids
         turn["api_call_ids"] = list(turn["api_call_ids"])  # make serializable
+        turn["attribution_skills_all"] = sorted(turn["attribution_skills_all"])
+        turn["attribution_plugins_all"] = sorted(turn["attribution_plugins_all"])
 
     # Match turn_duration entries to turns (by proximity of timestamps)
     for td in turn_durations:

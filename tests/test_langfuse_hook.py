@@ -2910,3 +2910,65 @@ class TestBuildHookScoreEventsNewScores:
         events = hook.build_hook_score_events("t1", "s1", "hi", turns, 0.0, str(transcript))
         div_event = next(e for e in events if e["body"]["name"] == "tool_diversity")
         assert div_event["body"]["value"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Attribution threading + rollup
+# ---------------------------------------------------------------------------
+
+class TestAttributionThreading:
+    def _entries_with_attribution(self, skill="superpowers:brainstorming",
+                                  plugin="superpowers"):
+        return [
+            {
+                "type": "user",
+                "timestamp": "2026-05-21T10:00:00+00:00",
+                "message": {"role": "user", "content": "Plan a feature"},
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-05-21T10:00:02+00:00",
+                "attributionSkill": skill,
+                "attributionPlugin": plugin,
+                "message": {
+                    "id": "msg-1",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "usage": {"input_tokens": 10, "output_tokens": 5,
+                              "cache_read_input_tokens": 0,
+                              "cache_creation_input_tokens": 0},
+                },
+            },
+        ]
+
+    def test_turn_has_attribution_skill(self):
+        turns = hook.build_turns(self._entries_with_attribution())
+        assert turns[0]["attribution_skill"] == "superpowers:brainstorming"
+        assert turns[0]["attribution_plugin"] == "superpowers"
+
+    def test_turn_attribution_defaults_to_empty(self):
+        entries = [
+            {
+                "type": "user",
+                "timestamp": "2026-05-21T10:00:00+00:00",
+                "message": {"role": "user", "content": "Hi"},
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-05-21T10:00:01+00:00",
+                "message": {
+                    "id": "msg-1", "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "hello"}],
+                    "usage": {"input_tokens": 1, "output_tokens": 1,
+                              "cache_read_input_tokens": 0,
+                              "cache_creation_input_tokens": 0},
+                },
+            },
+        ]
+        turns = hook.build_turns(entries)
+        assert turns[0]["attribution_skill"] == ""
+        assert turns[0]["attribution_plugin"] == ""
+        assert turns[0]["attribution_skills_all"] == []
+        assert turns[0]["attribution_plugins_all"] == []
