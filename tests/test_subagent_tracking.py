@@ -695,3 +695,89 @@ def test_subagent_state_not_saved_on_send_failure(tmp_path, monkeypatch):
         "Retry fire must include subagent generation events — "
         "if sa_state was saved on fire 1, ingest_subagent returns empty on fire 2"
     )
+
+
+# --- cwd-derived subagent discovery (worktree workflow) ---
+
+def test_project_dir_from_cwd_basic():
+    """/-separated cwd encodes / as -."""
+    assert langfuse_hook._project_dir_from_cwd("/home/u/repo") == "-home-u-repo"
+
+
+def test_project_dir_from_cwd_hidden_dirs():
+    """Both '/' and '.' become '-'; /.claude renders as --claude."""
+    cwd = "/home/u/.cfg/x"
+    assert langfuse_hook._project_dir_from_cwd(cwd) == "-home-u--cfg-x"
+
+
+def test_project_dir_from_cwd_worktree_path():
+    """Real worktree cwd matches observed Claude Code project dir naming."""
+    cwd = "/home/bharath/repository/git/langfuse-observability/.claude/worktrees/attribution-skill-capture"
+    expected = "-home-bharath-repository-git-langfuse-observability--claude-worktrees-attribution-skill-capture"
+    assert langfuse_hook._project_dir_from_cwd(cwd) == expected
+
+
+def test_discover_subagents_finds_cwd_derived_dir(tmp_path, monkeypatch):
+    """When the parent transcript's project dir has no subagents/ but
+    the cwd-derived project dir does, subagents are still discovered."""
+    # Layout: parent transcript at projects/parent-proj/SESSION.jsonl,
+    # subagents at projects/worktree-proj/SESSION/subagents/
+    projects = tmp_path / "projects"
+    parent_proj = projects / "parent-proj"
+    parent_proj.mkdir(parents=True)
+    transcript = parent_proj / "session123.jsonl"
+    transcript.write_text("")  # parent transcript exists; no co-located subagents/
+
+    worktree_cwd = "/home/u/repo/.claude/worktrees/foo"
+    encoded = langfuse_hook._project_dir_from_cwd(worktree_cwd)
+    worktree_proj = projects / encoded / "session123" / "subagents"
+    worktree_proj.mkdir(parents=True)
+    _make_subagent_jsonl(worktree_proj, "abc123", "2026-03-29T10:00:02+00:00")
+    _make_meta_json(worktree_proj, "abc123", description="Explore codebase")
+
+    monkeypatch.setattr(langfuse_hook, "PROJECTS_DIR", str(projects))
+
+    tool_uses = [("Explore codebase", "Explore", "2026-03-29T10:00:00+00:00", 0)]
+    result = langfuse_hook.discover_subagents(str(transcript), tool_uses, cwd=worktree_cwd)
+    assert len(result) == 1
+    assert result[0][0] == "abc123"
+
+
+def test_discover_subagents_dedupes_when_both_dirs_have_same_id(tmp_path, monkeypatch):
+    """Same agent_id present in primary + cwd-derived dirs: primary wins, one match."""
+    projects = tmp_path / "projects"
+    parent_proj = projects / "parent-proj"
+    parent_proj.mkdir(parents=True)
+    transcript = parent_proj / "session123.jsonl"
+    transcript.write_text("")
+    primary = parent_proj / "session123" / "subagents"
+    primary.mkdir(parents=True)
+    primary_jsonl = _make_subagent_jsonl(primary, "abc123", "2026-03-29T10:00:02+00:00")
+
+    worktree_cwd = "/home/u/repo/.claude/worktrees/foo"
+    encoded = langfuse_hook._project_dir_from_cwd(worktree_cwd)
+    alt = projects / encoded / "session123" / "subagents"
+    alt.mkdir(parents=True)
+    _make_subagent_jsonl(alt, "abc123", "2026-03-29T10:00:05+00:00")
+
+    monkeypatch.setattr(langfuse_hook, "PROJECTS_DIR", str(projects))
+
+    tool_uses = [("Explore", "Explore", "2026-03-29T10:00:00+00:00", 0)]
+    result = langfuse_hook.discover_subagents(str(transcript), tool_uses, cwd=worktree_cwd)
+    assert len(result) == 1
+    # Primary path won (its jsonl is the one returned)
+    assert result[0][1] == str(primary_jsonl)
+
+
+def test_discover_subagents_no_cwd_keeps_old_behavior(tmp_path):
+    """cwd="" (default) falls back to primary-only search; pre-existing semantics."""
+    transcript = tmp_path / "session123.jsonl"
+    transcript.write_text("")
+    primary = tmp_path / "session123" / "subagents"
+    primary.mkdir(parents=True)
+    _make_subagent_jsonl(primary, "abc123", "2026-03-29T10:00:02+00:00")
+
+    tool_uses = [("Explore", "Explore", "2026-03-29T10:00:00+00:00", 0)]
+    result = langfuse_hook.discover_subagents(str(transcript), tool_uses)
+    assert len(result) == 1
+    assert result[0][0] == "abc123"

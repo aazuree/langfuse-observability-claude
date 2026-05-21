@@ -37,6 +37,7 @@ INGESTION_URL = f"{LANGFUSE_HOST}/api/public/ingestion"
 
 LOG_FILE = os.path.expanduser("~/.claude/langfuse-hook.log")
 STATE_DIR = os.path.expanduser("~/.claude/langfuse-state")
+PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
 
 MAX_TEXT = 10000
 MAX_TOOL_IO = 5000
@@ -148,15 +149,26 @@ def save_subagent_state(session_id: str, state: dict) -> None:
     Path(state_file).write_text(json.dumps(state))
 
 
+def _project_dir_from_cwd(cwd: str) -> str:
+    """Mirror Claude Code's project-dir encoding: '/' and '.' both → '-'."""
+    return cwd.replace("/", "-").replace(".", "-")
+
+
 def discover_subagents(
     transcript_path: str,
     agent_tool_uses: list,
+    cwd: str = "",
 ) -> list:
     """Match Agent tool_uses to subagent transcripts by timestamp proximity.
 
     Args:
         transcript_path: Path to parent session JSONL (e.g., .../session.jsonl)
         agent_tool_uses: List of (description, subagent_type, timestamp, content_index)
+        cwd: Session cwd. When the session moved into a worktree mid-run,
+            new subagent transcripts land under a cwd-derived project dir
+            that differs from the parent transcript's project dir. Both
+            locations are searched; agent_ids seen in the primary location
+            win on duplicates.
 
     Returns:
         List of (agent_id, subagent_transcript_path, description, subagent_type, tool_use_content_index)
@@ -165,41 +177,63 @@ def discover_subagents(
     if not agent_tool_uses:
         return []
 
-    # Derive subagents directory: <transcript without .jsonl>/subagents/
+    # Primary location: <transcript without .jsonl>/subagents/
     base = transcript_path
     if base.endswith(".jsonl"):
         base = base[:-6]
-    subagents_dir = os.path.join(base, "subagents")
+    primary_dir = os.path.join(base, "subagents")
 
-    if not os.path.isdir(subagents_dir):
+    search_dirs = []
+    if os.path.isdir(primary_dir):
+        search_dirs.append(primary_dir)
+
+    # Worktree fallback: cwd-derived project dir.
+    if cwd:
+        session_id = os.path.basename(base)
+        alt_dir = os.path.join(
+            PROJECTS_DIR,
+            _project_dir_from_cwd(cwd),
+            session_id,
+            "subagents",
+        )
+        if alt_dir not in search_dirs and os.path.isdir(alt_dir):
+            search_dirs.append(alt_dir)
+
+    if not search_dirs:
         return []
 
-    # List candidate subagent JSONL files, excluding aside_question
+    # List candidate subagent JSONL files, excluding aside_question.
+    # Earlier search_dirs win — primary takes precedence over the cwd fallback.
     candidates = []
-    for fname in os.listdir(subagents_dir):
-        if not fname.startswith("agent-") or not fname.endswith(".jsonl"):
-            continue
-        if fname.startswith("agent-aside_question-"):
-            continue
-        agent_id = fname[len("agent-"):-len(".jsonl")]
-        jsonl_path = os.path.join(subagents_dir, fname)
+    seen_ids = set()
+    for sdir in search_dirs:
+        for fname in os.listdir(sdir):
+            if not fname.startswith("agent-") or not fname.endswith(".jsonl"):
+                continue
+            if fname.startswith("agent-aside_question-"):
+                continue
+            agent_id = fname[len("agent-"):-len(".jsonl")]
+            if agent_id in seen_ids:
+                continue
+            jsonl_path = os.path.join(sdir, fname)
 
-        # Read first entry timestamp
-        first_ts = None
-        try:
-            with open(jsonl_path) as f:
-                first_line = f.readline().strip()
-                if first_line:
-                    entry = json.loads(first_line)
-                    first_ts = parse_ts(entry.get("timestamp", ""))
-        except (IOError, OSError, json.JSONDecodeError):
-            # Can't open file, read it, or parse JSON; skip this subagent
-            continue
+            # Read first entry timestamp
+            first_ts = None
+            try:
+                with open(jsonl_path) as f:
+                    first_line = f.readline().strip()
+                    if first_line:
+                        entry = json.loads(first_line)
+                        first_ts = parse_ts(entry.get("timestamp", ""))
+            except (IOError, OSError, json.JSONDecodeError):
+                # Can't open file, read it, or parse JSON; skip this subagent
+                continue
 
-        if first_ts is None:
-            continue
+            if first_ts is None:
+                continue
 
-        candidates.append((agent_id, jsonl_path, first_ts))
+            seen_ids.add(agent_id)
+            candidates.append((agent_id, jsonl_path, first_ts))
 
     if not candidates:
         return []
@@ -237,8 +271,9 @@ def discover_subagents(
             agent_id, jsonl_path, _ = candidates[best]
             used_candidates.add(best)
 
-            # Log meta.json info for debugging (not required for matching)
-            meta_path = os.path.join(subagents_dir, f"agent-{agent_id}.meta.json")
+            # Log meta.json info for debugging (not required for matching).
+            # meta.json sits alongside the jsonl in whichever subagents dir won.
+            meta_path = os.path.join(os.path.dirname(jsonl_path), f"agent-{agent_id}.meta.json")
             try:
                 meta = json.loads(Path(meta_path).read_text())
                 meta_desc = meta.get("description", "")
@@ -1854,7 +1889,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
 
         # Discover and ingest subagents for this turn
         if agent_tool_uses_this_turn:
-            matches = discover_subagents(transcript_path, agent_tool_uses_this_turn)
+            matches = discover_subagents(transcript_path, agent_tool_uses_this_turn, cwd=cwd)
             for sa_id, sa_path, sa_desc, sa_type, sa_tc_idx in matches:
                 sa_prev_offset = sa_state.get(sa_id, {}).get("offset", 0)
                 sa_prior_turns = sa_state.get(sa_id, {}).get("turn_count", 0)
