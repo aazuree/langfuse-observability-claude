@@ -3135,3 +3135,39 @@ class TestGenerationAttributionMetadata:
             "attribution_skill": "x",
             "attribution_plugin": "p",
         }
+
+
+class TestTraceAttributionAssembly:
+    """Trace-level skill/plugin assembly helpers."""
+
+    def test_skill_plugin_tags_built_from_summary(self):
+        summary = {
+            "skills_used": ["superpowers:brainstorming",
+                            "superpowers:writing-plans"],
+            "plugins_used": ["superpowers"],
+            "top_skill": "superpowers:brainstorming",
+            "skill_turn_counts": {"superpowers:brainstorming": 2,
+                                  "superpowers:writing-plans": 1},
+            "skill_cost_breakdown": {},
+        }
+        tags = hook.build_attribution_tags(summary)
+        assert tags == [
+            "plugin:superpowers",
+            "skill:superpowers:brainstorming",
+            "skill:superpowers:writing-plans",
+        ]
+
+    def test_attribution_tags_empty_when_summary_none(self):
+        assert hook.build_attribution_tags(None) == []
+
+    def test_attribution_tags_skip_unattributed(self):
+        summary = {
+            "skills_used": ["x"],
+            "plugins_used": [],
+            "top_skill": "x",
+            "skill_turn_counts": {"x": 1},
+            "skill_cost_breakdown": {"x": {}, "_unattributed": {}},
+        }
+        tags = hook.build_attribution_tags(summary)
+        assert "skill:_unattributed" not in tags
+        assert tags == ["skill:x"]

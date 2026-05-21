@@ -1416,6 +1416,21 @@ def build_skill_attribution_summary(turns: list[dict]) -> dict | None:
     }
 
 
+def build_attribution_tags(summary: dict | None) -> list[str]:
+    """Trace tags for skill / plugin attribution. Sorted, deduplicated; never
+    includes the '_unattributed' breakdown bucket."""
+    if not summary:
+        return []
+    tags = []
+    for pl in summary.get("plugins_used") or []:
+        tags.append(f"plugin:{pl}")
+    for sk in summary.get("skills_used") or []:
+        if sk == "_unattributed":
+            continue
+        tags.append(f"skill:{sk}")
+    return sorted(set(tags))
+
+
 def build_hook_score_events(
     trace_id: str,
     session_id: str,
@@ -1589,6 +1604,8 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
     total_input = sum(t["usage"]["input"] for t in turns)
     total_output = sum(t["usage"]["output"] for t in turns)
     total_tool_calls = sum(len(t["tool_calls"]) for t in turns)
+    skill_attribution = build_skill_attribution_summary(turns)
+    attribution_tags = build_attribution_tags(skill_attribution)
     total_cost = 0.0
     subagent_cost_summaries = []
     sa_state = load_subagent_state(session_id)
@@ -1662,6 +1679,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 "local_commands": local_commands or None,
                 "file_snapshots": file_history_stats if file_history_stats["snapshot_count"] > 0 else None,
                 "stop_hook": stop_hook_stats if stop_hook_stats["total_hook_fires"] > 0 else None,
+                "skill_attribution": skill_attribution,
             },
             "tags": [t for t in [
                 "claude-code",
@@ -1673,6 +1691,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 f"permission:{permission_mode}" if permission_mode else None,
                 f"agent-name:{agent_name}" if agent_name else None,
                 f"session-kind:{session_kind}" if session_kind else None,
+                *attribution_tags,
                 *pr_tags,
             ] if t],
         },
