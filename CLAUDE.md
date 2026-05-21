@@ -157,6 +157,8 @@ Each trace is enriched with:
 - `pr:<N>` — one tag per PR linked from the session (via `pr-link` transcript entries)
 - `agent-name:{slug}` — present when `type: "agent-name"` entry exists (e.g., `agent-name:langfuse-usagedetails-fix`)
 - `session-kind:{bg|fg}` — background job vs interactive foreground session (from `sessionKind` field on transcript entries; defaults to `fg` when absent on older transcripts)
+- `skill:<slug>` — one per distinct `attributionSkill` observed in the session (e.g., `skill:superpowers:brainstorming`)
+- `plugin:<name>` — one per distinct `attributionPlugin` observed (e.g., `plugin:superpowers`)
 
 **Trace Name precedence:**
 1. `customTitle` from `type: "custom-title"` (user-set via in-CLI title command)
@@ -187,6 +189,7 @@ via Langfuse's upsert-on-id behaviour.
 - `local_commands` — list of `{content, timestamp}` from `system/local_command` entries (slash-command stdout, e.g. `/compact` summaries). Wrapper tags stripped, content truncated to 200 chars and run through `redact_secrets`. Capped at 20 entries. Null when none.
 - `file_snapshots` — `{snapshot_count, tracked_files_count}` from `file-history-snapshot` entries (null when no snapshots)
 - `stop_hook` — `{total_hook_fires, total_duration_ms, max_duration_ms, hook_errors, prevented_continuation_count}` from `system/stop_hook_summary` entries (null when none)
+- `skill_attribution` — per-session rollup from `attributionSkill`/`attributionPlugin` on assistant entries: `{skills_used, plugins_used, top_skill, skill_turn_counts, skill_cost_breakdown}`. `skill_cost_breakdown[<skill>]` = `{turns, input_tokens, output_tokens, cache_read_tokens, cache_create_tokens, cost_usd}`. Turns lacking attribution go to a `_unattributed` bucket inside the breakdown and are excluded from `skills_used`/`top_skill`. Null when no attribution data in session.
 
 Extracted from the first `type: "user"` entry in the JSONL transcript via `extract_session_metadata()`.
 API errors extracted from `type: "system"` / `subtype: "api_error"` entries via `extract_api_errors()`.
@@ -201,6 +204,8 @@ and away summaries are extracted via `extract_custom_title()`, `extract_ai_title
 - `inference_geo` — inference region (e.g., `us-east-1`)
 - `request_ids` — list of Anthropic request IDs for server-side correlation
 - `web_search_requests`, `web_fetch_requests` — server-side tool use counts
+- `attribution_skill`, `attribution_plugin` — primary skill / plugin for the turn (first non-empty observed)
+- `attribution_skills_all` — list of all distinct skills observed in the turn (only emitted when more than one)
 
 **OpenTelemetry GenAI semantic-convention aliases** (also on each generation):
 The hook emits standard `gen_ai.*` attributes so an OTLP collector or future

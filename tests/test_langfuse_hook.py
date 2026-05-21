@@ -2910,3 +2910,264 @@ class TestBuildHookScoreEventsNewScores:
         events = hook.build_hook_score_events("t1", "s1", "hi", turns, 0.0, str(transcript))
         div_event = next(e for e in events if e["body"]["name"] == "tool_diversity")
         assert div_event["body"]["value"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Attribution threading + rollup
+# ---------------------------------------------------------------------------
+
+class TestAttributionThreading:
+    def _entries_with_attribution(self, skill="superpowers:brainstorming",
+                                  plugin="superpowers"):
+        return [
+            {
+                "type": "user",
+                "timestamp": "2026-05-21T10:00:00+00:00",
+                "message": {"role": "user", "content": "Plan a feature"},
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-05-21T10:00:02+00:00",
+                "attributionSkill": skill,
+                "attributionPlugin": plugin,
+                "message": {
+                    "id": "msg-1",
+                    "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "usage": {"input_tokens": 10, "output_tokens": 5,
+                              "cache_read_input_tokens": 0,
+                              "cache_creation_input_tokens": 0},
+                },
+            },
+        ]
+
+    def test_turn_has_attribution_skill(self):
+        turns = hook.build_turns(self._entries_with_attribution())
+        assert turns[0]["attribution_skill"] == "superpowers:brainstorming"
+        assert turns[0]["attribution_plugin"] == "superpowers"
+
+    def test_turn_attribution_defaults_to_empty(self):
+        entries = [
+            {
+                "type": "user",
+                "timestamp": "2026-05-21T10:00:00+00:00",
+                "message": {"role": "user", "content": "Hi"},
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-05-21T10:00:01+00:00",
+                "message": {
+                    "id": "msg-1", "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "hello"}],
+                    "usage": {"input_tokens": 1, "output_tokens": 1,
+                              "cache_read_input_tokens": 0,
+                              "cache_creation_input_tokens": 0},
+                },
+            },
+        ]
+        turns = hook.build_turns(entries)
+        assert turns[0]["attribution_skill"] == ""
+        assert turns[0]["attribution_plugin"] == ""
+        assert turns[0]["attribution_skills_all"] == []
+        assert turns[0]["attribution_plugins_all"] == []
+
+    def test_turn_attribution_first_wins_and_all_collected(self):
+        # Single turn, two assistant messages from different skills
+        entries = [
+            {
+                "type": "user",
+                "timestamp": "2026-05-21T10:00:00+00:00",
+                "message": {"role": "user", "content": "Plan and write"},
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-05-21T10:00:01+00:00",
+                "attributionSkill": "superpowers:brainstorming",
+                "attributionPlugin": "superpowers",
+                "message": {
+                    "id": "msg-1", "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "thinking..."}],
+                    "usage": {"input_tokens": 5, "output_tokens": 5,
+                              "cache_read_input_tokens": 0,
+                              "cache_creation_input_tokens": 0},
+                },
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-05-21T10:00:02+00:00",
+                "attributionSkill": "superpowers:writing-plans",
+                "attributionPlugin": "superpowers",
+                "message": {
+                    "id": "msg-2", "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "plan."}],
+                    "usage": {"input_tokens": 5, "output_tokens": 5,
+                              "cache_read_input_tokens": 0,
+                              "cache_creation_input_tokens": 0},
+                },
+            },
+        ]
+        turns = hook.build_turns(entries)
+        assert len(turns) == 1
+        assert turns[0]["attribution_skill"] == "superpowers:brainstorming"
+        assert turns[0]["attribution_skills_all"] == [
+            "superpowers:brainstorming",
+            "superpowers:writing-plans",
+        ]
+        assert turns[0]["attribution_plugins_all"] == ["superpowers"]
+
+
+class TestSkillAttributionSummary:
+    def _turn(self, skill, plugin, usage=None, model="claude-sonnet-4-6",
+             cache_5m=0, cache_1h=0):
+        return {
+            "attribution_skill": skill,
+            "attribution_plugin": plugin,
+            "attribution_skills_all": [skill] if skill else [],
+            "attribution_plugins_all": [plugin] if plugin else [],
+            "usage": usage or {"input": 100, "output": 50, "total": 150,
+                                "cache_read": 0, "cache_creation": 0},
+            "model": model,
+            "cache_ephemeral_5m": cache_5m,
+            "cache_ephemeral_1h": cache_1h,
+            "speed": "",
+            "inference_geo": "",
+            "web_search_requests": 0,
+        }
+
+    def test_returns_none_when_no_attribution(self):
+        turns = [self._turn("", "")]
+        assert hook.build_skill_attribution_summary(turns) is None
+
+    def test_basic_rollup(self):
+        turns = [
+            self._turn("superpowers:brainstorming", "superpowers"),
+            self._turn("superpowers:brainstorming", "superpowers"),
+            self._turn("superpowers:writing-plans", "superpowers"),
+            self._turn("caveman:caveman-commit", "caveman"),
+        ]
+        s = hook.build_skill_attribution_summary(turns)
+        assert s["skills_used"] == [
+            "caveman:caveman-commit",
+            "superpowers:brainstorming",
+            "superpowers:writing-plans",
+        ]
+        assert s["plugins_used"] == ["caveman", "superpowers"]
+        assert s["top_skill"] == "superpowers:brainstorming"
+        assert s["skill_turn_counts"]["superpowers:brainstorming"] == 2
+
+    def test_unattributed_bucket_in_breakdown_but_not_in_skills_used(self):
+        turns = [
+            self._turn("superpowers:brainstorming", "superpowers"),
+            self._turn("", ""),
+        ]
+        s = hook.build_skill_attribution_summary(turns)
+        assert "_unattributed" in s["skill_cost_breakdown"]
+        assert "_unattributed" not in s["skills_used"]
+        assert s["top_skill"] == "superpowers:brainstorming"
+
+    def test_cost_breakdown_sums_tokens_per_skill(self):
+        turns = [
+            self._turn(
+                "superpowers:brainstorming", "superpowers",
+                usage={"input": 100, "output": 50, "total": 150,
+                       "cache_read": 200, "cache_creation": 0},
+            ),
+            self._turn(
+                "superpowers:brainstorming", "superpowers",
+                usage={"input": 10, "output": 5, "total": 15,
+                       "cache_read": 20, "cache_creation": 0},
+            ),
+        ]
+        s = hook.build_skill_attribution_summary(turns)
+        bk = s["skill_cost_breakdown"]["superpowers:brainstorming"]
+        assert bk["turns"] == 2
+        assert bk["input_tokens"] == 110
+        assert bk["output_tokens"] == 55
+        assert bk["cache_read_tokens"] == 220
+        assert bk["cost_usd"] >= 0.0
+
+    def test_top_skill_ties_broken_alphabetically(self):
+        turns = [
+            self._turn("zzz-skill", "p"),
+            self._turn("aaa-skill", "p"),
+        ]
+        s = hook.build_skill_attribution_summary(turns)
+        assert s["top_skill"] == "aaa-skill"
+
+
+class TestGenerationAttributionMetadata:
+    """Per-generation attribution metadata composition."""
+
+    def test_generation_metadata_includes_attribution(self):
+        turn = {
+            "attribution_skill": "superpowers:brainstorming",
+            "attribution_plugin": "superpowers",
+            "attribution_skills_all": ["superpowers:brainstorming",
+                                       "superpowers:writing-plans"],
+        }
+        meta = hook.gen_metadata_attribution(turn)
+        assert meta == {
+            "attribution_skill": "superpowers:brainstorming",
+            "attribution_plugin": "superpowers",
+            "attribution_skills_all": ["superpowers:brainstorming",
+                                       "superpowers:writing-plans"],
+        }
+
+    def test_generation_metadata_omits_when_empty(self):
+        turn = {
+            "attribution_skill": "",
+            "attribution_plugin": "",
+            "attribution_skills_all": [],
+        }
+        assert hook.gen_metadata_attribution(turn) == {}
+
+    def test_generation_metadata_omits_all_when_single(self):
+        turn = {
+            "attribution_skill": "x",
+            "attribution_plugin": "p",
+            "attribution_skills_all": ["x"],
+        }
+        assert hook.gen_metadata_attribution(turn) == {
+            "attribution_skill": "x",
+            "attribution_plugin": "p",
+        }
+
+
+class TestTraceAttributionAssembly:
+    """Trace-level skill/plugin assembly helpers."""
+
+    def test_skill_plugin_tags_built_from_summary(self):
+        summary = {
+            "skills_used": ["superpowers:brainstorming",
+                            "superpowers:writing-plans"],
+            "plugins_used": ["superpowers"],
+            "top_skill": "superpowers:brainstorming",
+            "skill_turn_counts": {"superpowers:brainstorming": 2,
+                                  "superpowers:writing-plans": 1},
+            "skill_cost_breakdown": {},
+        }
+        tags = hook.build_attribution_tags(summary)
+        assert tags == [
+            "plugin:superpowers",
+            "skill:superpowers:brainstorming",
+            "skill:superpowers:writing-plans",
+        ]
+
+    def test_attribution_tags_empty_when_summary_none(self):
+        assert hook.build_attribution_tags(None) == []
+
+    def test_attribution_tags_skip_unattributed(self):
+        summary = {
+            "skills_used": ["x"],
+            "plugins_used": [],
+            "top_skill": "x",
+            "skill_turn_counts": {"x": 1},
+            "skill_cost_breakdown": {"x": {}, "_unattributed": {}},
+        }
+        tags = hook.build_attribution_tags(summary)
+        assert "skill:_unattributed" not in tags
+        assert tags == ["skill:x"]

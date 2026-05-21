@@ -764,6 +764,8 @@ def build_turns(entries: list[dict]) -> list[dict]:
                 "usage": msg.get("usage", {}),
                 "request_id": entry.get("requestId", ""),
                 "stop_reason": msg.get("stop_reason", ""),
+                "attribution_skill": entry.get("attributionSkill", "") if etype == "assistant" else "",
+                "attribution_plugin": entry.get("attributionPlugin", "") if etype == "assistant" else "",
             })
         elif etype == "system" and entry.get("subtype") == "turn_duration":
             turn_durations.append(entry)
@@ -822,6 +824,10 @@ def build_turns(entries: list[dict]) -> list[dict]:
                     "api_call_ids": set(),
                     "messages": [me],
                     "stop_reason": "",
+                    "attribution_skill": "",
+                    "attribution_plugin": "",
+                    "attribution_skills_all": set(),
+                    "attribution_plugins_all": set(),
                 }
             elif current_turn:
                 current_turn["messages"].append(me)
@@ -842,6 +848,17 @@ def build_turns(entries: list[dict]) -> list[dict]:
             # turn carries the terminal reason: end_turn, tool_use, etc.)
             if me.get("stop_reason"):
                 current_turn["stop_reason"] = me["stop_reason"]
+
+            sk = me.get("attribution_skill", "")
+            pl = me.get("attribution_plugin", "")
+            if sk:
+                if not current_turn["attribution_skill"]:
+                    current_turn["attribution_skill"] = sk
+                current_turn["attribution_skills_all"].add(sk)
+            if pl:
+                if not current_turn["attribution_plugin"]:
+                    current_turn["attribution_plugin"] = pl
+                current_turn["attribution_plugins_all"].add(pl)
 
             current_turn["end_time"] = me["timestamp"]
             current_turn["api_call_ids"].add(mid)
@@ -923,6 +940,8 @@ def build_turns(entries: list[dict]) -> list[dict]:
         turn["cache_ephemeral_1h"] = cache_ephemeral_1h
         turn["request_ids"] = request_ids
         turn["api_call_ids"] = list(turn["api_call_ids"])  # make serializable
+        turn["attribution_skills_all"] = sorted(turn["attribution_skills_all"])
+        turn["attribution_plugins_all"] = sorted(turn["attribution_plugins_all"])
 
     # Match turn_duration entries to turns (by proximity of timestamps)
     for td in turn_durations:
@@ -1331,6 +1350,87 @@ def classify_cost_tier(total_cost: float) -> str:
         return "expensive"
 
 
+def build_skill_attribution_summary(turns: list[dict]) -> dict | None:
+    """Aggregate skill / plugin attribution across all turns.
+
+    Returns None when no turn has any attribution. Unattributed turns
+    contribute to a "_unattributed" bucket inside skill_cost_breakdown
+    but are excluded from skills_used and top_skill.
+    """
+    if not any(t.get("attribution_skill") or t.get("attribution_plugin") for t in turns):
+        return None
+
+    skills_set = set()
+    plugins_set = set()
+    skill_turn_counts: dict[str, int] = {}
+    breakdown: dict[str, dict] = {}
+
+    for t in turns:
+        sk = t.get("attribution_skill") or ""
+        pl = t.get("attribution_plugin") or ""
+        if sk:
+            skills_set.add(sk)
+            skill_turn_counts[sk] = skill_turn_counts.get(sk, 0) + 1
+        if pl:
+            plugins_set.add(pl)
+
+        bucket_key = sk if sk else "_unattributed"
+        b = breakdown.setdefault(bucket_key, {
+            "turns": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_create_tokens": 0,
+            "cost_usd": 0.0,
+        })
+        usage = t.get("usage") or {}
+        b["turns"] += 1
+        b["input_tokens"] += usage.get("input", 0)
+        b["output_tokens"] += usage.get("output", 0)
+        b["cache_read_tokens"] += usage.get("cache_read", 0)
+        b["cache_create_tokens"] += usage.get("cache_creation", 0)
+        turn_cost, _i, _o, _cd = calculate_turn_cost(
+            usage,
+            t.get("model") or DEFAULT_MODEL,
+            t.get("cache_ephemeral_5m", 0),
+            t.get("cache_ephemeral_1h", 0),
+            speed=t.get("speed", ""),
+            inference_geo=t.get("inference_geo", ""),
+            web_search_requests=t.get("web_search_requests", 0),
+        )
+        b["cost_usd"] = round(b["cost_usd"] + turn_cost, 6)
+
+    top_skill = ""
+    if skill_turn_counts:
+        top_skill = sorted(
+            skill_turn_counts.items(),
+            key=lambda kv: (-kv[1], kv[0]),
+        )[0][0]
+
+    return {
+        "skills_used": sorted(skills_set),
+        "plugins_used": sorted(plugins_set),
+        "top_skill": top_skill,
+        "skill_turn_counts": skill_turn_counts,
+        "skill_cost_breakdown": breakdown,
+    }
+
+
+def build_attribution_tags(summary: dict | None) -> list[str]:
+    """Trace tags for skill / plugin attribution. Sorted, deduplicated; never
+    includes the '_unattributed' breakdown bucket."""
+    if not summary:
+        return []
+    tags = []
+    for pl in summary.get("plugins_used") or []:
+        tags.append(f"plugin:{pl}")
+    for sk in summary.get("skills_used") or []:
+        if sk == "_unattributed":
+            continue
+        tags.append(f"skill:{sk}")
+    return sorted(set(tags))
+
+
 def build_hook_score_events(
     trace_id: str,
     session_id: str,
@@ -1423,6 +1523,21 @@ def build_hook_score_events(
     return events
 
 
+def gen_metadata_attribution(turn: dict) -> dict:
+    """Per-generation attribution metadata; empty dict when nothing to emit."""
+    out = {}
+    sk = turn.get("attribution_skill") or ""
+    pl = turn.get("attribution_plugin") or ""
+    all_skills = turn.get("attribution_skills_all") or []
+    if sk:
+        out["attribution_skill"] = sk
+    if pl:
+        out["attribution_plugin"] = pl
+    if len(all_skills) > 1:
+        out["attribution_skills_all"] = list(all_skills)
+    return out
+
+
 def process_session(session_id: str, transcript_path: str, cwd: str, last_assistant_message: str = "") -> None:
     """Core processing logic for a single session transcript."""
     prev_line_offset, prev_turn_count = load_state(session_id)
@@ -1489,6 +1604,8 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
     total_input = sum(t["usage"]["input"] for t in turns)
     total_output = sum(t["usage"]["output"] for t in turns)
     total_tool_calls = sum(len(t["tool_calls"]) for t in turns)
+    skill_attribution = build_skill_attribution_summary(turns)
+    attribution_tags = build_attribution_tags(skill_attribution)
     total_cost = 0.0
     subagent_cost_summaries = []
     sa_state = load_subagent_state(session_id)
@@ -1562,6 +1679,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 "local_commands": local_commands or None,
                 "file_snapshots": file_history_stats if file_history_stats["snapshot_count"] > 0 else None,
                 "stop_hook": stop_hook_stats if stop_hook_stats["total_hook_fires"] > 0 else None,
+                "skill_attribution": skill_attribution,
             },
             "tags": [t for t in [
                 "claude-code",
@@ -1573,6 +1691,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 f"permission:{permission_mode}" if permission_mode else None,
                 f"agent-name:{agent_name}" if agent_name else None,
                 f"session-kind:{session_kind}" if session_kind else None,
+                *attribution_tags,
                 *pr_tags,
             ] if t],
         },
@@ -1664,6 +1783,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                     request_ids=turn.get("request_ids", []),
                     stop_reason=turn.get("stop_reason", ""),
                 ),
+                **gen_metadata_attribution(turn),
             },
         }
 
