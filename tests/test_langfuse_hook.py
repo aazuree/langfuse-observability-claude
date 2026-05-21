@@ -2972,3 +2972,49 @@ class TestAttributionThreading:
         assert turns[0]["attribution_plugin"] == ""
         assert turns[0]["attribution_skills_all"] == []
         assert turns[0]["attribution_plugins_all"] == []
+
+    def test_turn_attribution_first_wins_and_all_collected(self):
+        # Single turn, two assistant messages from different skills
+        entries = [
+            {
+                "type": "user",
+                "timestamp": "2026-05-21T10:00:00+00:00",
+                "message": {"role": "user", "content": "Plan and write"},
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-05-21T10:00:01+00:00",
+                "attributionSkill": "superpowers:brainstorming",
+                "attributionPlugin": "superpowers",
+                "message": {
+                    "id": "msg-1", "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "thinking..."}],
+                    "usage": {"input_tokens": 5, "output_tokens": 5,
+                              "cache_read_input_tokens": 0,
+                              "cache_creation_input_tokens": 0},
+                },
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-05-21T10:00:02+00:00",
+                "attributionSkill": "superpowers:writing-plans",
+                "attributionPlugin": "superpowers",
+                "message": {
+                    "id": "msg-2", "role": "assistant",
+                    "model": "claude-sonnet-4-6",
+                    "content": [{"type": "text", "text": "plan."}],
+                    "usage": {"input_tokens": 5, "output_tokens": 5,
+                              "cache_read_input_tokens": 0,
+                              "cache_creation_input_tokens": 0},
+                },
+            },
+        ]
+        turns = hook.build_turns(entries)
+        assert len(turns) == 1
+        assert turns[0]["attribution_skill"] == "superpowers:brainstorming"
+        assert turns[0]["attribution_skills_all"] == [
+            "superpowers:brainstorming",
+            "superpowers:writing-plans",
+        ]
+        assert turns[0]["attribution_plugins_all"] == ["superpowers"]
