@@ -3097,3 +3097,41 @@ class TestSkillAttributionSummary:
         ]
         s = hook.build_skill_attribution_summary(turns)
         assert s["top_skill"] == "aaa-skill"
+
+
+class TestGenerationAttributionMetadata:
+    """Per-generation attribution metadata composition."""
+
+    def test_generation_metadata_includes_attribution(self):
+        turn = {
+            "attribution_skill": "superpowers:brainstorming",
+            "attribution_plugin": "superpowers",
+            "attribution_skills_all": ["superpowers:brainstorming",
+                                       "superpowers:writing-plans"],
+        }
+        meta = hook.gen_metadata_attribution(turn)
+        assert meta == {
+            "attribution_skill": "superpowers:brainstorming",
+            "attribution_plugin": "superpowers",
+            "attribution_skills_all": ["superpowers:brainstorming",
+                                       "superpowers:writing-plans"],
+        }
+
+    def test_generation_metadata_omits_when_empty(self):
+        turn = {
+            "attribution_skill": "",
+            "attribution_plugin": "",
+            "attribution_skills_all": [],
+        }
+        assert hook.gen_metadata_attribution(turn) == {}
+
+    def test_generation_metadata_omits_all_when_single(self):
+        turn = {
+            "attribution_skill": "x",
+            "attribution_plugin": "p",
+            "attribution_skills_all": ["x"],
+        }
+        assert hook.gen_metadata_attribution(turn) == {
+            "attribution_skill": "x",
+            "attribution_plugin": "p",
+        }

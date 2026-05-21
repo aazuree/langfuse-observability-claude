@@ -1508,6 +1508,21 @@ def build_hook_score_events(
     return events
 
 
+def gen_metadata_attribution(turn: dict) -> dict:
+    """Per-generation attribution metadata; empty dict when nothing to emit."""
+    out = {}
+    sk = turn.get("attribution_skill") or ""
+    pl = turn.get("attribution_plugin") or ""
+    all_skills = turn.get("attribution_skills_all") or []
+    if sk:
+        out["attribution_skill"] = sk
+    if pl:
+        out["attribution_plugin"] = pl
+    if len(all_skills) > 1:
+        out["attribution_skills_all"] = list(all_skills)
+    return out
+
+
 def process_session(session_id: str, transcript_path: str, cwd: str, last_assistant_message: str = "") -> None:
     """Core processing logic for a single session transcript."""
     prev_line_offset, prev_turn_count = load_state(session_id)
@@ -1749,6 +1764,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                     request_ids=turn.get("request_ids", []),
                     stop_reason=turn.get("stop_reason", ""),
                 ),
+                **gen_metadata_attribution(turn),
             },
         }
 
