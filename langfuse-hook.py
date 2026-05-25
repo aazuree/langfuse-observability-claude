@@ -50,10 +50,6 @@ _SYNTHETIC_PROMPT_RE = re.compile(r"^<[a-z][a-z0-9-]*>")
 
 SUBAGENT_MATCH_WINDOW_S = 60  # Max seconds between Agent tool_use and subagent start
 
-# Cost tier thresholds (used for session classification in Langfuse dashboard)
-COST_TIER_CHEAP_MAX = 0.10      # Sessions under $0.10
-COST_TIER_MODERATE_MAX = 1.00   # Sessions $0.10-$1.00; above $1.00 = expensive
-
 # Default model for cost calculation when model field is missing
 DEFAULT_MODEL = "claude-opus-4-6"
 
@@ -1230,101 +1226,6 @@ def calculate_turn_cost(
 # Hook-level score classifiers
 # ---------------------------------------------------------------------------
 
-# Keyword lists for session_type classification (checked in priority order)
-_SESSION_TYPE_PATTERNS = [
-    ("bug-fix", re.compile(
-        r"\b(fix|bug|error|broken|issue|crash|fail|debug|troubleshoot|regression|fault|defect)\b",
-        re.IGNORECASE,
-    )),
-    ("refactor", re.compile(
-        r"\b(refactor|clean\s*up|rename|reorganize|restructure|migrate|move|split|extract|simplify|deduplicate)\b",
-        re.IGNORECASE,
-    )),
-    ("research", re.compile(
-        r"\b(explain|what\s+does|how\s+does|why\s+does|understand|read\b.*\b(and|then)\s+(summarize|explain)|summarize|find\s+where|show\s+me|look\s+at|search\s+for|what\s+is|where\s+is|tell\s+me\s+about)\b",
-        re.IGNORECASE,
-    )),
-    ("feature", re.compile(
-        r"\b(add|create|implement|build|write|make|generate|setup|set\s*up|introduce|design|develop|new)\b",
-        re.IGNORECASE,
-    )),
-]
-
-
-def classify_session_type(first_user_input: str) -> str:
-    """Classify a session based on the first user message.
-
-    Returns one of: bug-fix, feature, refactor, research, exploratory.
-    Patterns are checked in priority order (bug-fix > refactor > research > feature).
-    """
-    text = first_user_input.strip()
-    if not text:
-        return "exploratory"
-    for label, pattern in _SESSION_TYPE_PATTERNS:
-        if pattern.search(text):
-            return label
-    return "exploratory"
-
-
-def calculate_token_efficiency(turns: list[dict]) -> float:
-    """Calculate output-to-total token ratio across all turns.
-
-    Returns a float between 0.0 and 1.0 (rounded to 4 decimals).
-    Higher values mean more output relative to input/cache tokens.
-    """
-    total_output = 0
-    total_all = 0
-    for t in turns:
-        u = t["usage"]
-        total_output += u["output"]
-        total_all += u["output"] + u["input"] + u["cache_read"] + u["cache_creation"]
-    if total_all == 0:
-        return 0.0
-    return round(total_output / total_all, 4)
-
-
-_FAILURE_PATTERNS = re.compile(
-    r"\b(couldn't complete|failed to|unable to|error occurred|I encountered an error|"
-    r"I'm unable|I cannot|not able to complete|could not)\b",
-    re.IGNORECASE,
-)
-
-_QUESTION_PATTERNS = re.compile(
-    r"(could you clarify|can you (provide|clarify|explain)|what do you mean|what you mean|"
-    r"which (one|file|approach)|do you want me to|shall I|would you like me to)",
-    re.IGNORECASE,
-)
-
-
-def classify_task_completed(turns: list[dict], last_output: str = "") -> bool:
-    """Heuristic: did the session likely complete its task?
-
-    Checks the last turn's assistant output and tool results for error/failure
-    signals. Returns True if the session appears to have finished successfully.
-    """
-    if not turns:
-        return True  # no turns = nothing to fail
-
-    last_turn = turns[-1]
-    last_output = last_output or last_turn.get("assistant_output", "")
-
-    # Check if last output indicates failure
-    if _FAILURE_PATTERNS.search(last_output):
-        return False
-
-    # Check if last output is asking a clarifying question (incomplete)
-    if _QUESTION_PATTERNS.search(last_output):
-        return False
-
-    # Check last turn's tool calls for errors
-    tool_calls = last_turn.get("tool_calls", [])
-    for tc in tool_calls:
-        output = tc.get("output", "")
-        if output.startswith("[ERROR]"):
-            return False
-
-    return True
-
 
 def compute_cache_hit_rate(turns: list[dict]) -> float | None:
     """Calculate cache hit rate: cache_read / (cache_read + cache_creation).
@@ -1345,18 +1246,6 @@ def compute_cache_hit_rate(turns: list[dict]) -> float | None:
         return None  # No cache activity at all — distinct from cache-miss
 
     return round(cache_read / denominator, 4)
-
-
-def calculate_tool_diversity(turns: list[dict]) -> float:
-    """Measure tool-call diversity across all turns.
-
-    Returns unique_tool_names / total_tool_calls, rounded to 4 decimal places.
-    0.0 when there are no tool calls or turns is empty.
-    """
-    all_calls = [tc["name"] for t in turns for tc in t.get("tool_calls", [])]
-    if not all_calls:
-        return 0.0
-    return round(len(set(all_calls)) / len(all_calls), 4)
 
 
 def calculate_tool_error_rate(turns: list[dict]) -> float | None:
@@ -1393,19 +1282,6 @@ def detect_compaction(transcript_path: str) -> bool:
         if etype == "system" and "compact" in subtype.lower():
             return True
     return False
-
-
-def classify_cost_tier(total_cost: float) -> str:
-    """Classify session cost into a tier for dashboard filtering.
-
-    < $0.10 = cheap, $0.10–$1.00 = moderate, ≥ $1.00 = expensive.
-    """
-    if total_cost < COST_TIER_CHEAP_MAX:
-        return "cheap"
-    elif total_cost < COST_TIER_MODERATE_MAX:
-        return "moderate"
-    else:
-        return "expensive"
 
 
 def build_skill_attribution_summary(turns: list[dict]) -> dict | None:

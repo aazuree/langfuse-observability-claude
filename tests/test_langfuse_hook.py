@@ -2804,41 +2804,6 @@ class TestTraceNamePrecedence:
 
 
 # ---------------------------------------------------------------------------
-# calculate_tool_diversity
-# ---------------------------------------------------------------------------
-
-class TestCalculateToolDiversity:
-    def _turns(self, tool_names_per_turn):
-        return [
-            {"tool_calls": [{"name": n} for n in names]}
-            for names in tool_names_per_turn
-        ]
-
-    def test_all_same_tool(self):
-        turns = self._turns([["Bash", "Bash", "Bash"]])
-        assert hook.calculate_tool_diversity(turns) == round(1/3, 4)
-
-    def test_all_unique_tools(self):
-        turns = self._turns([["Bash", "Read", "Write"]])
-        assert hook.calculate_tool_diversity(turns) == 1.0
-
-    def test_no_tool_calls(self):
-        turns = [{"tool_calls": []}]
-        assert hook.calculate_tool_diversity(turns) == 0.0
-
-    def test_empty_turns(self):
-        assert hook.calculate_tool_diversity([]) == 0.0
-
-    def test_tools_across_multiple_turns(self):
-        turns = self._turns([["Bash", "Bash"], ["Read"]])
-        assert hook.calculate_tool_diversity(turns) == round(2/3, 4)
-
-    def test_single_tool_single_call(self):
-        turns = self._turns([["Bash"]])
-        assert hook.calculate_tool_diversity(turns) == 1.0
-
-
-# ---------------------------------------------------------------------------
 # detect_compaction
 # ---------------------------------------------------------------------------
 
