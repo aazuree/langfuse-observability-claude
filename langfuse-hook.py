@@ -1356,6 +1356,26 @@ def calculate_tool_diversity(turns: list[dict]) -> float:
     return round(len(set(all_calls)) / len(all_calls), 4)
 
 
+def calculate_tool_error_rate(turns: list[dict]) -> float | None:
+    """Fraction of tool calls whose output is an [ERROR].
+
+    Returns None when there are no tool calls at all (omit the score, same
+    pattern as compute_cache_hit_rate) so an error-free session stays distinct
+    from a session that ran no tools. The "[ERROR]" prefix is applied upstream
+    in extract_tool_results.
+    """
+    total = 0
+    errors = 0
+    for t in turns:
+        for tc in t.get("tool_calls", []):
+            total += 1
+            if str(tc.get("output", "")).startswith("[ERROR]"):
+                errors += 1
+    if total == 0:
+        return None
+    return round(errors / total, 4)
+
+
 def detect_compaction(transcript_path: str) -> bool:
     """Return True if the transcript contains a compaction event.
 

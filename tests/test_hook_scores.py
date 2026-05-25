@@ -383,3 +383,38 @@ def test_build_hook_score_events_task_completed_false():
     )
     by_name = {e["body"]["name"]: e for e in events}
     assert by_name["task_completed"]["body"]["value"] == 0  # False -> 0
+
+
+# --- calculate_tool_error_rate ---
+
+def test_tool_error_rate_no_tools():
+    turns = [{"tool_calls": []}]
+    assert hook.calculate_tool_error_rate(turns) is None
+
+
+def test_tool_error_rate_empty_turns():
+    assert hook.calculate_tool_error_rate([]) is None
+
+
+def test_tool_error_rate_all_clean():
+    turns = [{"tool_calls": [{"output": "ok"}, {"output": "done"}]}]
+    assert hook.calculate_tool_error_rate(turns) == 0.0
+
+
+def test_tool_error_rate_mixed():
+    turns = [{"tool_calls": [
+        {"output": "[ERROR] boom"},
+        {"output": "ok"},
+        {"output": "ok"},
+        {"output": "ok"},
+    ]}]
+    assert hook.calculate_tool_error_rate(turns) == 0.25
+
+
+def test_tool_error_rate_multi_turn_rounding():
+    turns = [
+        {"tool_calls": [{"output": "[ERROR] x"}, {"output": "ok"}]},
+        {"tool_calls": [{"output": "ok"}]},
+    ]
+    # 1 error / 3 calls = 0.3333
+    assert hook.calculate_tool_error_rate(turns) == 0.3333
