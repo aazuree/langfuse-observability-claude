@@ -1868,13 +1868,13 @@ class TestProcessSession:
         assert len(sent_batches) == 1
         batch = sent_batches[0]
 
-        # Should have: 1 trace + 1 generation + 7 scores = 9 events
+        # Should have: 1 trace + 1 generation + 1 score (cache_hit_rate only, no tool calls)
         trace_events = [e for e in batch if e["type"] == "trace-create"]
         gen_events = [e for e in batch if e["type"] == "generation-create"]
         score_events = [e for e in batch if e["type"] == "score-create"]
         assert len(trace_events) == 1
         assert len(gen_events) == 1
-        assert len(score_events) == 7
+        assert len(score_events) == 1
 
         # Trace metadata
         trace = trace_events[0]["body"]
@@ -1882,9 +1882,9 @@ class TestProcessSession:
         assert "claude-code" in trace["tags"]
         assert trace["metadata"]["turn_count"] == 1
 
-        # Score: session_type should be bug-fix
+        # Score: only cache_hit_rate (cache activity present, no tool calls)
         score_by_name = {e["body"]["name"]: e["body"] for e in score_events}
-        assert score_by_name["session_type"]["value"] == "bug-fix"
+        assert "cache_hit_rate" in score_by_name
 
     def test_no_new_entries_skips_send(self, tmp_path, monkeypatch):
         state_dir = tmp_path / "state"
@@ -2804,41 +2804,6 @@ class TestTraceNamePrecedence:
 
 
 # ---------------------------------------------------------------------------
-# calculate_tool_diversity
-# ---------------------------------------------------------------------------
-
-class TestCalculateToolDiversity:
-    def _turns(self, tool_names_per_turn):
-        return [
-            {"tool_calls": [{"name": n} for n in names]}
-            for names in tool_names_per_turn
-        ]
-
-    def test_all_same_tool(self):
-        turns = self._turns([["Bash", "Bash", "Bash"]])
-        assert hook.calculate_tool_diversity(turns) == round(1/3, 4)
-
-    def test_all_unique_tools(self):
-        turns = self._turns([["Bash", "Read", "Write"]])
-        assert hook.calculate_tool_diversity(turns) == 1.0
-
-    def test_no_tool_calls(self):
-        turns = [{"tool_calls": []}]
-        assert hook.calculate_tool_diversity(turns) == 0.0
-
-    def test_empty_turns(self):
-        assert hook.calculate_tool_diversity([]) == 0.0
-
-    def test_tools_across_multiple_turns(self):
-        turns = self._turns([["Bash", "Bash"], ["Read"]])
-        assert hook.calculate_tool_diversity(turns) == round(2/3, 4)
-
-    def test_single_tool_single_call(self):
-        turns = self._turns([["Bash"]])
-        assert hook.calculate_tool_diversity(turns) == 1.0
-
-
-# ---------------------------------------------------------------------------
 # detect_compaction
 # ---------------------------------------------------------------------------
 
@@ -2883,33 +2848,38 @@ class TestBuildHookScoreEventsNewScores:
             for names in tool_names_per_turn
         ]
 
-    def test_tool_diversity_score_present(self, tmp_path):
+    def test_tool_error_rate_score_present(self, tmp_path):
         transcript = tmp_path / "s.jsonl"
         transcript.write_text("")
         turns = self._turns([["Bash", "Read"]])
+        # No cache activity, but tool calls present → only tool_error_rate
         events = hook.build_hook_score_events("t1", "s1", "fix bug", turns, 0.05, str(transcript))
         names = {e["body"]["name"] for e in events}
-        assert "tool_diversity" in names
-        assert "compaction_occurred" in names
-        # Empty transcript → no compaction
-        comp_event = next(e for e in events if e["body"]["name"] == "compaction_occurred")
-        assert comp_event["body"]["value"] == 0
+        assert "tool_error_rate" in names
+        assert "tool_diversity" not in names
+        assert "compaction_occurred" not in names
 
-    def test_compaction_occurred_true(self, tmp_path):
+    def test_tool_error_rate_not_emitted_when_no_tool_calls(self, tmp_path):
         transcript = tmp_path / "s.jsonl"
         transcript.write_text(json.dumps({"type": "system", "subtype": "compact"}))
-        turns = self._turns([["Bash"]])
+        turns = [{"tool_calls": [], "usage": {"input": 0, "output": 0, "total": 0, "cache_read": 0, "cache_creation": 0}}]
+        # No cache activity, no tool calls → zero events
         events = hook.build_hook_score_events("t1", "s1", "fix bug", turns, 0.05, str(transcript))
-        comp_event = next(e for e in events if e["body"]["name"] == "compaction_occurred")
-        assert comp_event["body"]["value"] == 1
+        names = {e["body"]["name"] for e in events}
+        assert "compaction_occurred" not in names
+        assert "tool_error_rate" not in names
+        assert events == []
 
-    def test_tool_diversity_zero_no_tools(self, tmp_path):
+    def test_tool_error_rate_zero_for_clean_tools(self, tmp_path):
         transcript = tmp_path / "s.jsonl"
         transcript.write_text("")
-        turns = [{"tool_calls": [], "usage": {"input": 0, "output": 0, "total": 0, "cache_read": 0, "cache_creation": 0}}]
+        turns = self._turns([["Bash"]])
+        # Tool calls present, all clean → tool_error_rate = 0.0 (not None)
+        # _turns helper builds tool_calls without "output" key; output defaults to ""
+        # which does not start with "[ERROR]", so error rate is 0.0
         events = hook.build_hook_score_events("t1", "s1", "hi", turns, 0.0, str(transcript))
-        div_event = next(e for e in events if e["body"]["name"] == "tool_diversity")
-        assert div_event["body"]["value"] == 0.0
+        ter_event = next(e for e in events if e["body"]["name"] == "tool_error_rate")
+        assert ter_event["body"]["value"] == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -3171,3 +3141,66 @@ class TestTraceAttributionAssembly:
         tags = hook.build_attribution_tags(summary)
         assert "skill:_unattributed" not in tags
         assert tags == ["skill:x"]
+
+
+def test_build_turns_sums_iteration_count():
+    entries = [
+        {"type": "user", "timestamp": "2026-05-25T10:00:00Z",
+         "message": {"role": "user", "content": "hi"}},
+        {"type": "assistant", "timestamp": "2026-05-25T10:00:01Z",
+         "message": {"role": "assistant", "id": "m1",
+                     "model": "claude-opus-4-7",
+                     "content": [{"type": "text", "text": "hello"}],
+                     "usage": {"input_tokens": 1, "output_tokens": 2,
+                               "iterations": [{"type": "message"},
+                                              {"type": "message"}]}}},
+    ]
+    turns = hook.build_turns(entries)
+    assert turns[0]["iteration_count"] == 2
+
+
+def test_build_turns_iteration_count_defaults_zero():
+    entries = [
+        {"type": "user", "timestamp": "2026-05-25T10:00:00Z",
+         "message": {"role": "user", "content": "hi"}},
+        {"type": "assistant", "timestamp": "2026-05-25T10:00:01Z",
+         "message": {"role": "assistant", "id": "m1",
+                     "model": "claude-opus-4-7",
+                     "content": [{"type": "text", "text": "hello"}],
+                     "usage": {"input_tokens": 1, "output_tokens": 2}}},
+    ]
+    turns = hook.build_turns(entries)
+    assert turns[0]["iteration_count"] == 0
+
+
+def test_process_session_trace_metadata_has_compaction_and_iterations(tmp_path, monkeypatch):
+    import json as _json
+    transcript = tmp_path / "sess.jsonl"
+    lines = [
+        {"type": "user", "timestamp": "2026-05-25T10:00:00Z", "cwd": "/x/repo",
+         "version": "2.1.150", "message": {"role": "user", "content": "add a feature"}},
+        {"type": "assistant", "timestamp": "2026-05-25T10:00:01Z",
+         "message": {"role": "assistant", "id": "m1", "model": "claude-opus-4-7",
+                     "stop_reason": "end_turn",
+                     "content": [{"type": "text", "text": "done"}],
+                     "usage": {"input_tokens": 1, "output_tokens": 2,
+                               "iterations": [{"type": "message"}, {"type": "message"}]}}},
+    ]
+    transcript.write_text("\n".join(_json.dumps(l) for l in lines) + "\n")
+
+    captured = {}
+    def fake_send(batch):
+        captured["batch"] = batch
+        return True
+    monkeypatch.setattr(hook, "send_to_langfuse", fake_send)
+    monkeypatch.setattr(hook, "STATE_DIR", str(tmp_path / "state"))
+
+    hook.process_session("sess", str(transcript), "/x/repo")
+
+    trace = next(e for e in captured["batch"] if e["type"] == "trace-create")
+    meta = trace["body"]["metadata"]
+    assert meta["compaction_occurred"] is False
+    assert meta["total_iterations"] == 2
+
+    gen = next(e for e in captured["batch"] if e["type"] == "generation-create")
+    assert gen["body"]["metadata"]["iteration_count"] == 2

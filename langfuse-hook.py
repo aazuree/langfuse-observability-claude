@@ -50,10 +50,6 @@ _SYNTHETIC_PROMPT_RE = re.compile(r"^<[a-z][a-z0-9-]*>")
 
 SUBAGENT_MATCH_WINDOW_S = 60  # Max seconds between Agent tool_use and subagent start
 
-# Cost tier thresholds (used for session classification in Langfuse dashboard)
-COST_TIER_CHEAP_MAX = 0.10      # Sessions under $0.10
-COST_TIER_MODERATE_MAX = 1.00   # Sessions $0.10-$1.00; above $1.00 = expensive
-
 # Default model for cost calculation when model field is missing
 DEFAULT_MODEL = "claude-opus-4-6"
 
@@ -935,6 +931,7 @@ def build_turns(entries: list[dict]) -> list[dict]:
         web_fetch_requests = 0
         cache_ephemeral_5m = 0
         cache_ephemeral_1h = 0
+        iteration_count = 0
         for mid in turn["api_call_ids"]:
             u = msg_id_final_usage.get(mid, {})
             inp = u.get("input_tokens", 0)
@@ -959,6 +956,7 @@ def build_turns(entries: list[dict]) -> list[dict]:
             cc = u.get("cache_creation", {})
             cache_ephemeral_5m += cc.get("ephemeral_5m_input_tokens", 0)
             cache_ephemeral_1h += cc.get("ephemeral_1h_input_tokens", 0)
+            iteration_count += len(u.get("iterations", []) or [])
         # Collect request_ids from messages in this turn
         request_ids = [
             me.get("request_id")
@@ -973,6 +971,7 @@ def build_turns(entries: list[dict]) -> list[dict]:
         turn["web_fetch_requests"] = web_fetch_requests
         turn["cache_ephemeral_5m"] = cache_ephemeral_5m
         turn["cache_ephemeral_1h"] = cache_ephemeral_1h
+        turn["iteration_count"] = iteration_count
         turn["request_ids"] = request_ids
         turn["api_call_ids"] = list(turn["api_call_ids"])  # make serializable
         turn["attribution_skills_all"] = sorted(turn["attribution_skills_all"])
@@ -1227,101 +1226,6 @@ def calculate_turn_cost(
 # Hook-level score classifiers
 # ---------------------------------------------------------------------------
 
-# Keyword lists for session_type classification (checked in priority order)
-_SESSION_TYPE_PATTERNS = [
-    ("bug-fix", re.compile(
-        r"\b(fix|bug|error|broken|issue|crash|fail|debug|troubleshoot|regression|fault|defect)\b",
-        re.IGNORECASE,
-    )),
-    ("refactor", re.compile(
-        r"\b(refactor|clean\s*up|rename|reorganize|restructure|migrate|move|split|extract|simplify|deduplicate)\b",
-        re.IGNORECASE,
-    )),
-    ("research", re.compile(
-        r"\b(explain|what\s+does|how\s+does|why\s+does|understand|read\b.*\b(and|then)\s+(summarize|explain)|summarize|find\s+where|show\s+me|look\s+at|search\s+for|what\s+is|where\s+is|tell\s+me\s+about)\b",
-        re.IGNORECASE,
-    )),
-    ("feature", re.compile(
-        r"\b(add|create|implement|build|write|make|generate|setup|set\s*up|introduce|design|develop|new)\b",
-        re.IGNORECASE,
-    )),
-]
-
-
-def classify_session_type(first_user_input: str) -> str:
-    """Classify a session based on the first user message.
-
-    Returns one of: bug-fix, feature, refactor, research, exploratory.
-    Patterns are checked in priority order (bug-fix > refactor > research > feature).
-    """
-    text = first_user_input.strip()
-    if not text:
-        return "exploratory"
-    for label, pattern in _SESSION_TYPE_PATTERNS:
-        if pattern.search(text):
-            return label
-    return "exploratory"
-
-
-def calculate_token_efficiency(turns: list[dict]) -> float:
-    """Calculate output-to-total token ratio across all turns.
-
-    Returns a float between 0.0 and 1.0 (rounded to 4 decimals).
-    Higher values mean more output relative to input/cache tokens.
-    """
-    total_output = 0
-    total_all = 0
-    for t in turns:
-        u = t["usage"]
-        total_output += u["output"]
-        total_all += u["output"] + u["input"] + u["cache_read"] + u["cache_creation"]
-    if total_all == 0:
-        return 0.0
-    return round(total_output / total_all, 4)
-
-
-_FAILURE_PATTERNS = re.compile(
-    r"\b(couldn't complete|failed to|unable to|error occurred|I encountered an error|"
-    r"I'm unable|I cannot|not able to complete|could not)\b",
-    re.IGNORECASE,
-)
-
-_QUESTION_PATTERNS = re.compile(
-    r"(could you clarify|can you (provide|clarify|explain)|what do you mean|what you mean|"
-    r"which (one|file|approach)|do you want me to|shall I|would you like me to)",
-    re.IGNORECASE,
-)
-
-
-def classify_task_completed(turns: list[dict], last_output: str = "") -> bool:
-    """Heuristic: did the session likely complete its task?
-
-    Checks the last turn's assistant output and tool results for error/failure
-    signals. Returns True if the session appears to have finished successfully.
-    """
-    if not turns:
-        return True  # no turns = nothing to fail
-
-    last_turn = turns[-1]
-    last_output = last_output or last_turn.get("assistant_output", "")
-
-    # Check if last output indicates failure
-    if _FAILURE_PATTERNS.search(last_output):
-        return False
-
-    # Check if last output is asking a clarifying question (incomplete)
-    if _QUESTION_PATTERNS.search(last_output):
-        return False
-
-    # Check last turn's tool calls for errors
-    tool_calls = last_turn.get("tool_calls", [])
-    for tc in tool_calls:
-        output = tc.get("output", "")
-        if output.startswith("[ERROR]"):
-            return False
-
-    return True
-
 
 def compute_cache_hit_rate(turns: list[dict]) -> float | None:
     """Calculate cache hit rate: cache_read / (cache_read + cache_creation).
@@ -1344,16 +1248,24 @@ def compute_cache_hit_rate(turns: list[dict]) -> float | None:
     return round(cache_read / denominator, 4)
 
 
-def calculate_tool_diversity(turns: list[dict]) -> float:
-    """Measure tool-call diversity across all turns.
+def calculate_tool_error_rate(turns: list[dict]) -> float | None:
+    """Fraction of tool calls whose output is an [ERROR].
 
-    Returns unique_tool_names / total_tool_calls, rounded to 4 decimal places.
-    0.0 when there are no tool calls or turns is empty.
+    Returns None when there are no tool calls at all (omit the score, same
+    pattern as compute_cache_hit_rate) so an error-free session stays distinct
+    from a session that ran no tools. The "[ERROR]" prefix is applied upstream
+    in extract_tool_results.
     """
-    all_calls = [tc["name"] for t in turns for tc in t.get("tool_calls", [])]
-    if not all_calls:
-        return 0.0
-    return round(len(set(all_calls)) / len(all_calls), 4)
+    total = 0
+    errors = 0
+    for t in turns:
+        for tc in t.get("tool_calls", []):
+            total += 1
+            if str(tc.get("output", "")).startswith("[ERROR]"):
+                errors += 1
+    if total == 0:
+        return None
+    return round(errors / total, 4)
 
 
 def detect_compaction(transcript_path: str) -> bool:
@@ -1370,19 +1282,6 @@ def detect_compaction(transcript_path: str) -> bool:
         if etype == "system" and "compact" in subtype.lower():
             return True
     return False
-
-
-def classify_cost_tier(total_cost: float) -> str:
-    """Classify session cost into a tier for dashboard filtering.
-
-    < $0.10 = cheap, $0.10–$1.00 = moderate, ≥ $1.00 = expensive.
-    """
-    if total_cost < COST_TIER_CHEAP_MAX:
-        return "cheap"
-    elif total_cost < COST_TIER_MODERATE_MAX:
-        return "moderate"
-    else:
-        return "expensive"
 
 
 def build_skill_attribution_summary(turns: list[dict]) -> dict | None:
@@ -1477,61 +1376,21 @@ def build_hook_score_events(
 ) -> list[dict]:
     """Build score-create events for the ingestion batch.
 
-    Returns up to 7 events: session_type (CATEGORICAL), token_efficiency (NUMERIC),
-    task_completed (BOOLEAN as int 0/1), cache_hit_rate (NUMERIC),
-    cost_tier (CATEGORICAL), tool_diversity (NUMERIC),
-    compaction_occurred (BOOLEAN as int 0/1).
-
-    cache_hit_rate is omitted when there is no cache activity at all
-    (compute_cache_hit_rate returns None) so it stays distinguishable from
-    a fully-cache-miss session in the dashboard.
+    Emits up to two NUMERIC scores: cache_hit_rate and tool_error_rate. Each is
+    omitted when its classifier returns None (no cache activity / no tool calls)
+    so "absent" stays distinct from a genuine 0.0. Unused params are kept for
+    caller compatibility.
     """
     now = datetime.now(timezone.utc).isoformat()
 
-    session_type = classify_session_type(first_user_input)
-    token_eff = calculate_token_efficiency(turns)
-    completed = classify_task_completed(turns, last_assistant_message)
     cache_hit = compute_cache_hit_rate(turns)
-    cost_tier = classify_cost_tier(total_cost)
+    tool_err = calculate_tool_error_rate(turns)
 
-    scores = [
-        {
-            "name": "session_type",
-            "dataType": "CATEGORICAL",
-            "value": session_type,
-        },
-        {
-            "name": "token_efficiency",
-            "dataType": "NUMERIC",
-            "value": token_eff,
-        },
-        {
-            "name": "task_completed",
-            "dataType": "BOOLEAN",
-            "value": 1 if completed else 0,
-        },
-        {
-            "name": "cost_tier",
-            "dataType": "CATEGORICAL",
-            "value": cost_tier,
-        },
-        {
-            "name": "tool_diversity",
-            "dataType": "NUMERIC",
-            "value": calculate_tool_diversity(turns),
-        },
-        {
-            "name": "compaction_occurred",
-            "dataType": "BOOLEAN",
-            "value": 1 if detect_compaction(transcript_path) else 0,
-        },
-    ]
+    scores = []
     if cache_hit is not None:
-        scores.append({
-            "name": "cache_hit_rate",
-            "dataType": "NUMERIC",
-            "value": cache_hit,
-        })
+        scores.append({"name": "cache_hit_rate", "dataType": "NUMERIC", "value": cache_hit})
+    if tool_err is not None:
+        scores.append({"name": "tool_error_rate", "dataType": "NUMERIC", "value": tool_err})
 
     events = []
     for score in scores:
@@ -1715,6 +1574,8 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 "file_snapshots": file_history_stats if file_history_stats["snapshot_count"] > 0 else None,
                 "stop_hook": stop_hook_stats if stop_hook_stats["total_hook_fires"] > 0 else None,
                 "skill_attribution": skill_attribution,
+                "compaction_occurred": detect_compaction(transcript_path),
+                "total_iterations": sum(t.get("iteration_count", 0) for t in turns),
             },
             "tags": [t for t in [
                 "claude-code",
@@ -1807,6 +1668,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 "request_ids": list(dict.fromkeys(turn.get("request_ids", []))),
                 "web_search_requests": turn.get("web_search_requests", 0),
                 "web_fetch_requests": turn.get("web_fetch_requests", 0),
+                "iteration_count": turn.get("iteration_count", 0),
                 # OpenTelemetry GenAI semantic-convention aliases. Zero behaviour
                 # change for Langfuse, but lets an OTLP collector (or future
                 # Langfuse mapping) consume the trace without a transform step.
@@ -1962,7 +1824,6 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 break
 
     # Hook-level scores (trace-level)
-    cost_tier = classify_cost_tier(cumulative_parent_cost)
     score_events = build_hook_score_events(
         trace_id=trace_id,
         session_id=session_id,
