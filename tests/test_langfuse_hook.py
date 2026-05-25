@@ -3206,3 +3206,36 @@ def test_build_turns_iteration_count_defaults_zero():
     ]
     turns = hook.build_turns(entries)
     assert turns[0]["iteration_count"] == 0
+
+
+def test_process_session_trace_metadata_has_compaction_and_iterations(tmp_path, monkeypatch):
+    import json as _json
+    transcript = tmp_path / "sess.jsonl"
+    lines = [
+        {"type": "user", "timestamp": "2026-05-25T10:00:00Z", "cwd": "/x/repo",
+         "version": "2.1.150", "message": {"role": "user", "content": "add a feature"}},
+        {"type": "assistant", "timestamp": "2026-05-25T10:00:01Z",
+         "message": {"role": "assistant", "id": "m1", "model": "claude-opus-4-7",
+                     "stop_reason": "end_turn",
+                     "content": [{"type": "text", "text": "done"}],
+                     "usage": {"input_tokens": 1, "output_tokens": 2,
+                               "iterations": [{"type": "message"}, {"type": "message"}]}}},
+    ]
+    transcript.write_text("\n".join(_json.dumps(l) for l in lines) + "\n")
+
+    captured = {}
+    def fake_send(batch):
+        captured["batch"] = batch
+        return True
+    monkeypatch.setattr(hook, "send_to_langfuse", fake_send)
+    monkeypatch.setattr(hook, "STATE_DIR", str(tmp_path / "state"))
+
+    hook.process_session("sess", str(transcript), "/x/repo")
+
+    trace = next(e for e in captured["batch"] if e["type"] == "trace-create")
+    meta = trace["body"]["metadata"]
+    assert meta["compaction_occurred"] is False
+    assert meta["total_iterations"] == 2
+
+    gen = next(e for e in captured["batch"] if e["type"] == "generation-create")
+    assert gen["body"]["metadata"]["iteration_count"] == 2

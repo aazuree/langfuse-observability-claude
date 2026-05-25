@@ -1698,6 +1698,8 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 "file_snapshots": file_history_stats if file_history_stats["snapshot_count"] > 0 else None,
                 "stop_hook": stop_hook_stats if stop_hook_stats["total_hook_fires"] > 0 else None,
                 "skill_attribution": skill_attribution,
+                "compaction_occurred": detect_compaction(transcript_path),
+                "total_iterations": sum(t.get("iteration_count", 0) for t in turns),
             },
             "tags": [t for t in [
                 "claude-code",
@@ -1790,6 +1792,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 "request_ids": list(dict.fromkeys(turn.get("request_ids", []))),
                 "web_search_requests": turn.get("web_search_requests", 0),
                 "web_fetch_requests": turn.get("web_fetch_requests", 0),
+                "iteration_count": turn.get("iteration_count", 0),
                 # OpenTelemetry GenAI semantic-convention aliases. Zero behaviour
                 # change for Langfuse, but lets an OTLP collector (or future
                 # Langfuse mapping) consume the trace without a transform step.
@@ -1945,7 +1948,6 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 break
 
     # Hook-level scores (trace-level)
-    cost_tier = classify_cost_tier(cumulative_parent_cost)
     score_events = build_hook_score_events(
         trace_id=trace_id,
         session_id=session_id,
