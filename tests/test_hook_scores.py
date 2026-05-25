@@ -257,83 +257,61 @@ def test_cost_tier_expensive():
 
 # --- build_hook_score_events ---
 
-def test_build_hook_score_events_omits_cache_hit_when_no_activity():
-    """No cache activity → cache_hit_rate omitted (distinct from cache-miss)."""
+def test_build_hook_score_events_omits_both_when_no_activity():
+    """No cache activity and no tool calls -> zero score events."""
     events = hook.build_hook_score_events(
         trace_id="trace-abc",
         session_id="abc",
         first_user_input="fix the login bug",
         turns=[{"usage": {"input": 100, "output": 200, "total": 300,
-                           "cache_read": 0, "cache_creation": 0},
-                "assistant_output": "Done, fixed the bug.",
-                "tool_calls": []}],
-        total_cost=0.05,
-    )
-    assert len(events) == 6
-    names = {e["body"]["name"] for e in events}
-    assert names == {"session_type", "token_efficiency", "task_completed", "cost_tier", "tool_diversity", "compaction_occurred"}
-    assert "cache_hit_rate" not in names
-
-
-def test_build_hook_score_events_includes_cache_hit_when_active():
-    """With cache activity, all 7 scores emitted."""
-    events = hook.build_hook_score_events(
-        trace_id="trace-abc",
-        session_id="abc",
-        first_user_input="fix the login bug",
-        turns=[{"usage": {"input": 100, "output": 200, "total": 300,
-                           "cache_read": 500, "cache_creation": 500},
+                          "cache_read": 0, "cache_creation": 0},
                 "assistant_output": "Done.",
                 "tool_calls": []}],
         total_cost=0.05,
     )
-    assert len(events) == 7
+    assert events == []
+
+
+def test_build_hook_score_events_cache_hit_only():
+    """Cache activity but no tool calls -> only cache_hit_rate."""
+    events = hook.build_hook_score_events(
+        trace_id="trace-abc",
+        session_id="abc",
+        first_user_input="fix the login bug",
+        turns=[{"usage": {"input": 100, "output": 200, "total": 300,
+                          "cache_read": 500, "cache_creation": 500},
+                "assistant_output": "Done.",
+                "tool_calls": []}],
+        total_cost=0.05,
+    )
     names = {e["body"]["name"] for e in events}
-    assert "cache_hit_rate" in names
+    assert names == {"cache_hit_rate"}
 
 
-def test_build_hook_score_events_types():
-    """Verify data types and values for each score."""
+def test_build_hook_score_events_both_scores():
+    """Cache activity + tool calls -> both scores, correct types/values."""
     events = hook.build_hook_score_events(
         trace_id="trace-xyz",
         session_id="xyz",
-                first_user_input="explain the auth module",
+        first_user_input="explain the auth module",
         turns=[{"usage": {"input": 500, "output": 500, "total": 1000,
-                           "cache_read": 2000, "cache_creation": 3000},
+                          "cache_read": 2000, "cache_creation": 3000},
                 "assistant_output": "The auth module works by...",
-                "tool_calls": []}],
+                "tool_calls": [{"output": "[ERROR] x"}, {"output": "ok"}]}],
         total_cost=0.50,
     )
     by_name = {e["body"]["name"]: e for e in events}
+    assert set(by_name) == {"cache_hit_rate", "tool_error_rate"}
 
-    # session_type
-    st = by_name["session_type"]
-    assert st["type"] == "score-create"
-    assert st["body"]["dataType"] == "CATEGORICAL"
-    assert st["body"]["value"] == "research"
-    assert st["body"]["traceId"] == "trace-xyz"
-
-    # token_efficiency
-    # output / (output + input + cache_read + cache_creation)
-    # = 500 / (500 + 500 + 2000 + 3000) = 500/6000 = 0.0833
-    te = by_name["token_efficiency"]
-    assert te["body"]["dataType"] == "NUMERIC"
-    assert te["body"]["value"] == 0.0833
-
-    # task_completed
-    tc = by_name["task_completed"]
-    assert tc["body"]["dataType"] == "BOOLEAN"
-    assert tc["body"]["value"] == 1  # True -> 1
-
-    # cache_hit_rate
     chr = by_name["cache_hit_rate"]
+    assert chr["type"] == "score-create"
     assert chr["body"]["dataType"] == "NUMERIC"
     assert chr["body"]["value"] == 0.4  # 2000 / (2000 + 3000)
+    assert chr["body"]["traceId"] == "trace-xyz"
 
-    # cost_tier
-    ct = by_name["cost_tier"]
-    assert ct["body"]["dataType"] == "CATEGORICAL"
-    assert ct["body"]["value"] == "moderate"
+    ter = by_name["tool_error_rate"]
+    assert ter["body"]["dataType"] == "NUMERIC"
+    assert ter["body"]["value"] == 0.5  # 1 error / 2 calls
 
 
 def test_build_hook_score_events_deterministic_ids():
@@ -367,22 +345,6 @@ def test_build_hook_score_events_stable_ids_across_turns():
     events_turn1 = hook.build_hook_score_events(**base)
     events_turn3 = hook.build_hook_score_events(**base)
     assert [e["id"] for e in events_turn1] == [e["id"] for e in events_turn3]
-
-
-def test_build_hook_score_events_task_completed_false():
-    """task_completed should be 0 (False) when last turn has failure."""
-    events = hook.build_hook_score_events(
-        trace_id="trace-fail",
-        session_id="fail",
-                first_user_input="fix the bug",
-        turns=[{"usage": {"input": 100, "output": 100, "total": 200,
-                           "cache_read": 0, "cache_creation": 0},
-                "assistant_output": "I encountered an error and couldn't complete the task.",
-                "tool_calls": []}],
-        total_cost=0.02,
-    )
-    by_name = {e["body"]["name"]: e for e in events}
-    assert by_name["task_completed"]["body"]["value"] == 0  # False -> 0
 
 
 # --- calculate_tool_error_rate ---

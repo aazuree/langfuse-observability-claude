@@ -1500,61 +1500,21 @@ def build_hook_score_events(
 ) -> list[dict]:
     """Build score-create events for the ingestion batch.
 
-    Returns up to 7 events: session_type (CATEGORICAL), token_efficiency (NUMERIC),
-    task_completed (BOOLEAN as int 0/1), cache_hit_rate (NUMERIC),
-    cost_tier (CATEGORICAL), tool_diversity (NUMERIC),
-    compaction_occurred (BOOLEAN as int 0/1).
-
-    cache_hit_rate is omitted when there is no cache activity at all
-    (compute_cache_hit_rate returns None) so it stays distinguishable from
-    a fully-cache-miss session in the dashboard.
+    Emits up to two NUMERIC scores: cache_hit_rate and tool_error_rate. Each is
+    omitted when its classifier returns None (no cache activity / no tool calls)
+    so "absent" stays distinct from a genuine 0.0. Unused params are kept for
+    caller compatibility.
     """
     now = datetime.now(timezone.utc).isoformat()
 
-    session_type = classify_session_type(first_user_input)
-    token_eff = calculate_token_efficiency(turns)
-    completed = classify_task_completed(turns, last_assistant_message)
     cache_hit = compute_cache_hit_rate(turns)
-    cost_tier = classify_cost_tier(total_cost)
+    tool_err = calculate_tool_error_rate(turns)
 
-    scores = [
-        {
-            "name": "session_type",
-            "dataType": "CATEGORICAL",
-            "value": session_type,
-        },
-        {
-            "name": "token_efficiency",
-            "dataType": "NUMERIC",
-            "value": token_eff,
-        },
-        {
-            "name": "task_completed",
-            "dataType": "BOOLEAN",
-            "value": 1 if completed else 0,
-        },
-        {
-            "name": "cost_tier",
-            "dataType": "CATEGORICAL",
-            "value": cost_tier,
-        },
-        {
-            "name": "tool_diversity",
-            "dataType": "NUMERIC",
-            "value": calculate_tool_diversity(turns),
-        },
-        {
-            "name": "compaction_occurred",
-            "dataType": "BOOLEAN",
-            "value": 1 if detect_compaction(transcript_path) else 0,
-        },
-    ]
+    scores = []
     if cache_hit is not None:
-        scores.append({
-            "name": "cache_hit_rate",
-            "dataType": "NUMERIC",
-            "value": cache_hit,
-        })
+        scores.append({"name": "cache_hit_rate", "dataType": "NUMERIC", "value": cache_hit})
+    if tool_err is not None:
+        scores.append({"name": "tool_error_rate", "dataType": "NUMERIC", "value": tool_err})
 
     events = []
     for score in scores:
