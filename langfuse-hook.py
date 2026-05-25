@@ -935,6 +935,7 @@ def build_turns(entries: list[dict]) -> list[dict]:
         web_fetch_requests = 0
         cache_ephemeral_5m = 0
         cache_ephemeral_1h = 0
+        iteration_count = 0
         for mid in turn["api_call_ids"]:
             u = msg_id_final_usage.get(mid, {})
             inp = u.get("input_tokens", 0)
@@ -959,6 +960,7 @@ def build_turns(entries: list[dict]) -> list[dict]:
             cc = u.get("cache_creation", {})
             cache_ephemeral_5m += cc.get("ephemeral_5m_input_tokens", 0)
             cache_ephemeral_1h += cc.get("ephemeral_1h_input_tokens", 0)
+            iteration_count += len(u.get("iterations", []) or [])
         # Collect request_ids from messages in this turn
         request_ids = [
             me.get("request_id")
@@ -973,6 +975,7 @@ def build_turns(entries: list[dict]) -> list[dict]:
         turn["web_fetch_requests"] = web_fetch_requests
         turn["cache_ephemeral_5m"] = cache_ephemeral_5m
         turn["cache_ephemeral_1h"] = cache_ephemeral_1h
+        turn["iteration_count"] = iteration_count
         turn["request_ids"] = request_ids
         turn["api_call_ids"] = list(turn["api_call_ids"])  # make serializable
         turn["attribution_skills_all"] = sorted(turn["attribution_skills_all"])

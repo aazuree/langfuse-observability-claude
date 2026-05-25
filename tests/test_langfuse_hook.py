@@ -3171,3 +3171,33 @@ class TestTraceAttributionAssembly:
         tags = hook.build_attribution_tags(summary)
         assert "skill:_unattributed" not in tags
         assert tags == ["skill:x"]
+
+
+def test_build_turns_sums_iteration_count():
+    entries = [
+        {"type": "user", "timestamp": "2026-05-25T10:00:00Z",
+         "message": {"role": "user", "content": "hi"}},
+        {"type": "assistant", "timestamp": "2026-05-25T10:00:01Z",
+         "message": {"role": "assistant", "id": "m1",
+                     "model": "claude-opus-4-7",
+                     "content": [{"type": "text", "text": "hello"}],
+                     "usage": {"input_tokens": 1, "output_tokens": 2,
+                               "iterations": [{"type": "message"},
+                                              {"type": "message"}]}}},
+    ]
+    turns = hook.build_turns(entries)
+    assert turns[0]["iteration_count"] == 2
+
+
+def test_build_turns_iteration_count_defaults_zero():
+    entries = [
+        {"type": "user", "timestamp": "2026-05-25T10:00:00Z",
+         "message": {"role": "user", "content": "hi"}},
+        {"type": "assistant", "timestamp": "2026-05-25T10:00:01Z",
+         "message": {"role": "assistant", "id": "m1",
+                     "model": "claude-opus-4-7",
+                     "content": [{"type": "text", "text": "hello"}],
+                     "usage": {"input_tokens": 1, "output_tokens": 2}}},
+    ]
+    turns = hook.build_turns(entries)
+    assert turns[0]["iteration_count"] == 0
