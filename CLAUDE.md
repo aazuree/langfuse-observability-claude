@@ -144,6 +144,11 @@ Set `REPORT_API_EQUIVALENT_COST = False` in `langfuse-hook.py` to report $0.
 
 ## Tags and Metadata
 
+> Transcript-field coverage verified against Claude Code **v2.1.156** (2026-05-29).
+> Note: `effort.level`, `agent_id`/`parent_agent_id`, and skill `invocation_trigger` are
+> OTel-span / hook-stdin fields, **not** transcript JSONL — unreachable by this hook's
+> transcript parsing. effort is captured via the `$CLAUDE_EFFORT` env var instead.
+
 Each trace is enriched with:
 
 **Tags** (filterable in Langfuse UI):
@@ -157,6 +162,7 @@ Each trace is enriched with:
 - `pr:<N>` — one tag per PR linked from the session (via `pr-link` transcript entries)
 - `agent-name:{slug}` — present when `type: "agent-name"` entry exists (e.g., `agent-name:langfuse-usagedetails-fix`)
 - `session-kind:{bg|fg}` — background job vs interactive foreground session (from `sessionKind` field on transcript entries; defaults to `fg` when absent on older transcripts)
+- `effort:<level>` — active effort level at Stop-fire time (`low`/`medium`/`high`/`max`), from `$CLAUDE_EFFORT`. Live fires only (absent on reprocessed sessions)
 - `skill:<slug>` — one per distinct `attributionSkill` observed in the session (e.g., `skill:superpowers:brainstorming`)
 - `plugin:<name>` — one per distinct `attributionPlugin` observed (e.g., `plugin:superpowers`)
 
@@ -192,6 +198,8 @@ via Langfuse's upsert-on-id behaviour.
 - `skill_attribution` — per-session rollup from `attributionSkill`/`attributionPlugin` on assistant entries: `{skills_used, plugins_used, top_skill, skill_turn_counts, skill_cost_breakdown}`. `skill_cost_breakdown[<skill>]` = `{turns, input_tokens, output_tokens, cache_read_tokens, cache_create_tokens, cost_usd}`. Turns lacking attribution go to a `_unattributed` bucket inside the breakdown and are excluded from `skills_used`/`top_skill`. Null when no attribution data in session.
 - `compaction_occurred` — `true`/`false`; whether the session was context-compacted (from `type: "summary"` or a `system`/`compact*` subtype entry). Demoted from a score to metadata.
 - `total_iterations` — sum of per-turn `iteration_count` across the session (server-side agentic-loop iterations from `usage.iterations`).
+- `cache_miss` — session rollup of cache misses from `message.diagnostics.cache_miss_reason`: `{total_missed_tokens, by_reason: {<type>: count}, turns_with_miss}`. Explains *why* `cache_hit_rate` is low and how many input tokens were re-sent (e.g. `tools_changed`). Null when no turn missed cache.
+- `effort_level` — active effort level (`low`/`medium`/`high`/`max`) read from `$CLAUDE_EFFORT` at Stop-fire time. Session-level, last-observed. Live fires only; null on reprocessed sessions.
 
 Extracted from the first `type: "user"` entry in the JSONL transcript via `extract_session_metadata()`.
 API errors extracted from `type: "system"` / `subtype: "api_error"` entries via `extract_api_errors()`.
@@ -209,6 +217,9 @@ and away summaries are extracted via `extract_custom_title()`, `extract_ai_title
 - `attribution_skill`, `attribution_plugin` — primary skill / plugin for the turn (first non-empty observed)
 - `attribution_skills_all` — list of all distinct skills observed in the turn (only emitted when more than one)
 - `iteration_count` — number of server-side iterations in the turn (length of `usage.iterations`; 0 when absent).
+- `cache_miss_reason` — dominant cache-miss reason type for the turn (e.g. `tools_changed`), from `message.diagnostics`. Omitted when the turn had no cache miss.
+- `cache_missed_tokens` — total input tokens that missed cache in the turn. Omitted when no miss.
+- `cache_miss_by_reason` — `{<type>: count}` tally of miss reasons in the turn. Omitted when no miss.
 
 **OpenTelemetry GenAI semantic-convention aliases** (also on each generation):
 The hook emits standard `gen_ai.*` attributes so an OTLP collector or future

@@ -795,6 +795,7 @@ def build_turns(entries: list[dict]) -> list[dict]:
                 "usage": msg.get("usage", {}),
                 "request_id": entry.get("requestId", ""),
                 "stop_reason": msg.get("stop_reason", ""),
+                "diagnostics": msg.get("diagnostics", {}) if etype == "assistant" else {},
                 "attribution_skill": entry.get("attributionSkill", "") if etype == "assistant" else "",
                 "attribution_plugin": entry.get("attributionPlugin", "") if etype == "assistant" else "",
             })
@@ -817,6 +818,7 @@ def build_turns(entries: list[dict]) -> list[dict]:
     # The first entry with a message_id gives us the first-token time.
     msg_id_first_ts = {}  # message_id -> first timestamp seen
     msg_id_final_usage = {}  # message_id -> final usage dict
+    msg_id_diagnostics = {}  # message_id -> diagnostics dict
 
     for me in msg_entries:
         if me["role"] != "assistant" or not me["message_id"]:
@@ -827,6 +829,8 @@ def build_turns(entries: list[dict]) -> list[dict]:
         # All entries for a given message_id carry identical usage since v2.1.97; first is fine
         if me["usage"] and mid not in msg_id_final_usage:
             msg_id_final_usage[mid] = me["usage"]
+        if me["diagnostics"] and mid not in msg_id_diagnostics:
+            msg_id_diagnostics[mid] = me["diagnostics"]
 
     # Build turns
     turns = []
@@ -932,6 +936,8 @@ def build_turns(entries: list[dict]) -> list[dict]:
         cache_ephemeral_5m = 0
         cache_ephemeral_1h = 0
         iteration_count = 0
+        cm_missed_tokens = 0
+        cm_by_reason = {}
         for mid in turn["api_call_ids"]:
             u = msg_id_final_usage.get(mid, {})
             inp = u.get("input_tokens", 0)
@@ -957,6 +963,12 @@ def build_turns(entries: list[dict]) -> list[dict]:
             cache_ephemeral_5m += cc.get("ephemeral_5m_input_tokens", 0)
             cache_ephemeral_1h += cc.get("ephemeral_1h_input_tokens", 0)
             iteration_count += len(u.get("iterations", []) or [])
+            cmr = msg_id_diagnostics.get(mid, {}).get("cache_miss_reason")
+            if isinstance(cmr, dict):
+                cm_missed_tokens += cmr.get("cache_missed_input_tokens", 0) or 0
+                rtype = cmr.get("type")
+                if rtype:
+                    cm_by_reason[rtype] = cm_by_reason.get(rtype, 0) + 1
         # Collect request_ids from messages in this turn
         request_ids = [
             me.get("request_id")
@@ -972,6 +984,10 @@ def build_turns(entries: list[dict]) -> list[dict]:
         turn["cache_ephemeral_5m"] = cache_ephemeral_5m
         turn["cache_ephemeral_1h"] = cache_ephemeral_1h
         turn["iteration_count"] = iteration_count
+        turn["cache_miss"] = (
+            {"missed_tokens": cm_missed_tokens, "by_reason": cm_by_reason}
+            if cm_by_reason else None
+        )
         turn["request_ids"] = request_ids
         turn["api_call_ids"] = list(turn["api_call_ids"])  # make serializable
         turn["attribution_skills_all"] = sorted(turn["attribution_skills_all"])
@@ -1350,6 +1366,28 @@ def build_skill_attribution_summary(turns: list[dict]) -> dict | None:
     }
 
 
+def build_cache_miss_summary(turns: list[dict]) -> dict | None:
+    """Session rollup of per-turn cache misses; None when no turn missed cache."""
+    total = 0
+    by_reason = {}
+    turns_with_miss = 0
+    for t in turns:
+        cm = t.get("cache_miss")
+        if not cm:
+            continue
+        turns_with_miss += 1
+        total += cm["missed_tokens"]
+        for r, c in cm["by_reason"].items():
+            by_reason[r] = by_reason.get(r, 0) + c
+    if turns_with_miss == 0:
+        return None
+    return {
+        "total_missed_tokens": total,
+        "by_reason": by_reason,
+        "turns_with_miss": turns_with_miss,
+    }
+
+
 def build_attribution_tags(summary: dict | None) -> list[str]:
     """Trace tags for skill / plugin attribution. Sorted, deduplicated; never
     includes the '_unattributed' breakdown bucket."""
@@ -1432,8 +1470,26 @@ def gen_metadata_attribution(turn: dict) -> dict:
     return out
 
 
-def process_session(session_id: str, transcript_path: str, cwd: str, last_assistant_message: str = "") -> None:
+def gen_metadata_cache_miss(turn: dict) -> dict:
+    """Per-generation cache-miss metadata; empty dict when no miss in the turn."""
+    cm = turn.get("cache_miss")
+    if not cm:
+        return {}
+    by = cm["by_reason"]
+    dominant = max(by, key=by.get) if by else None
+    return {
+        "cache_miss_reason": dominant,
+        "cache_missed_tokens": cm["missed_tokens"],
+        "cache_miss_by_reason": by,
+    }
+
+
+def process_session(session_id: str, transcript_path: str, cwd: str, last_assistant_message: str = "", live: bool = True) -> None:
     """Core processing logic for a single session transcript."""
+    # effort comes from the live hook process environment ($CLAUDE_EFFORT,
+    # v2.1.133+). It is NOT in the transcript, so it cannot be recovered on
+    # reprocess; omit it then so Langfuse's upsert preserves any prior value.
+    effort = os.environ.get("CLAUDE_EFFORT", "").strip() if live else ""
     prev_line_offset, prev_turn_count = load_state(session_id)
     custom_title = extract_custom_title(transcript_path)
     permission_mode = extract_permission_mode(transcript_path)
@@ -1576,6 +1632,8 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 "skill_attribution": skill_attribution,
                 "compaction_occurred": detect_compaction(transcript_path),
                 "total_iterations": sum(t.get("iteration_count", 0) for t in turns),
+                "cache_miss": build_cache_miss_summary(turns),
+                "effort_level": effort or None,
             },
             "tags": [t for t in [
                 "claude-code",
@@ -1587,6 +1645,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 f"permission:{permission_mode}" if permission_mode else None,
                 f"agent-name:{agent_name}" if agent_name else None,
                 f"session-kind:{session_kind}" if session_kind else None,
+                f"effort:{effort}" if effort else None,
                 *attribution_tags,
                 *pr_tags,
             ] if t],
@@ -1681,6 +1740,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                     stop_reason=turn.get("stop_reason", ""),
                 ),
                 **gen_metadata_attribution(turn),
+                **gen_metadata_cache_miss(turn),
             },
         }
 
@@ -1904,7 +1964,7 @@ def reprocess_all() -> None:
         print(f"[{idx}/{total}] {label}")
 
         try:
-            process_session(session_id, str(transcript), cwd)
+            process_session(session_id, str(transcript), cwd, live=False)
         except (IOError, OSError, json.JSONDecodeError, ValueError) as e:
             # Broad exception from process_session (file I/O, JSON, parsing errors)
             print(f"  Error: {e}")
