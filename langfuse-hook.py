@@ -795,6 +795,7 @@ def build_turns(entries: list[dict]) -> list[dict]:
                 "usage": msg.get("usage", {}),
                 "request_id": entry.get("requestId", ""),
                 "stop_reason": msg.get("stop_reason", ""),
+                "diagnostics": msg.get("diagnostics", {}) if etype == "assistant" else {},
                 "attribution_skill": entry.get("attributionSkill", "") if etype == "assistant" else "",
                 "attribution_plugin": entry.get("attributionPlugin", "") if etype == "assistant" else "",
             })
@@ -817,6 +818,7 @@ def build_turns(entries: list[dict]) -> list[dict]:
     # The first entry with a message_id gives us the first-token time.
     msg_id_first_ts = {}  # message_id -> first timestamp seen
     msg_id_final_usage = {}  # message_id -> final usage dict
+    msg_id_diagnostics = {}  # message_id -> diagnostics dict
 
     for me in msg_entries:
         if me["role"] != "assistant" or not me["message_id"]:
@@ -827,6 +829,8 @@ def build_turns(entries: list[dict]) -> list[dict]:
         # All entries for a given message_id carry identical usage since v2.1.97; first is fine
         if me["usage"] and mid not in msg_id_final_usage:
             msg_id_final_usage[mid] = me["usage"]
+        if me["diagnostics"] and mid not in msg_id_diagnostics:
+            msg_id_diagnostics[mid] = me["diagnostics"]
 
     # Build turns
     turns = []
@@ -932,6 +936,8 @@ def build_turns(entries: list[dict]) -> list[dict]:
         cache_ephemeral_5m = 0
         cache_ephemeral_1h = 0
         iteration_count = 0
+        cm_missed_tokens = 0
+        cm_by_reason = {}
         for mid in turn["api_call_ids"]:
             u = msg_id_final_usage.get(mid, {})
             inp = u.get("input_tokens", 0)
@@ -957,6 +963,12 @@ def build_turns(entries: list[dict]) -> list[dict]:
             cache_ephemeral_5m += cc.get("ephemeral_5m_input_tokens", 0)
             cache_ephemeral_1h += cc.get("ephemeral_1h_input_tokens", 0)
             iteration_count += len(u.get("iterations", []) or [])
+            cmr = msg_id_diagnostics.get(mid, {}).get("cache_miss_reason")
+            if isinstance(cmr, dict):
+                cm_missed_tokens += cmr.get("cache_missed_input_tokens", 0) or 0
+                rtype = cmr.get("type")
+                if rtype:
+                    cm_by_reason[rtype] = cm_by_reason.get(rtype, 0) + 1
         # Collect request_ids from messages in this turn
         request_ids = [
             me.get("request_id")
@@ -972,6 +984,10 @@ def build_turns(entries: list[dict]) -> list[dict]:
         turn["cache_ephemeral_5m"] = cache_ephemeral_5m
         turn["cache_ephemeral_1h"] = cache_ephemeral_1h
         turn["iteration_count"] = iteration_count
+        turn["cache_miss"] = (
+            {"missed_tokens": cm_missed_tokens, "by_reason": cm_by_reason}
+            if cm_by_reason else None
+        )
         turn["request_ids"] = request_ids
         turn["api_call_ids"] = list(turn["api_call_ids"])  # make serializable
         turn["attribution_skills_all"] = sorted(turn["attribution_skills_all"])

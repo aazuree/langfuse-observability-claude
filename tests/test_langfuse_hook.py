@@ -3204,3 +3204,74 @@ def test_process_session_trace_metadata_has_compaction_and_iterations(tmp_path, 
 
     gen = next(e for e in captured["batch"] if e["type"] == "generation-create")
     assert gen["body"]["metadata"]["iteration_count"] == 2
+
+
+class TestCacheMissExtraction:
+    def _entries(self, *, diag, second_diag=None):
+        msgs = [
+            {
+                "type": "user",
+                "timestamp": "2026-05-29T10:00:00+00:00",
+                "message": {"role": "user", "content": "Hi"},
+            },
+            {
+                "type": "assistant",
+                "timestamp": "2026-05-29T10:00:01+00:00",
+                "message": {
+                    "id": "msg-1", "role": "assistant",
+                    "model": "claude-opus-4-6",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "usage": {"input_tokens": 1, "output_tokens": 1,
+                              "cache_read_input_tokens": 0,
+                              "cache_creation_input_tokens": 0},
+                    **({"diagnostics": diag} if diag is not None else {}),
+                },
+            },
+        ]
+        if second_diag is not None:
+            msgs.append({
+                "type": "assistant",
+                "timestamp": "2026-05-29T10:00:02+00:00",
+                "message": {
+                    "id": "msg-2", "role": "assistant",
+                    "model": "claude-opus-4-6",
+                    "content": [{"type": "text", "text": "more"}],
+                    "usage": {"input_tokens": 1, "output_tokens": 1,
+                              "cache_read_input_tokens": 0,
+                              "cache_creation_input_tokens": 0},
+                    "diagnostics": second_diag,
+                },
+            })
+        return msgs
+
+    def test_no_diagnostics_yields_none(self):
+        turns = hook.build_turns(self._entries(diag=None))
+        assert turns[0]["cache_miss"] is None
+
+    def test_diagnostics_without_cache_miss_yields_none(self):
+        turns = hook.build_turns(self._entries(diag={"other": 1}))
+        assert turns[0]["cache_miss"] is None
+
+    def test_single_cache_miss_captured(self):
+        diag = {"cache_miss_reason": {"type": "tools_changed",
+                                      "cache_missed_input_tokens": 21333}}
+        turns = hook.build_turns(self._entries(diag=diag))
+        assert turns[0]["cache_miss"] == {
+            "missed_tokens": 21333,
+            "by_reason": {"tools_changed": 1},
+        }
+
+    def test_multiple_misses_sum_and_tally(self):
+        diag = {"cache_miss_reason": {"type": "tools_changed",
+                                      "cache_missed_input_tokens": 100}}
+        diag2 = {"cache_miss_reason": {"type": "prompt_changed",
+                                       "cache_missed_input_tokens": 50}}
+        turns = hook.build_turns(self._entries(diag=diag, second_diag=diag2))
+        assert turns[0]["cache_miss"] == {
+            "missed_tokens": 150,
+            "by_reason": {"tools_changed": 1, "prompt_changed": 1},
+        }
+
+    def test_malformed_cache_miss_reason_ignored(self):
+        turns = hook.build_turns(self._entries(diag={"cache_miss_reason": "oops"}))
+        assert turns[0]["cache_miss"] is None
