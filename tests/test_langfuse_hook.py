@@ -3314,3 +3314,50 @@ class TestCacheMissSummary:
             "by_reason": {"tools_changed": 2, "prompt_changed": 2},
             "turns_with_miss": 2,
         }
+
+
+class TestEffortCapture:
+    def _capture_trace(self, monkeypatch, tmp_path, *, live, effort):
+        import json as _json
+        transcript = tmp_path / "sess.jsonl"
+        rows = [
+            {"type": "user", "timestamp": "2026-05-29T10:00:00+00:00",
+             "cwd": str(tmp_path), "version": "2.1.156", "gitBranch": "main",
+             "entrypoint": "cli", "message": {"role": "user", "content": "Hi"}},
+            {"type": "assistant", "timestamp": "2026-05-29T10:00:01+00:00",
+             "message": {"id": "m1", "role": "assistant", "model": "claude-opus-4-6",
+                         "stop_reason": "end_turn",
+                         "content": [{"type": "text", "text": "ok"}],
+                         "usage": {"input_tokens": 1, "output_tokens": 1,
+                                   "cache_read_input_tokens": 0,
+                                   "cache_creation_input_tokens": 0}}},
+        ]
+        transcript.write_text("\n".join(_json.dumps(r) for r in rows) + "\n")
+
+        captured = {}
+        def fake_send(batch):
+            captured["batch"] = batch
+            return True
+        monkeypatch.setattr(hook, "send_to_langfuse", fake_send)
+        monkeypatch.setattr(hook, "STATE_DIR", str(tmp_path / "state"))
+        if effort is None:
+            monkeypatch.delenv("CLAUDE_EFFORT", raising=False)
+        else:
+            monkeypatch.setenv("CLAUDE_EFFORT", effort)
+        hook.process_session("s1", str(transcript), str(tmp_path), live=live)
+        return next(e["body"] for e in captured["batch"] if e["type"] == "trace-create")
+
+    def test_effort_tag_and_metadata_when_live(self, monkeypatch, tmp_path):
+        trace = self._capture_trace(monkeypatch, tmp_path, live=True, effort="high")
+        assert "effort:high" in trace["tags"]
+        assert trace["metadata"]["effort_level"] == "high"
+
+    def test_no_effort_when_env_absent(self, monkeypatch, tmp_path):
+        trace = self._capture_trace(monkeypatch, tmp_path, live=True, effort=None)
+        assert not any(t.startswith("effort:") for t in trace["tags"])
+        assert trace["metadata"].get("effort_level") is None
+
+    def test_no_effort_on_reprocess(self, monkeypatch, tmp_path):
+        trace = self._capture_trace(monkeypatch, tmp_path, live=False, effort="high")
+        assert not any(t.startswith("effort:") for t in trace["tags"])
+        assert trace["metadata"].get("effort_level") is None

@@ -1484,8 +1484,12 @@ def gen_metadata_cache_miss(turn: dict) -> dict:
     }
 
 
-def process_session(session_id: str, transcript_path: str, cwd: str, last_assistant_message: str = "") -> None:
+def process_session(session_id: str, transcript_path: str, cwd: str, last_assistant_message: str = "", live: bool = True) -> None:
     """Core processing logic for a single session transcript."""
+    # effort comes from the live hook process environment ($CLAUDE_EFFORT,
+    # v2.1.133+). It is NOT in the transcript, so it cannot be recovered on
+    # reprocess; omit it then so Langfuse's upsert preserves any prior value.
+    effort = os.environ.get("CLAUDE_EFFORT", "").strip() if live else ""
     prev_line_offset, prev_turn_count = load_state(session_id)
     custom_title = extract_custom_title(transcript_path)
     permission_mode = extract_permission_mode(transcript_path)
@@ -1629,6 +1633,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 "compaction_occurred": detect_compaction(transcript_path),
                 "total_iterations": sum(t.get("iteration_count", 0) for t in turns),
                 "cache_miss": build_cache_miss_summary(turns),
+                "effort_level": effort or None,
             },
             "tags": [t for t in [
                 "claude-code",
@@ -1640,6 +1645,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 f"permission:{permission_mode}" if permission_mode else None,
                 f"agent-name:{agent_name}" if agent_name else None,
                 f"session-kind:{session_kind}" if session_kind else None,
+                f"effort:{effort}" if effort else None,
                 *attribution_tags,
                 *pr_tags,
             ] if t],
@@ -1958,7 +1964,7 @@ def reprocess_all() -> None:
         print(f"[{idx}/{total}] {label}")
 
         try:
-            process_session(session_id, str(transcript), cwd)
+            process_session(session_id, str(transcript), cwd, live=False)
         except (IOError, OSError, json.JSONDecodeError, ValueError) as e:
             # Broad exception from process_session (file I/O, JSON, parsing errors)
             print(f"  Error: {e}")
