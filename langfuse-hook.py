@@ -1366,6 +1366,28 @@ def build_skill_attribution_summary(turns: list[dict]) -> dict | None:
     }
 
 
+def build_cache_miss_summary(turns: list[dict]) -> dict | None:
+    """Session rollup of per-turn cache misses; None when no turn missed cache."""
+    total = 0
+    by_reason = {}
+    turns_with_miss = 0
+    for t in turns:
+        cm = t.get("cache_miss")
+        if not cm:
+            continue
+        turns_with_miss += 1
+        total += cm["missed_tokens"]
+        for r, c in cm["by_reason"].items():
+            by_reason[r] = by_reason.get(r, 0) + c
+    if turns_with_miss == 0:
+        return None
+    return {
+        "total_missed_tokens": total,
+        "by_reason": by_reason,
+        "turns_with_miss": turns_with_miss,
+    }
+
+
 def build_attribution_tags(summary: dict | None) -> list[str]:
     """Trace tags for skill / plugin attribution. Sorted, deduplicated; never
     includes the '_unattributed' breakdown bucket."""
@@ -1606,6 +1628,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 "skill_attribution": skill_attribution,
                 "compaction_occurred": detect_compaction(transcript_path),
                 "total_iterations": sum(t.get("iteration_count", 0) for t in turns),
+                "cache_miss": build_cache_miss_summary(turns),
             },
             "tags": [t for t in [
                 "claude-code",

@@ -3292,3 +3292,25 @@ class TestGenMetadataCacheMiss:
             "cache_missed_tokens": 150,
             "cache_miss_by_reason": {"tools_changed": 3, "prompt_changed": 1},
         }
+
+
+class TestCacheMissSummary:
+    def test_none_when_no_misses(self):
+        turns = [{"cache_miss": None}, {"cache_miss": None}]
+        assert hook.build_cache_miss_summary(turns) is None
+
+    def test_none_for_empty_turns(self):
+        assert hook.build_cache_miss_summary([]) is None
+
+    def test_rolls_up_totals_and_reasons(self):
+        turns = [
+            {"cache_miss": {"missed_tokens": 100, "by_reason": {"tools_changed": 1}}},
+            {"cache_miss": None},
+            {"cache_miss": {"missed_tokens": 50,
+                            "by_reason": {"tools_changed": 1, "prompt_changed": 2}}},
+        ]
+        assert hook.build_cache_miss_summary(turns) == {
+            "total_missed_tokens": 150,
+            "by_reason": {"tools_changed": 2, "prompt_changed": 2},
+            "turns_with_miss": 2,
+        }
