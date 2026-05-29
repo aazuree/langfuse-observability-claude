@@ -3275,3 +3275,20 @@ class TestCacheMissExtraction:
     def test_malformed_cache_miss_reason_ignored(self):
         turns = hook.build_turns(self._entries(diag={"cache_miss_reason": "oops"}))
         assert turns[0]["cache_miss"] is None
+
+
+class TestGenMetadataCacheMiss:
+    def test_empty_when_no_cache_miss(self):
+        assert hook.gen_metadata_cache_miss({"cache_miss": None}) == {}
+
+    def test_empty_when_key_absent(self):
+        assert hook.gen_metadata_cache_miss({}) == {}
+
+    def test_emits_dominant_reason_and_tokens(self):
+        turn = {"cache_miss": {"missed_tokens": 150,
+                               "by_reason": {"tools_changed": 3, "prompt_changed": 1}}}
+        assert hook.gen_metadata_cache_miss(turn) == {
+            "cache_miss_reason": "tools_changed",
+            "cache_missed_tokens": 150,
+            "cache_miss_by_reason": {"tools_changed": 3, "prompt_changed": 1},
+        }

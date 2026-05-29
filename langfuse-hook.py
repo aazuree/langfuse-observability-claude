@@ -1448,6 +1448,20 @@ def gen_metadata_attribution(turn: dict) -> dict:
     return out
 
 
+def gen_metadata_cache_miss(turn: dict) -> dict:
+    """Per-generation cache-miss metadata; empty dict when no miss in the turn."""
+    cm = turn.get("cache_miss")
+    if not cm:
+        return {}
+    by = cm["by_reason"]
+    dominant = max(by, key=by.get) if by else None
+    return {
+        "cache_miss_reason": dominant,
+        "cache_missed_tokens": cm["missed_tokens"],
+        "cache_miss_by_reason": by,
+    }
+
+
 def process_session(session_id: str, transcript_path: str, cwd: str, last_assistant_message: str = "") -> None:
     """Core processing logic for a single session transcript."""
     prev_line_offset, prev_turn_count = load_state(session_id)
@@ -1697,6 +1711,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                     stop_reason=turn.get("stop_reason", ""),
                 ),
                 **gen_metadata_attribution(turn),
+                **gen_metadata_cache_miss(turn),
             },
         }
 
