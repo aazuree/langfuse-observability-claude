@@ -1061,6 +1061,8 @@ class TestCalculateTurnCost:
 
     @pytest.mark.parametrize("model,expected_input,expected_output", [
         # Current models
+        ("claude-opus-4-8",              5.0,   25.0),
+        ("claude-opus-4-8-20260528",     5.0,   25.0),
         ("claude-opus-4-7",              5.0,   25.0),
         ("claude-opus-4-7-20260415",     5.0,   25.0),
         ("claude-opus-4-6",              5.0,   25.0),
@@ -1134,6 +1136,25 @@ class TestCalculateTurnCost:
         cost, *_ = hook.calculate_turn_cost(usage, "claude-sonnet-4-6", speed="fast")
         assert abs(cost - 3.0) < 0.001  # base rate
 
+    def test_fast_mode_opus_4_8_applies_2x(self):
+        # Opus 4.8 fast mode is $10/$50 = 2x base, NOT 6x like 4.6/4.7.
+        # Source: pricing#fast-mode-pricing (verified 2026-06-01)
+        usage = self._usage(inp=1_000_000, out=1_000_000)
+        cost, inp_cost, out_cost, details = hook.calculate_turn_cost(
+            usage, "claude-opus-4-8", speed="fast"
+        )
+        assert abs(inp_cost - 10.0) < 0.001   # $5 * 2
+        assert abs(out_cost - 50.0) < 0.001   # $25 * 2
+
+    def test_fast_mode_opus_4_8_cache_scaled_2x(self):
+        # Cache read $0.50 * 2 = $1.00; write 5m $6.25 * 2 = $12.50
+        usage = self._usage(cache_read=1_000_000, cache_creation=1_000_000)
+        cost, *_, details = hook.calculate_turn_cost(
+            usage, "claude-opus-4-8", cache_5m=1_000_000, speed="fast"
+        )
+        assert abs(details["cache_read_input_tokens"] - 1.0) < 0.001
+        assert abs(details["cache_creation_input_tokens"] - 12.5) < 0.001
+
     # ----- Data residency 1.1x (Opus 4.6+/Sonnet 4.6+) -----
 
     def test_inference_geo_us_opus_4_7_applies_1_1x(self):
@@ -1181,6 +1202,19 @@ class TestCalculateTurnCost:
             usage, "claude-opus-4-7", speed="fast", inference_geo="us"
         )
         assert abs(cost - 33.0) < 0.001  # $5 * 6 * 1.1
+
+    def test_inference_geo_us_opus_4_8_applies_1_1x(self):
+        usage = self._usage(inp=1_000_000, out=0)
+        cost, *_ = hook.calculate_turn_cost(usage, "claude-opus-4-8", inference_geo="us")
+        assert abs(cost - 5.5) < 0.001  # $5 * 1.1
+
+    def test_fast_mode_and_geo_stack_opus_4_8(self):
+        # Opus 4.8: 2x * 1.1x = 2.2x
+        usage = self._usage(inp=1_000_000, out=0)
+        cost, *_ = hook.calculate_turn_cost(
+            usage, "claude-opus-4-8", speed="fast", inference_geo="us"
+        )
+        assert abs(cost - 11.0) < 0.001  # $5 * 2 * 1.1
 
     # ----- Web search billing $10/1000 -----
 
