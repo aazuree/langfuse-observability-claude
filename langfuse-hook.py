@@ -167,7 +167,9 @@ def discover_subagents(
             win on duplicates.
 
     Returns:
-        List of (agent_id, subagent_transcript_path, description, subagent_type, tool_use_content_index)
+        List of (agent_id, subagent_transcript_path, description, subagent_type,
+        tool_use_content_index, correlation) where correlation is "deterministic"
+        (agentId link from tool_result) or "timestamp" (proximity fallback).
         Unmatched entries are omitted.
     """
     if not agent_tool_uses:
@@ -234,17 +236,41 @@ def discover_subagents(
     if not candidates:
         return []
 
-    # Sort candidates by start timestamp
+    # Sort candidates by start timestamp; index them by agent_id for direct lookup.
     candidates.sort(key=lambda c: c[2])
+    by_id = {aid: (path, ts) for (aid, path, ts) in candidates}
 
-    # Sort tool_uses by content_index to preserve dispatch order
+    # Sort tool_uses by content_index to preserve dispatch order.
     sorted_tool_uses = sorted(agent_tool_uses, key=lambda t: t[3])
 
-    # Match 1:1 in order: first tool_use gets earliest unmatched subagent
     matched = []
-    used_candidates = set()
+    used_candidates = set()  # indices into `candidates` consumed by timestamp matching
+    used_ids = set()         # agent_ids consumed by deterministic matching
+    pending_timestamp = []   # tool_uses with no usable agentId link
 
-    for desc, sa_type, tu_ts_str, content_idx in sorted_tool_uses:
+    # Pass 1: deterministic agentId match (exact, ignores timestamps).
+    for tu in sorted_tool_uses:
+        desc, sa_type, tu_ts_str, content_idx = tu[0], tu[1], tu[2], tu[3]
+        agent_id = tu[4] if len(tu) > 4 else None
+        if agent_id and agent_id in by_id and agent_id not in used_ids:
+            path, _ = by_id[agent_id]
+            used_ids.add(agent_id)
+            log(f"Matched subagent {agent_id} deterministically via tool_result agentId")
+            matched.append((agent_id, path, desc, sa_type, content_idx, "deterministic"))
+        else:
+            if agent_id and agent_id not in by_id:
+                log(f"[WARN] tool_result agentId {agent_id} has no matching transcript; "
+                    "falling back to timestamp matching")
+            pending_timestamp.append(tu)
+
+    # Reserve deterministically-claimed candidates so the timestamp pass skips them.
+    for i, (aid, _p, _t) in enumerate(candidates):
+        if aid in used_ids:
+            used_candidates.add(i)
+
+    # Pass 2: timestamp proximity fallback for the remainder.
+    for tu in pending_timestamp:
+        desc, sa_type, tu_ts_str, content_idx = tu[0], tu[1], tu[2], tu[3]
         tu_ts = parse_ts(tu_ts_str)
         if tu_ts is None:
             continue
@@ -276,13 +302,15 @@ def discover_subagents(
                 meta_type = meta.get("agentType", "")
                 if meta_desc and meta_desc != desc:
                     log(f"Subagent {agent_id}: meta description '{meta_desc}' != tool_use '{desc}'")
-                log(f"Matched subagent {agent_id} (meta: type={meta_type}, desc={meta_desc})")
+                log(f"Matched subagent {agent_id} via timestamp (meta: type={meta_type}, desc={meta_desc})")
             except (IOError, OSError, json.JSONDecodeError):
                 # .meta.json doesn't exist, can't be read, or contains invalid JSON
-                log(f"Matched subagent {agent_id} (no .meta.json)")
+                log(f"Matched subagent {agent_id} via timestamp (no .meta.json)")
 
-            matched.append((agent_id, jsonl_path, desc, sa_type, content_idx))
+            matched.append((agent_id, jsonl_path, desc, sa_type, content_idx, "timestamp"))
 
+    # Stable dispatch order regardless of which pass produced each match.
+    matched.sort(key=lambda m: m[4])
     return matched
 
 
@@ -294,6 +322,7 @@ def ingest_subagent(
     session_id: str,
     subagent_offset: int,
     prior_turn_count: int = 0,
+    correlation: str = "timestamp",
 ) -> tuple:
     """Parse a subagent transcript and build Langfuse events.
 
@@ -364,6 +393,8 @@ def ingest_subagent(
 
         sa_metadata = {
             "subagent_id": agent_id,
+            "agent_id": agent_id,
+            "subagent_correlation": correlation,
             "tools_used": [tc["name"] for tc in turn["tool_calls"]],
             "tool_count": len(turn["tool_calls"]),
             "speed": turn.get("speed", ""),
@@ -499,6 +530,23 @@ def extract_agent_name(transcript_path: str) -> str:
             if name:
                 return name
     return ""
+
+
+_AGENT_ID_RE = re.compile(r"agentId:\s*([0-9a-f]+)")
+
+
+def extract_agent_id_from_result(tool_output) -> str | None:
+    """Extract the subagent agentId from an Agent tool_result.
+
+    Both synchronous results ("agentId: <id> (use SendMessage ...)") and
+    asynchronous ("Async agent launched successfully.\\nagentId: <id>") embed
+    the id as a literal `agentId: <hex>` token. Returns the id, or None when
+    the output is empty or carries no agentId.
+    """
+    if not tool_output:
+        return None
+    m = _AGENT_ID_RE.search(tool_output)
+    return m.group(1) if m else None
 
 
 def extract_ai_title(transcript_path: str) -> str:
@@ -1927,12 +1975,13 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                         tc_input.get("subagent_type", "unknown"),
                         tc.get("start_time", start_time),
                         tc_idx,
+                        extract_agent_id_from_result(tc.get("output", "")),
                     ))
 
         # Discover and ingest subagents for this turn
         if agent_tool_uses_this_turn:
             matches = discover_subagents(transcript_path, agent_tool_uses_this_turn, cwd=cwd)
-            for sa_id, sa_path, sa_desc, sa_type, sa_tc_idx in matches:
+            for sa_id, sa_path, sa_desc, sa_type, sa_tc_idx, sa_corr in matches:
                 sa_prev_offset = sa_state.get(sa_id, {}).get("offset", 0)
                 sa_prior_turns = sa_state.get(sa_id, {}).get("turn_count", 0)
                 sa_parent_span = f"span-{turn_id}-{sa_tc_idx}"
@@ -1945,6 +1994,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                     session_id=session_id,
                     subagent_offset=sa_prev_offset,
                     prior_turn_count=sa_prior_turns,
+                    correlation=sa_corr,
                 )
                 batch.extend(sa_events)
                 _prev = sa_state.get(sa_id, {})

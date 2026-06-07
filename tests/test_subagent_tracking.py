@@ -129,6 +129,7 @@ def test_discover_subagents_single_match(tmp_path):
     assert result[0][2] == "Explore codebase"
     assert result[0][3] == "Explore"
     assert result[0][4] == 0  # original tool_use content_index
+    assert result[0][5] == "timestamp"  # no agentId link → proximity fallback
 
 
 def test_discover_subagents_rejects_outside_window(tmp_path):
@@ -781,3 +782,163 @@ def test_discover_subagents_no_cwd_keeps_old_behavior(tmp_path):
     result = langfuse_hook.discover_subagents(str(transcript), tool_uses)
     assert len(result) == 1
     assert result[0][0] == "abc123"
+
+
+# --- extract_agent_id_from_result tests ---
+
+def test_extract_agent_id_sync():
+    """Synchronous Agent tool_result embeds 'agentId: <id> (use SendMessage ...)'."""
+    out = '{"type": "text", "text": "agentId: a2b537af4a71ab023 (use SendMessage to reply)"}'
+    assert langfuse_hook.extract_agent_id_from_result(out) == "a2b537af4a71ab023"
+
+
+def test_extract_agent_id_async():
+    """Background Agent tool_result embeds 'Async agent launched...\\nagentId: <id>'."""
+    out = "Async agent launched successfully.\nagentId: a631e03755422d8ec"
+    assert langfuse_hook.extract_agent_id_from_result(out) == "a631e03755422d8ec"
+
+
+def test_extract_agent_id_absent():
+    """Returns None when no agentId token is present."""
+    assert langfuse_hook.extract_agent_id_from_result("some unrelated tool output") is None
+
+
+def test_extract_agent_id_empty():
+    """Returns None for empty/falsy input."""
+    assert langfuse_hook.extract_agent_id_from_result("") is None
+    assert langfuse_hook.extract_agent_id_from_result(None) is None
+
+
+# --- discover_subagents deterministic tests ---
+
+def test_discover_deterministic_match_ignores_timestamp(tmp_path):
+    """agentId link matches even when the timestamp is far outside the window."""
+    transcript = tmp_path / "session123.jsonl"
+    transcript.write_text("")
+    subagents_dir = tmp_path / "session123" / "subagents"
+    subagents_dir.mkdir(parents=True)
+    # subagent file timestamp is 2 minutes off — would FAIL timestamp matching
+    _make_subagent_jsonl(subagents_dir, "abc123", "2026-03-29T10:02:00+00:00")
+    tool_uses = [("desc", "general-purpose", "2026-03-29T10:00:00+00:00", 0, "abc123")]
+    result = langfuse_hook.discover_subagents(str(transcript), tool_uses)
+    assert len(result) == 1
+    assert result[0][0] == "abc123"
+    assert result[0][5] == "deterministic"
+
+
+def test_discover_deterministic_swapped_timestamps(tmp_path):
+    """Two parallel agents whose file timestamps are SWAPPED vs dispatch order.
+
+    Pure timestamp matching would pair tool_use[0] with the earliest file
+    ('second'); the agentId link must pair them correctly instead.
+    """
+    transcript = tmp_path / "session123.jsonl"
+    transcript.write_text("")
+    subagents_dir = tmp_path / "session123" / "subagents"
+    subagents_dir.mkdir(parents=True)
+    _make_subagent_jsonl(subagents_dir, "first", "2026-03-29T10:00:03+00:00")
+    _make_subagent_jsonl(subagents_dir, "second", "2026-03-29T10:00:01+00:00")
+    tool_uses = [
+        ("Build", "general-purpose", "2026-03-29T10:00:00+00:00", 0, "first"),
+        ("Review", "general-purpose", "2026-03-29T10:00:00+00:00", 1, "second"),
+    ]
+    result = langfuse_hook.discover_subagents(str(transcript), tool_uses)
+    by_idx = {r[4]: r for r in result}
+    assert by_idx[0][0] == "first"
+    assert by_idx[1][0] == "second"
+    assert all(r[5] == "deterministic" for r in result)
+
+
+def test_discover_mixed_link_and_fallback(tmp_path):
+    """One tool_use has an agentId link, one does not — fallback for the latter."""
+    transcript = tmp_path / "session123.jsonl"
+    transcript.write_text("")
+    subagents_dir = tmp_path / "session123" / "subagents"
+    subagents_dir.mkdir(parents=True)
+    _make_subagent_jsonl(subagents_dir, "linked", "2026-03-29T10:00:05+00:00")
+    _make_subagent_jsonl(subagents_dir, "unlinked", "2026-03-29T10:00:01+00:00")
+    tool_uses = [
+        ("Has link", "general-purpose", "2026-03-29T10:00:00+00:00", 0, "linked"),
+        ("No link", "general-purpose", "2026-03-29T10:00:00+00:00", 1, None),
+    ]
+    result = langfuse_hook.discover_subagents(str(transcript), tool_uses)
+    by_idx = {r[4]: r for r in result}
+    assert by_idx[0][0] == "linked"
+    assert by_idx[0][5] == "deterministic"
+    assert by_idx[1][0] == "unlinked"
+    assert by_idx[1][5] == "timestamp"
+
+
+def test_discover_agentid_missing_file_falls_back(tmp_path):
+    """agentId given but no matching file — falls back to timestamp matching."""
+    transcript = tmp_path / "session123.jsonl"
+    transcript.write_text("")
+    subagents_dir = tmp_path / "session123" / "subagents"
+    subagents_dir.mkdir(parents=True)
+    _make_subagent_jsonl(subagents_dir, "realfile", "2026-03-29T10:00:01+00:00")
+    tool_uses = [("desc", "general-purpose", "2026-03-29T10:00:00+00:00", 0, "ghost-id")]
+    result = langfuse_hook.discover_subagents(str(transcript), tool_uses)
+    assert len(result) == 1
+    assert result[0][0] == "realfile"
+    assert result[0][5] == "timestamp"
+
+
+def test_discover_backcompat_4tuple(tmp_path):
+    """Legacy 4-element tool_use tuples (no agentId) still work, marked timestamp."""
+    transcript = tmp_path / "session123.jsonl"
+    transcript.write_text("")
+    subagents_dir = tmp_path / "session123" / "subagents"
+    subagents_dir.mkdir(parents=True)
+    _make_subagent_jsonl(subagents_dir, "abc123", "2026-03-29T10:00:01+00:00")
+    tool_uses = [("desc", "general-purpose", "2026-03-29T10:00:00+00:00", 0)]
+    result = langfuse_hook.discover_subagents(str(transcript), tool_uses)
+    assert len(result) == 1
+    assert result[0][0] == "abc123"
+    assert result[0][5] == "timestamp"
+
+
+# --- ingest_subagent correlation metadata tests ---
+
+def test_ingest_subagent_records_correlation(tmp_path):
+    """ingest_subagent stamps the correlation method + agent_id on the generation."""
+    sub_dir = tmp_path / "subagents"
+    sub_dir.mkdir(parents=True)
+    _make_full_subagent_jsonl(sub_dir, "abc123")
+    jsonl = sub_dir / "agent-abc123.jsonl"
+
+    events, cost, offset, turns, status = langfuse_hook.ingest_subagent(
+        agent_id="abc123",
+        transcript_path=str(jsonl),
+        parent_span_id="span-parent",
+        trace_id="trace-1",
+        session_id="parent-session",
+        subagent_offset=0,
+        prior_turn_count=0,
+        correlation="deterministic",
+    )
+
+    gens = [e for e in events if e["type"] == "generation-create"]
+    assert gens, "expected at least one subagent generation event"
+    meta = gens[0]["body"]["metadata"]
+    assert meta["subagent_correlation"] == "deterministic"
+    assert meta["agent_id"] == "abc123"
+
+
+def test_ingest_subagent_correlation_defaults_to_timestamp(tmp_path):
+    """correlation defaults to 'timestamp' when not supplied (back-compat)."""
+    sub_dir = tmp_path / "subagents"
+    sub_dir.mkdir(parents=True)
+    _make_full_subagent_jsonl(sub_dir, "def456")
+    jsonl = sub_dir / "agent-def456.jsonl"
+
+    events, *_ = langfuse_hook.ingest_subagent(
+        agent_id="def456",
+        transcript_path=str(jsonl),
+        parent_span_id="span-parent",
+        trace_id="trace-1",
+        session_id="parent-session",
+        subagent_offset=0,
+        prior_turn_count=0,
+    )
+    gens = [e for e in events if e["type"] == "generation-create"]
+    assert gens[0]["body"]["metadata"]["subagent_correlation"] == "timestamp"
