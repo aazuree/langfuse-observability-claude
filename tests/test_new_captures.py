@@ -74,3 +74,33 @@ class TestExtractCompaction:
         out = hook.extract_compaction(_write(entries, tmp_path))
         assert "tokens_reclaimed" not in out["events"][0]
         assert out["total_tokens_reclaimed"] == 0
+
+
+class TestExtractBridge:
+    def test_none_when_absent(self, tmp_path):
+        assert hook.extract_bridge(_write([{"type": "user"}], tmp_path)) is None
+
+    def test_nonexistent_file(self):
+        assert hook.extract_bridge("/nonexistent.jsonl") is None
+
+    def test_both_fields(self, tmp_path):
+        entries = [
+            {"type": "bridge-session", "bridgeSessionId": "cse_019X", "lastSequenceNum": 0},
+            {"type": "system", "subtype": "bridge_status",
+             "content": "/remote-control is active",
+             "url": "https://claude.ai/code/session_019X"},
+        ]
+        out = hook.extract_bridge(_write(entries, tmp_path))
+        assert out == {"bridge_session_id": "cse_019X",
+                       "url": "https://claude.ai/code/session_019X"}
+
+    def test_bridge_session_only(self, tmp_path):
+        entries = [{"type": "bridge-session", "bridgeSessionId": "cse_abc"}]
+        out = hook.extract_bridge(_write(entries, tmp_path))
+        assert out == {"bridge_session_id": "cse_abc"}
+
+    def test_bridge_status_only(self, tmp_path):
+        entries = [{"type": "system", "subtype": "bridge_status",
+                    "url": "https://claude.ai/code/session_z"}]
+        out = hook.extract_bridge(_write(entries, tmp_path))
+        assert out == {"url": "https://claude.ai/code/session_z"}

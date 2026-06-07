@@ -729,6 +729,26 @@ def extract_compaction(transcript_path: str) -> dict | None:
     }
 
 
+def extract_bridge(transcript_path: str) -> dict | None:
+    """Remote-control / bridge session info. None when the session was never bridged.
+
+    bridge-session entries carry bridgeSessionId; system/bridge_status carries the
+    shareable claude.ai url. Either may be absent independently. No timestamps.
+    """
+    out: dict = {}
+    for entry in iter_transcript(transcript_path):
+        etype = entry.get("type", "")
+        if etype == "bridge-session" and "bridge_session_id" not in out:
+            bsid = entry.get("bridgeSessionId")
+            if bsid:
+                out["bridge_session_id"] = bsid
+        elif etype == "system" and entry.get("subtype") == "bridge_status" and "url" not in out:
+            url = entry.get("url")
+            if url:
+                out["url"] = redact_secrets(truncate(url, MAX_TEXT))
+    return out or None
+
+
 def parse_transcript(transcript_path: str, skip_lines: int = 0) -> tuple[list[dict], int, bool]:
     """Parse a JSONL transcript starting after `skip_lines`.
 
