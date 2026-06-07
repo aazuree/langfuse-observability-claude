@@ -674,6 +674,61 @@ def extract_away_summaries(transcript_path: str) -> list:
     return out
 
 
+def extract_compaction(transcript_path: str) -> dict | None:
+    """Rollup of compaction events. None when the session was never compacted.
+
+    Rich events come from system/compact_boundary (with compactMetadata: trigger,
+    preTokens, postTokens, durationMs). Legacy transcripts only have type=="summary"
+    with no metadata — counted with trigger "legacy" and no token data.
+    Unknown trigger values pass through verbatim.
+    """
+    events = []
+    triggers: dict[str, int] = {}
+    total_pre = total_post = total_reclaimed = total_dur = 0
+
+    for entry in iter_transcript(transcript_path):
+        etype = entry.get("type", "")
+        subtype = entry.get("subtype", "")
+        if etype == "system" and subtype == "compact_boundary":
+            cm = entry.get("compactMetadata") or {}
+            trigger = cm.get("trigger") or "unknown"
+            triggers[trigger] = triggers.get(trigger, 0) + 1
+            ev = {"trigger": trigger, "timestamp": entry.get("timestamp")}
+            pre = cm.get("preTokens")
+            post = cm.get("postTokens")
+            dur = cm.get("durationMs")
+            if pre is not None:
+                ev["pre_tokens"] = pre
+                total_pre += pre
+            if post is not None:
+                ev["post_tokens"] = post
+                total_post += post
+            if pre is not None and post is not None:
+                reclaimed = pre - post
+                ev["tokens_reclaimed"] = reclaimed
+                total_reclaimed += reclaimed
+            if dur is not None:
+                ev["duration_ms"] = dur
+                total_dur += dur
+            events.append(ev)
+        elif etype == "summary":
+            events.append({"trigger": "legacy", "timestamp": entry.get("timestamp")})
+        if len(events) >= 50:
+            break
+
+    if not events:
+        return None
+    return {
+        "count": len(events),
+        "triggers": triggers,
+        "total_tokens_reclaimed": total_reclaimed,
+        "total_pre_tokens": total_pre,
+        "total_post_tokens": total_post,
+        "total_duration_ms": total_dur,
+        "events": events,
+    }
+
+
 def parse_transcript(transcript_path: str, skip_lines: int = 0) -> tuple[list[dict], int, bool]:
     """Parse a JSONL transcript starting after `skip_lines`.
 
