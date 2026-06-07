@@ -1599,6 +1599,9 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
     prev_line_offset, prev_turn_count = load_state(session_id)
     custom_title = extract_custom_title(transcript_path)
     permission_mode = extract_permission_mode(transcript_path)
+    permission_timeline = extract_permission_timeline(transcript_path)
+    compaction = extract_compaction(transcript_path)
+    remote_control = extract_bridge(transcript_path)
     pr_links = extract_pr_links(transcript_path)
     away_summaries = extract_away_summaries(transcript_path)
     agent_name = extract_agent_name(transcript_path)
@@ -1698,6 +1701,10 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
     )
 
     pr_tags = [f"pr:{p['number']}" for p in pr_links if p.get("number") is not None]
+    compact_trigger_tags = [
+        f"compact-trigger:{t}" for t in sorted((compaction or {}).get("triggers", {}))
+        if t != "unknown"
+    ]
 
     # 1. Trace
     batch.append({
@@ -1736,7 +1743,10 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 "file_snapshots": file_history_stats if file_history_stats["snapshot_count"] > 0 else None,
                 "stop_hook": stop_hook_stats if stop_hook_stats["total_hook_fires"] > 0 else None,
                 "skill_attribution": skill_attribution,
+                "compaction": compaction,
                 "compaction_occurred": detect_compaction(transcript_path),
+                "remote_control": remote_control,
+                "permission_timeline": permission_timeline,
                 "total_iterations": sum(t.get("iteration_count", 0) for t in turns),
                 "cache_miss": build_cache_miss_summary(turns),
                 "effort_level": effort or None,
@@ -1752,6 +1762,10 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 f"agent-name:{agent_name}" if agent_name else None,
                 f"session-kind:{session_kind}" if session_kind else None,
                 f"effort:{effort}" if effort else None,
+                "compacted" if detect_compaction(transcript_path) else None,
+                "remote-control" if remote_control else None,
+                "permission-bypass" if (permission_timeline or {}).get("ever_bypass") else None,
+                *compact_trigger_tags,
                 *attribution_tags,
                 *pr_tags,
             ] if t],

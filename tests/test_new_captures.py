@@ -142,3 +142,52 @@ class TestExtractPermissionTimeline:
         ]
         out = hook.extract_permission_timeline(_write(entries, tmp_path))
         assert out["ever_bypass"] is True
+
+
+class TestNewCapturesWiring:
+    def test_metadata_and_tags_present(self, tmp_path, monkeypatch):
+        entries = [
+            {"type": "user", "timestamp": "2026-06-07T00:00:00Z", "cwd": "/x/repo",
+             "version": "2.1.168", "message": {"role": "user", "content": "hi"}},
+            {"type": "permission-mode", "permissionMode": "default"},
+            {"type": "permission-mode", "permissionMode": "acceptEdits"},
+            {"type": "bridge-session", "bridgeSessionId": "cse_019X"},
+            {"type": "system", "subtype": "bridge_status",
+             "url": "https://claude.ai/code/session_019X"},
+            {"type": "system", "subtype": "compact_boundary",
+             "timestamp": "2026-06-07T00:01:00Z",
+             "compactMetadata": {"trigger": "manual", "preTokens": 100,
+                                 "postTokens": 10, "durationMs": 5}},
+            {"type": "assistant", "timestamp": "2026-06-07T00:00:05Z",
+             "message": {"role": "assistant", "id": "m1", "model": "claude-opus-4-8",
+                         "stop_reason": "end_turn",
+                         "content": [{"type": "text", "text": "hello"}],
+                         "usage": {"input_tokens": 5, "output_tokens": 3}}},
+        ]
+        transcript = tmp_path / "sess.jsonl"
+        transcript.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+
+        captured = {}
+        monkeypatch.setattr(hook, "send_to_langfuse",
+                            lambda batch: captured.setdefault("batch", batch) or True)
+        monkeypatch.setattr(hook, "STATE_DIR", str(tmp_path / "state"))
+
+        hook.process_session("sess", str(transcript), "/x/repo")
+
+        trace = next(e for e in captured["batch"] if e["type"] == "trace-create")
+        md = trace["body"]["metadata"]
+        tags = trace["body"]["tags"]
+
+        assert md["compaction"]["count"] == 1
+        assert md["compaction"]["total_tokens_reclaimed"] == 90
+        assert md["remote_control"] == {"bridge_session_id": "cse_019X",
+                                        "url": "https://claude.ai/code/session_019X"}
+        assert md["permission_timeline"]["transition_count"] == 1
+        # backward-compat fields unchanged
+        assert md["compaction_occurred"] is True
+        assert md["permission_mode"] == "acceptEdits"
+
+        assert "compacted" in tags
+        assert "compact-trigger:manual" in tags
+        assert "remote-control" in tags
+        assert "permission:acceptEdits" in tags
