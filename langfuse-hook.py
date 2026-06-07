@@ -646,6 +646,29 @@ def extract_permission_mode(transcript_path: str) -> str:
     return last
 
 
+def extract_permission_timeline(transcript_path: str) -> dict | None:
+    """Ordered permission-mode changes across a session. None when no entries.
+
+    permission-mode entries have no timestamps, so the sequence is file-order only.
+    Consecutive duplicates are collapsed — a transition is a value change.
+    """
+    sequence = []
+    for entry in iter_transcript(transcript_path):
+        if entry.get("type") == "permission-mode":
+            mode = entry.get("permissionMode", "")
+            if mode and (not sequence or sequence[-1] != mode):
+                sequence.append(mode)
+    if not sequence:
+        return None
+    return {
+        "modes_used": sorted(set(sequence)),
+        "sequence": sequence,
+        "transition_count": len(sequence) - 1,
+        "ever_bypass": "bypassPermissions" in sequence,
+        "ever_accept_edits": "acceptEdits" in sequence,
+    }
+
+
 def extract_pr_links(transcript_path: str) -> list:
     """All pr-link entries in chronological order."""
     out = []

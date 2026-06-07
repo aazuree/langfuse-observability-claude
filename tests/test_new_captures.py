@@ -104,3 +104,41 @@ class TestExtractBridge:
                     "url": "https://claude.ai/code/session_z"}]
         out = hook.extract_bridge(_write(entries, tmp_path))
         assert out == {"url": "https://claude.ai/code/session_z"}
+
+
+class TestExtractPermissionTimeline:
+    def test_none_when_no_entries(self, tmp_path):
+        assert hook.extract_permission_timeline(_write([{"type": "user"}], tmp_path)) is None
+
+    def test_nonexistent_file(self):
+        assert hook.extract_permission_timeline("/nonexistent.jsonl") is None
+
+    def test_single_mode_zero_transitions(self, tmp_path):
+        entries = [{"type": "permission-mode", "permissionMode": "default"}]
+        out = hook.extract_permission_timeline(_write(entries, tmp_path))
+        assert out["modes_used"] == ["default"]
+        assert out["sequence"] == ["default"]
+        assert out["transition_count"] == 0
+        assert out["ever_bypass"] is False
+        assert out["ever_accept_edits"] is False
+
+    def test_collapses_consecutive_dups(self, tmp_path):
+        entries = [
+            {"type": "permission-mode", "permissionMode": "default"},
+            {"type": "permission-mode", "permissionMode": "default"},
+            {"type": "permission-mode", "permissionMode": "acceptEdits"},
+            {"type": "permission-mode", "permissionMode": "default"},
+        ]
+        out = hook.extract_permission_timeline(_write(entries, tmp_path))
+        assert out["sequence"] == ["default", "acceptEdits", "default"]
+        assert out["transition_count"] == 2
+        assert out["modes_used"] == ["acceptEdits", "default"]
+        assert out["ever_accept_edits"] is True
+
+    def test_bypass_flag(self, tmp_path):
+        entries = [
+            {"type": "permission-mode", "permissionMode": "default"},
+            {"type": "permission-mode", "permissionMode": "bypassPermissions"},
+        ]
+        out = hook.extract_permission_timeline(_write(entries, tmp_path))
+        assert out["ever_bypass"] is True
