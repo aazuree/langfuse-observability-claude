@@ -129,6 +129,7 @@ def test_discover_subagents_single_match(tmp_path):
     assert result[0][2] == "Explore codebase"
     assert result[0][3] == "Explore"
     assert result[0][4] == 0  # original tool_use content_index
+    assert result[0][5] == "timestamp"  # no agentId link → proximity fallback
 
 
 def test_discover_subagents_rejects_outside_window(tmp_path):
@@ -806,3 +807,91 @@ def test_extract_agent_id_empty():
     """Returns None for empty/falsy input."""
     assert langfuse_hook.extract_agent_id_from_result("") is None
     assert langfuse_hook.extract_agent_id_from_result(None) is None
+
+
+# --- discover_subagents deterministic tests ---
+
+def test_discover_deterministic_match_ignores_timestamp(tmp_path):
+    """agentId link matches even when the timestamp is far outside the window."""
+    transcript = tmp_path / "session123.jsonl"
+    transcript.write_text("")
+    subagents_dir = tmp_path / "session123" / "subagents"
+    subagents_dir.mkdir(parents=True)
+    # subagent file timestamp is 2 minutes off — would FAIL timestamp matching
+    _make_subagent_jsonl(subagents_dir, "abc123", "2026-03-29T10:02:00+00:00")
+    tool_uses = [("desc", "general-purpose", "2026-03-29T10:00:00+00:00", 0, "abc123")]
+    result = langfuse_hook.discover_subagents(str(transcript), tool_uses)
+    assert len(result) == 1
+    assert result[0][0] == "abc123"
+    assert result[0][5] == "deterministic"
+
+
+def test_discover_deterministic_swapped_timestamps(tmp_path):
+    """Two parallel agents whose file timestamps are SWAPPED vs dispatch order.
+
+    Pure timestamp matching would pair tool_use[0] with the earliest file
+    ('second'); the agentId link must pair them correctly instead.
+    """
+    transcript = tmp_path / "session123.jsonl"
+    transcript.write_text("")
+    subagents_dir = tmp_path / "session123" / "subagents"
+    subagents_dir.mkdir(parents=True)
+    _make_subagent_jsonl(subagents_dir, "first", "2026-03-29T10:00:03+00:00")
+    _make_subagent_jsonl(subagents_dir, "second", "2026-03-29T10:00:01+00:00")
+    tool_uses = [
+        ("Build", "general-purpose", "2026-03-29T10:00:00+00:00", 0, "first"),
+        ("Review", "general-purpose", "2026-03-29T10:00:00+00:00", 1, "second"),
+    ]
+    result = langfuse_hook.discover_subagents(str(transcript), tool_uses)
+    by_idx = {r[4]: r for r in result}
+    assert by_idx[0][0] == "first"
+    assert by_idx[1][0] == "second"
+    assert all(r[5] == "deterministic" for r in result)
+
+
+def test_discover_mixed_link_and_fallback(tmp_path):
+    """One tool_use has an agentId link, one does not — fallback for the latter."""
+    transcript = tmp_path / "session123.jsonl"
+    transcript.write_text("")
+    subagents_dir = tmp_path / "session123" / "subagents"
+    subagents_dir.mkdir(parents=True)
+    _make_subagent_jsonl(subagents_dir, "linked", "2026-03-29T10:00:05+00:00")
+    _make_subagent_jsonl(subagents_dir, "unlinked", "2026-03-29T10:00:01+00:00")
+    tool_uses = [
+        ("Has link", "general-purpose", "2026-03-29T10:00:00+00:00", 0, "linked"),
+        ("No link", "general-purpose", "2026-03-29T10:00:00+00:00", 1, None),
+    ]
+    result = langfuse_hook.discover_subagents(str(transcript), tool_uses)
+    by_idx = {r[4]: r for r in result}
+    assert by_idx[0][0] == "linked"
+    assert by_idx[0][5] == "deterministic"
+    assert by_idx[1][0] == "unlinked"
+    assert by_idx[1][5] == "timestamp"
+
+
+def test_discover_agentid_missing_file_falls_back(tmp_path):
+    """agentId given but no matching file — falls back to timestamp matching."""
+    transcript = tmp_path / "session123.jsonl"
+    transcript.write_text("")
+    subagents_dir = tmp_path / "session123" / "subagents"
+    subagents_dir.mkdir(parents=True)
+    _make_subagent_jsonl(subagents_dir, "realfile", "2026-03-29T10:00:01+00:00")
+    tool_uses = [("desc", "general-purpose", "2026-03-29T10:00:00+00:00", 0, "ghost-id")]
+    result = langfuse_hook.discover_subagents(str(transcript), tool_uses)
+    assert len(result) == 1
+    assert result[0][0] == "realfile"
+    assert result[0][5] == "timestamp"
+
+
+def test_discover_backcompat_4tuple(tmp_path):
+    """Legacy 4-element tool_use tuples (no agentId) still work, marked timestamp."""
+    transcript = tmp_path / "session123.jsonl"
+    transcript.write_text("")
+    subagents_dir = tmp_path / "session123" / "subagents"
+    subagents_dir.mkdir(parents=True)
+    _make_subagent_jsonl(subagents_dir, "abc123", "2026-03-29T10:00:01+00:00")
+    tool_uses = [("desc", "general-purpose", "2026-03-29T10:00:00+00:00", 0)]
+    result = langfuse_hook.discover_subagents(str(transcript), tool_uses)
+    assert len(result) == 1
+    assert result[0][0] == "abc123"
+    assert result[0][5] == "timestamp"
