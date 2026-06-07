@@ -895,3 +895,50 @@ def test_discover_backcompat_4tuple(tmp_path):
     assert len(result) == 1
     assert result[0][0] == "abc123"
     assert result[0][5] == "timestamp"
+
+
+# --- ingest_subagent correlation metadata tests ---
+
+def test_ingest_subagent_records_correlation(tmp_path):
+    """ingest_subagent stamps the correlation method + agent_id on the generation."""
+    sub_dir = tmp_path / "subagents"
+    sub_dir.mkdir(parents=True)
+    _make_full_subagent_jsonl(sub_dir, "abc123")
+    jsonl = sub_dir / "agent-abc123.jsonl"
+
+    events, cost, offset, turns, status = langfuse_hook.ingest_subagent(
+        agent_id="abc123",
+        transcript_path=str(jsonl),
+        parent_span_id="span-parent",
+        trace_id="trace-1",
+        session_id="parent-session",
+        subagent_offset=0,
+        prior_turn_count=0,
+        correlation="deterministic",
+    )
+
+    gens = [e for e in events if e["type"] == "generation-create"]
+    assert gens, "expected at least one subagent generation event"
+    meta = gens[0]["body"]["metadata"]
+    assert meta["subagent_correlation"] == "deterministic"
+    assert meta["agent_id"] == "abc123"
+
+
+def test_ingest_subagent_correlation_defaults_to_timestamp(tmp_path):
+    """correlation defaults to 'timestamp' when not supplied (back-compat)."""
+    sub_dir = tmp_path / "subagents"
+    sub_dir.mkdir(parents=True)
+    _make_full_subagent_jsonl(sub_dir, "def456")
+    jsonl = sub_dir / "agent-def456.jsonl"
+
+    events, *_ = langfuse_hook.ingest_subagent(
+        agent_id="def456",
+        transcript_path=str(jsonl),
+        parent_span_id="span-parent",
+        trace_id="trace-1",
+        session_id="parent-session",
+        subagent_offset=0,
+        prior_turn_count=0,
+    )
+    gens = [e for e in events if e["type"] == "generation-create"]
+    assert gens[0]["body"]["metadata"]["subagent_correlation"] == "timestamp"

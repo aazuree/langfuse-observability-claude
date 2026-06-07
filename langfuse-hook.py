@@ -322,6 +322,7 @@ def ingest_subagent(
     session_id: str,
     subagent_offset: int,
     prior_turn_count: int = 0,
+    correlation: str = "timestamp",
 ) -> tuple:
     """Parse a subagent transcript and build Langfuse events.
 
@@ -392,6 +393,8 @@ def ingest_subagent(
 
         sa_metadata = {
             "subagent_id": agent_id,
+            "agent_id": agent_id,
+            "subagent_correlation": correlation,
             "tools_used": [tc["name"] for tc in turn["tool_calls"]],
             "tool_count": len(turn["tool_calls"]),
             "speed": turn.get("speed", ""),
@@ -1991,6 +1994,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                     session_id=session_id,
                     subagent_offset=sa_prev_offset,
                     prior_turn_count=sa_prior_turns,
+                    correlation=sa_corr,
                 )
                 batch.extend(sa_events)
                 _prev = sa_state.get(sa_id, {})
