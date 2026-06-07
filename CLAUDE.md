@@ -144,7 +144,7 @@ Set `REPORT_API_EQUIVALENT_COST = False` in `langfuse-hook.py` to report $0.
 
 ## Tags and Metadata
 
-> Transcript-field coverage verified against Claude Code **v2.1.156** (2026-05-29).
+> Transcript-field coverage verified against Claude Code **v2.1.168** (2026-06-07).
 > Note: `effort.level`, `agent_id`/`parent_agent_id`, and skill `invocation_trigger` are
 > OTel-span / hook-stdin fields, **not** transcript JSONL — unreachable by this hook's
 > transcript parsing. effort is captured via the `$CLAUDE_EFFORT` env var instead.
@@ -165,6 +165,10 @@ Each trace is enriched with:
 - `effort:<level>` — active effort level at Stop-fire time (`low`/`medium`/`high`/`max`), from `$CLAUDE_EFFORT`. Live fires only (absent on reprocessed sessions)
 - `skill:<slug>` — one per distinct `attributionSkill` observed in the session (e.g., `skill:superpowers:brainstorming`)
 - `plugin:<name>` — one per distinct `attributionPlugin` observed (e.g., `plugin:superpowers`)
+- `compacted` — present when the session was context-compacted (mirrors `compaction_occurred`)
+- `compact-trigger:<trigger>` — one per distinct compaction trigger (`manual`/`auto`; `unknown` omitted)
+- `remote-control` — present when the session was bridged to claude.ai (Remote Control / `/remote-control`)
+- `permission-bypass` — present when `bypassPermissions` was active at any point in the session
 
 **Trace Name precedence:**
 1. `customTitle` from `type: "custom-title"` (user-set via in-CLI title command)
@@ -200,6 +204,9 @@ via Langfuse's upsert-on-id behaviour.
 - `total_iterations` — sum of per-turn `iteration_count` across the session (server-side agentic-loop iterations from `usage.iterations`).
 - `cache_miss` — session rollup of cache misses from `message.diagnostics.cache_miss_reason`: `{total_missed_tokens, by_reason: {<type>: count}, turns_with_miss}`. Explains *why* `cache_hit_rate` is low and how many input tokens were re-sent (e.g. `tools_changed`). Null when no turn missed cache.
 - `effort_level` — active effort level (`low`/`medium`/`high`/`max`) read from `$CLAUDE_EFFORT` at Stop-fire time. Session-level, last-observed. Live fires only; null on reprocessed sessions.
+- `compaction` — rollup of `system/compact_boundary` events: `{count, triggers: {<trigger>: n}, total_tokens_reclaimed (Σ preTokens−postTokens), total_pre_tokens, total_post_tokens, total_duration_ms, events: [{trigger, pre_tokens, post_tokens, tokens_reclaimed, duration_ms, timestamp}]}`. Surfaces context-window pressure and the token/time cost of compaction. Legacy `type:"summary"` entries (pre-`compactMetadata`) count with `trigger:"legacy"` and no token fields. Unknown triggers pass through verbatim. Null when never compacted. The bare `compaction_occurred` bool (via `detect_compaction`) is retained alongside for back-compat. From `extract_compaction()`.
+- `remote_control` — `{bridge_session_id, url}` from `bridge-session` + `system/bridge_status` entries (the Remote Control / phone-web bridge). Either field may be absent independently; `url` correlates with the claude.ai session. **No timestamps** on these entries. Null when the session was never bridged. From `extract_bridge()`.
+- `permission_timeline` — `{modes_used (sorted distinct), sequence (file-order, consecutive dups collapsed), transition_count, ever_bypass, ever_accept_edits}` from `permission-mode` entries. Complements the last-observed `permission_mode`/`permission:<mode>` tag with the full transition history. **No timestamps** on these entries → sequence is order-only, not timed. Null when no `permission-mode` entries. From `extract_permission_timeline()`.
 
 Extracted from the first `type: "user"` entry in the JSONL transcript via `extract_session_metadata()`.
 API errors extracted from `type: "system"` / `subtype: "api_error"` entries via `extract_api_errors()`.

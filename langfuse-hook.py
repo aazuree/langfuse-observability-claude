@@ -646,6 +646,29 @@ def extract_permission_mode(transcript_path: str) -> str:
     return last
 
 
+def extract_permission_timeline(transcript_path: str) -> dict | None:
+    """Ordered permission-mode changes across a session. None when no entries.
+
+    permission-mode entries have no timestamps, so the sequence is file-order only.
+    Consecutive duplicates are collapsed — a transition is a value change.
+    """
+    sequence = []
+    for entry in iter_transcript(transcript_path):
+        if entry.get("type") == "permission-mode":
+            mode = entry.get("permissionMode", "")
+            if mode and (not sequence or sequence[-1] != mode):
+                sequence.append(mode)
+    if not sequence:
+        return None
+    return {
+        "modes_used": sorted(set(sequence)),
+        "sequence": sequence,
+        "transition_count": len(sequence) - 1,
+        "ever_bypass": "bypassPermissions" in sequence,
+        "ever_accept_edits": "acceptEdits" in sequence,
+    }
+
+
 def extract_pr_links(transcript_path: str) -> list:
     """All pr-link entries in chronological order."""
     out = []
@@ -672,6 +695,81 @@ def extract_away_summaries(transcript_path: str) -> list:
                     "timestamp": entry.get("timestamp"),
                 })
     return out
+
+
+def extract_compaction(transcript_path: str) -> dict | None:
+    """Rollup of compaction events. None when the session was never compacted.
+
+    Rich events come from system/compact_boundary (with compactMetadata: trigger,
+    preTokens, postTokens, durationMs). Legacy transcripts only have type=="summary"
+    with no metadata — counted with trigger "legacy" and no token data.
+    Unknown trigger values pass through verbatim.
+    """
+    events = []
+    triggers: dict[str, int] = {}
+    total_pre = total_post = total_reclaimed = total_dur = 0
+
+    for entry in iter_transcript(transcript_path):
+        etype = entry.get("type", "")
+        subtype = entry.get("subtype", "")
+        if etype == "system" and subtype == "compact_boundary":
+            cm = entry.get("compactMetadata") or {}
+            trigger = cm.get("trigger") or "unknown"
+            triggers[trigger] = triggers.get(trigger, 0) + 1
+            ev = {"trigger": trigger, "timestamp": entry.get("timestamp")}
+            pre = cm.get("preTokens")
+            post = cm.get("postTokens")
+            dur = cm.get("durationMs")
+            if pre is not None:
+                ev["pre_tokens"] = pre
+                total_pre += pre
+            if post is not None:
+                ev["post_tokens"] = post
+                total_post += post
+            if pre is not None and post is not None:
+                reclaimed = pre - post
+                ev["tokens_reclaimed"] = reclaimed
+                total_reclaimed += reclaimed
+            if dur is not None:
+                ev["duration_ms"] = dur
+                total_dur += dur
+            events.append(ev)
+        elif etype == "summary":
+            events.append({"trigger": "legacy", "timestamp": entry.get("timestamp")})
+        if len(events) >= 50:
+            break
+
+    if not events:
+        return None
+    return {
+        "count": len(events),
+        "triggers": triggers,
+        "total_tokens_reclaimed": total_reclaimed,
+        "total_pre_tokens": total_pre,
+        "total_post_tokens": total_post,
+        "total_duration_ms": total_dur,
+        "events": events,
+    }
+
+
+def extract_bridge(transcript_path: str) -> dict | None:
+    """Remote-control / bridge session info. None when the session was never bridged.
+
+    bridge-session entries carry bridgeSessionId; system/bridge_status carries the
+    shareable claude.ai url. Either may be absent independently. No timestamps.
+    """
+    out: dict = {}
+    for entry in iter_transcript(transcript_path):
+        etype = entry.get("type", "")
+        if etype == "bridge-session" and "bridge_session_id" not in out:
+            bsid = entry.get("bridgeSessionId")
+            if bsid:
+                out["bridge_session_id"] = bsid
+        elif etype == "system" and entry.get("subtype") == "bridge_status" and "url" not in out:
+            url = entry.get("url")
+            if url:
+                out["url"] = redact_secrets(truncate(url, MAX_TEXT))
+    return out or None
 
 
 def parse_transcript(transcript_path: str, skip_lines: int = 0) -> tuple[list[dict], int, bool]:
@@ -1501,6 +1599,9 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
     prev_line_offset, prev_turn_count = load_state(session_id)
     custom_title = extract_custom_title(transcript_path)
     permission_mode = extract_permission_mode(transcript_path)
+    permission_timeline = extract_permission_timeline(transcript_path)
+    compaction = extract_compaction(transcript_path)
+    remote_control = extract_bridge(transcript_path)
     pr_links = extract_pr_links(transcript_path)
     away_summaries = extract_away_summaries(transcript_path)
     agent_name = extract_agent_name(transcript_path)
@@ -1600,6 +1701,10 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
     )
 
     pr_tags = [f"pr:{p['number']}" for p in pr_links if p.get("number") is not None]
+    compact_trigger_tags = [
+        f"compact-trigger:{t}" for t in sorted((compaction or {}).get("triggers", {}))
+        if t != "unknown"
+    ]
 
     # 1. Trace
     batch.append({
@@ -1638,7 +1743,10 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 "file_snapshots": file_history_stats if file_history_stats["snapshot_count"] > 0 else None,
                 "stop_hook": stop_hook_stats if stop_hook_stats["total_hook_fires"] > 0 else None,
                 "skill_attribution": skill_attribution,
+                "compaction": compaction,
                 "compaction_occurred": detect_compaction(transcript_path),
+                "remote_control": remote_control,
+                "permission_timeline": permission_timeline,
                 "total_iterations": sum(t.get("iteration_count", 0) for t in turns),
                 "cache_miss": build_cache_miss_summary(turns),
                 "effort_level": effort or None,
@@ -1654,6 +1762,10 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 f"agent-name:{agent_name}" if agent_name else None,
                 f"session-kind:{session_kind}" if session_kind else None,
                 f"effort:{effort}" if effort else None,
+                "compacted" if detect_compaction(transcript_path) else None,
+                "remote-control" if remote_control else None,
+                "permission-bypass" if (permission_timeline or {}).get("ever_bypass") else None,
+                *compact_trigger_tags,
                 *attribution_tags,
                 *pr_tags,
             ] if t],
