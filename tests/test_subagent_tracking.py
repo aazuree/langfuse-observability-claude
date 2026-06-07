@@ -781,3 +781,28 @@ def test_discover_subagents_no_cwd_keeps_old_behavior(tmp_path):
     result = langfuse_hook.discover_subagents(str(transcript), tool_uses)
     assert len(result) == 1
     assert result[0][0] == "abc123"
+
+
+# --- extract_agent_id_from_result tests ---
+
+def test_extract_agent_id_sync():
+    """Synchronous Agent tool_result embeds 'agentId: <id> (use SendMessage ...)'."""
+    out = '{"type": "text", "text": "agentId: a2b537af4a71ab023 (use SendMessage to reply)"}'
+    assert langfuse_hook.extract_agent_id_from_result(out) == "a2b537af4a71ab023"
+
+
+def test_extract_agent_id_async():
+    """Background Agent tool_result embeds 'Async agent launched...\\nagentId: <id>'."""
+    out = "Async agent launched successfully.\nagentId: a631e03755422d8ec"
+    assert langfuse_hook.extract_agent_id_from_result(out) == "a631e03755422d8ec"
+
+
+def test_extract_agent_id_absent():
+    """Returns None when no agentId token is present."""
+    assert langfuse_hook.extract_agent_id_from_result("some unrelated tool output") is None
+
+
+def test_extract_agent_id_empty():
+    """Returns None for empty/falsy input."""
+    assert langfuse_hook.extract_agent_id_from_result("") is None
+    assert langfuse_hook.extract_agent_id_from_result(None) is None

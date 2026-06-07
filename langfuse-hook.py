@@ -501,6 +501,23 @@ def extract_agent_name(transcript_path: str) -> str:
     return ""
 
 
+_AGENT_ID_RE = re.compile(r"agentId:\s*([0-9a-f]+)")
+
+
+def extract_agent_id_from_result(tool_output) -> str | None:
+    """Extract the subagent agentId from an Agent tool_result.
+
+    Both synchronous results ("agentId: <id> (use SendMessage ...)") and
+    asynchronous ("Async agent launched successfully.\\nagentId: <id>") embed
+    the id as a literal `agentId: <hex>` token. Returns the id, or None when
+    the output is empty or carries no agentId.
+    """
+    if not tool_output:
+        return None
+    m = _AGENT_ID_RE.search(tool_output)
+    return m.group(1) if m else None
+
+
 def extract_ai_title(transcript_path: str) -> str:
     """First non-empty aiTitle from type: 'ai-title' entries.
 
