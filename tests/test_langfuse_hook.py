@@ -2242,6 +2242,74 @@ class TestProcessSession:
         trace = [e for e in sent_batches[0] if e["type"] == "trace-create"][0]
         assert "opus" in trace["body"]["tags"]
 
+    def test_model_missing_tag_when_billable_turn_lacks_model(self, tmp_path, monkeypatch):
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        monkeypatch.setattr(hook, "STATE_DIR", str(state_dir))
+        sent_batches = []
+        monkeypatch.setattr(hook, "send_to_langfuse", lambda batch: sent_batches.append(batch) or True)
+
+        entries = [
+            {"type": "user", "timestamp": "2026-03-29T10:00:00+00:00",
+             "message": {"role": "user", "content": "Hello"}},
+            {"type": "assistant", "timestamp": "2026-03-29T10:00:01+00:00",
+             "message": {  # NOTE: no "model" key, but real usage -> billable
+                 "id": "msg-1", "role": "assistant",
+                 "content": [{"type": "text", "text": "Hi"}],
+                 "usage": {"input_tokens": 1000, "output_tokens": 500,
+                           "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}},
+        ]
+        path = self._make_transcript(tmp_path, entries)
+        hook.process_session("missing-model-sess", path, "/test")
+
+        trace = [e for e in sent_batches[0] if e["type"] == "trace-create"][0]
+        assert "model-missing" in trace["body"]["tags"]
+        gen = [e for e in sent_batches[0] if e["type"] == "generation-create"][0]
+        assert gen["body"]["costDetails"] is None  # $0, no fabricated cost
+
+    def test_no_model_missing_tag_when_model_present(self, tmp_path, monkeypatch):
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        monkeypatch.setattr(hook, "STATE_DIR", str(state_dir))
+        sent_batches = []
+        monkeypatch.setattr(hook, "send_to_langfuse", lambda batch: sent_batches.append(batch) or True)
+
+        entries = [
+            {"type": "user", "timestamp": "2026-03-29T10:00:00+00:00",
+             "message": {"role": "user", "content": "Hello"}},
+            {"type": "assistant", "timestamp": "2026-03-29T10:00:01+00:00",
+             "message": {"id": "msg-1", "role": "assistant", "model": "claude-opus-4-6",
+                         "content": [{"type": "text", "text": "Hi"}],
+                         "usage": {"input_tokens": 10, "output_tokens": 5,
+                                   "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}},
+        ]
+        path = self._make_transcript(tmp_path, entries)
+        hook.process_session("present-model-sess", path, "/test")
+        trace = [e for e in sent_batches[0] if e["type"] == "trace-create"][0]
+        assert "model-missing" not in trace["body"]["tags"]
+
+    def test_no_model_missing_tag_for_zero_usage_stub(self, tmp_path, monkeypatch):
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        monkeypatch.setattr(hook, "STATE_DIR", str(state_dir))
+        sent_batches = []
+        monkeypatch.setattr(hook, "send_to_langfuse", lambda batch: sent_batches.append(batch) or True)
+
+        entries = [
+            {"type": "user", "timestamp": "2026-03-29T10:00:00+00:00",
+             "message": {"role": "user", "content": "Hello"}},
+            {"type": "assistant", "timestamp": "2026-03-29T10:00:01+00:00",
+             "message": {  # no model, zero usage -> not billable -> no tag
+                 "id": "msg-1", "role": "assistant",
+                 "content": [{"type": "text", "text": "Hi"}],
+                 "usage": {"input_tokens": 0, "output_tokens": 0,
+                           "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}},
+        ]
+        path = self._make_transcript(tmp_path, entries)
+        hook.process_session("zero-usage-sess", path, "/test")
+        trace = [e for e in sent_batches[0] if e["type"] == "trace-create"][0]
+        assert "model-missing" not in trace["body"]["tags"]
+
 
 # ---------------------------------------------------------------------------
 # main

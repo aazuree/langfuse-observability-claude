@@ -1726,6 +1726,13 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
         elif m and m != "<synthetic>":
             model_families.add("sonnet")
 
+    # A turn with billable tokens but no model would otherwise be silently
+    # mispriced (was: defaulted to Opus). Surface it as a filterable trace tag.
+    has_missing_model = any(
+        not (t.get("model") or "") and _has_billable_tokens(t.get("usage") or {})
+        for t in turns
+    )
+
     # Aggregate totals for the trace
     total_tokens = sum(t["usage"]["total"] for t in turns)
     total_input = sum(t["usage"]["input"] for t in turns)
@@ -1826,6 +1833,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 session_meta.get("entrypoint") or None,
                 "fast" if has_fast else None,
                 "has-errors" if has_errors else None,
+                "model-missing" if has_missing_model else None,
                 f"permission:{permission_mode}" if permission_mode else None,
                 f"agent-name:{agent_name}" if agent_name else None,
                 f"session-kind:{session_kind}" if session_kind else None,
