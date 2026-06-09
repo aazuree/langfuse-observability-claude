@@ -1009,6 +1009,66 @@ class TestCalculateTurnCost:
         assert abs(inp_cost - 0.80) < 0.001  # $0.80/1M input
         assert abs(out_cost - 4.00) < 0.001  # $4/1M output
 
+    def test_fable_pricing(self):
+        usage = self._usage(inp=1_000_000, out=1_000_000)
+        cost, inp_cost, out_cost, details = hook.calculate_turn_cost(usage, "claude-fable-5")
+        assert abs(inp_cost - 10.0) < 0.001   # $10/1M input
+        assert abs(out_cost - 50.0) < 0.001   # $50/1M output
+
+    def test_fable_cache_read_and_write_5m(self):
+        usage = self._usage(cache_read=1_000_000, cache_creation=1_000_000)
+        cost, inp_cost, out_cost, details = hook.calculate_turn_cost(usage, "claude-fable-5")
+        assert abs(details["cache_read_input_tokens"] - 1.00) < 0.001       # $1.00/1M read
+        assert abs(details["cache_creation_input_tokens"] - 12.50) < 0.001  # $12.50/1M write 5m
+
+    def test_fable_cache_write_1h(self):
+        usage = self._usage(cache_creation=1_000_000)
+        cost, _i, _o, details = hook.calculate_turn_cost(
+            usage, "claude-fable-5", cache_5m=0, cache_1h=1_000_000
+        )
+        assert abs(details["cache_creation_input_tokens"] - 20.00) < 0.001  # $20.00/1M write 1h
+
+    def test_bedrock_prefixed_fable_bills_same(self):
+        usage = self._usage(inp=1_000_000, out=1_000_000)
+        _c, inp_cost, out_cost, _d = hook.calculate_turn_cost(usage, "anthropic.claude-fable-5")
+        assert abs(inp_cost - 10.0) < 0.001
+        assert abs(out_cost - 50.0) < 0.001
+
+    def test_fable_fast_mode_no_multiplier(self):
+        # Fable has no /fast variant — speed="fast" must not scale the rate.
+        usage = self._usage(inp=1_000_000, out=1_000_000)
+        _c, inp_cost, _o, _d = hook.calculate_turn_cost(usage, "claude-fable-5", speed="fast")
+        assert abs(inp_cost - 10.0) < 0.001
+
+    def test_no_default_model_constant(self):
+        assert not hasattr(hook, "DEFAULT_MODEL"), \
+            "DEFAULT_MODEL must be removed — missing models report $0, not a fabricated default"
+
+    def test_has_billable_tokens(self):
+        assert hook._has_billable_tokens({"input": 1}) is True
+        assert hook._has_billable_tokens({"cache_read": 5}) is True
+        assert hook._has_billable_tokens({"cache_creation": 7}) is True
+        assert hook._has_billable_tokens(
+            {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0}
+        ) is False
+        assert hook._has_billable_tokens({}) is False
+
+    def test_empty_model_billable_returns_zero_and_warns(self, monkeypatch):
+        warnings = []
+        monkeypatch.setattr(hook, "log", lambda msg: warnings.append(msg))
+        usage = self._usage(inp=1_000_000, out=1_000_000)
+        cost, inp_cost, out_cost, details = hook.calculate_turn_cost(usage, "")
+        assert cost == 0.0 and inp_cost == 0.0 and out_cost == 0.0
+        assert details == {}
+        assert any("[WARN]" in w and "no model" in w for w in warnings)
+
+    def test_empty_model_zero_usage_is_silent(self, monkeypatch):
+        warnings = []
+        monkeypatch.setattr(hook, "log", lambda msg: warnings.append(msg))
+        cost, _i, _o, details = hook.calculate_turn_cost(self._usage(), "")
+        assert cost == 0.0 and details == {}
+        assert not any("[WARN]" in w for w in warnings)
+
     def test_cache_read_cost(self):
         usage = self._usage(cache_read=1_000_000)
         cost, inp_cost, out_cost, details = hook.calculate_turn_cost(usage, "claude-sonnet-4-6")
@@ -1071,6 +1131,12 @@ class TestCalculateTurnCost:
         ("claude-sonnet-4-5-20250929",   3.0,   15.0),
         ("claude-sonnet-4-20250514",     3.0,   15.0),
         ("claude-haiku-4-5-20251001",    1.0,    5.0),
+        # Fable 5 + Bedrock provider-prefixed IDs (substring match → base rate)
+        ("claude-fable-5",               10.0,   50.0),
+        ("anthropic.claude-fable-5",     10.0,   50.0),
+        ("anthropic.claude-opus-4-8",     5.0,   25.0),
+        ("us.anthropic.claude-opus-4-8",  5.0,   25.0),
+        ("eu.anthropic.claude-sonnet-4-6", 3.0,  15.0),
         # Legacy models
         ("claude-opus-4-1-20250805",    15.0,   75.0),
         ("claude-opus-4-20250514",      15.0,   75.0),
@@ -2175,6 +2241,74 @@ class TestProcessSession:
 
         trace = [e for e in sent_batches[0] if e["type"] == "trace-create"][0]
         assert "opus" in trace["body"]["tags"]
+
+    def test_model_missing_tag_when_billable_turn_lacks_model(self, tmp_path, monkeypatch):
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        monkeypatch.setattr(hook, "STATE_DIR", str(state_dir))
+        sent_batches = []
+        monkeypatch.setattr(hook, "send_to_langfuse", lambda batch: sent_batches.append(batch) or True)
+
+        entries = [
+            {"type": "user", "timestamp": "2026-03-29T10:00:00+00:00",
+             "message": {"role": "user", "content": "Hello"}},
+            {"type": "assistant", "timestamp": "2026-03-29T10:00:01+00:00",
+             "message": {  # NOTE: no "model" key, but real usage -> billable
+                 "id": "msg-1", "role": "assistant",
+                 "content": [{"type": "text", "text": "Hi"}],
+                 "usage": {"input_tokens": 1000, "output_tokens": 500,
+                           "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}},
+        ]
+        path = self._make_transcript(tmp_path, entries)
+        hook.process_session("missing-model-sess", path, "/test")
+
+        trace = [e for e in sent_batches[0] if e["type"] == "trace-create"][0]
+        assert "model-missing" in trace["body"]["tags"]
+        gen = [e for e in sent_batches[0] if e["type"] == "generation-create"][0]
+        assert gen["body"]["costDetails"] is None  # $0, no fabricated cost
+
+    def test_no_model_missing_tag_when_model_present(self, tmp_path, monkeypatch):
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        monkeypatch.setattr(hook, "STATE_DIR", str(state_dir))
+        sent_batches = []
+        monkeypatch.setattr(hook, "send_to_langfuse", lambda batch: sent_batches.append(batch) or True)
+
+        entries = [
+            {"type": "user", "timestamp": "2026-03-29T10:00:00+00:00",
+             "message": {"role": "user", "content": "Hello"}},
+            {"type": "assistant", "timestamp": "2026-03-29T10:00:01+00:00",
+             "message": {"id": "msg-1", "role": "assistant", "model": "claude-opus-4-6",
+                         "content": [{"type": "text", "text": "Hi"}],
+                         "usage": {"input_tokens": 10, "output_tokens": 5,
+                                   "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}},
+        ]
+        path = self._make_transcript(tmp_path, entries)
+        hook.process_session("present-model-sess", path, "/test")
+        trace = [e for e in sent_batches[0] if e["type"] == "trace-create"][0]
+        assert "model-missing" not in trace["body"]["tags"]
+
+    def test_no_model_missing_tag_for_zero_usage_stub(self, tmp_path, monkeypatch):
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        monkeypatch.setattr(hook, "STATE_DIR", str(state_dir))
+        sent_batches = []
+        monkeypatch.setattr(hook, "send_to_langfuse", lambda batch: sent_batches.append(batch) or True)
+
+        entries = [
+            {"type": "user", "timestamp": "2026-03-29T10:00:00+00:00",
+             "message": {"role": "user", "content": "Hello"}},
+            {"type": "assistant", "timestamp": "2026-03-29T10:00:01+00:00",
+             "message": {  # no model, zero usage -> not billable -> no tag
+                 "id": "msg-1", "role": "assistant",
+                 "content": [{"type": "text", "text": "Hi"}],
+                 "usage": {"input_tokens": 0, "output_tokens": 0,
+                           "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}},
+        ]
+        path = self._make_transcript(tmp_path, entries)
+        hook.process_session("zero-usage-sess", path, "/test")
+        trace = [e for e in sent_batches[0] if e["type"] == "trace-create"][0]
+        assert "model-missing" not in trace["body"]["tags"]
 
 
 # ---------------------------------------------------------------------------

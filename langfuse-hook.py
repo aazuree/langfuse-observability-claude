@@ -50,8 +50,6 @@ _SYNTHETIC_PROMPT_RE = re.compile(r"^<[a-z][a-z0-9-]*>")
 
 SUBAGENT_MATCH_WINDOW_S = 60  # Max seconds between Agent tool_use and subagent start
 
-# Default model for cost calculation when model field is missing
-DEFAULT_MODEL = "claude-opus-4-6"
 
 # Pro subscription: $0 marginal cost. Set to True to report equivalent API cost instead.
 REPORT_API_EQUIVALENT_COST = True
@@ -363,7 +361,7 @@ def ingest_subagent(
         start_time = turn["start_time"]
         end_time = turn["end_time"]
         usage = turn["usage"]
-        model = turn.get("model", "claude-sonnet-4-6") or "claude-sonnet-4-6"
+        model = turn.get("model") or ""
 
         turn_cost, input_cost, output_cost, cost_details = calculate_turn_cost(
             usage,
@@ -1286,6 +1284,15 @@ def _otel_genai_attrs(
     return attrs
 
 
+def _has_billable_tokens(usage: dict) -> bool:
+    """True when a turn has any cost-bearing tokens (input/output/cache).
+
+    Used to suppress the missing-model warning/tag for zero-usage stub turns
+    (slash commands, synthetic prompts) whose cost is legitimately $0.
+    """
+    return any(usage.get(k, 0) for k in ("input", "output", "cache_read", "cache_creation"))
+
+
 def calculate_turn_cost(
     usage: dict,
     model: str,
@@ -1310,6 +1317,15 @@ def calculate_turn_cost(
         return 0.0, 0.0, 0.0, {}
 
     m = model.lower()
+    if not m:
+        # No model on the turn. Do NOT fabricate a default — report $0 so the
+        # dashboard shows an obvious gap. Warn only when tokens are actually
+        # billable; zero-usage stub turns ($0 regardless) stay silent.
+        if _has_billable_tokens(usage):
+            log("[WARN] calculate_turn_cost: turn has no model field but carries "
+                "billable tokens — cost reported as $0. Upstream transcript is missing "
+                "the assistant 'model' value; FIX the source.")
+        return 0.0, 0.0, 0.0, {}
     # Pricing per 1M tokens: (input, output, cache_read, cache_write_5m, cache_write_1h)
     # Source: platform.claude.com/docs/en/about-claude/pricing (verified 2026-05-13)
     # When a new model releases, its name will fall through to Sonnet pricing and log a warning.
@@ -1344,6 +1360,10 @@ def calculate_turn_cost(
         p_in, p_out, p_cr, p_cc5, p_cc1 = 3.0, 15.0, 0.30, 3.75, 6.00
         if "sonnet-4-6" in m:
             supports_inference_geo = True
+    elif "fable" in m:                               # Fable 5 (top tier, $10/$50)
+        # supports_fast_mode / supports_inference_geo stay False: Fable has no
+        # /fast variant, and its data-residency multiplier is unverified.
+        p_in, p_out, p_cr, p_cc5, p_cc1 = 10.00, 50.00, 1.00, 12.50, 20.00
     else:
         log(f"[WARN] calculate_turn_cost: unrecognised model '{model}' — cost reported as $0. "
             "Update calculate_turn_cost() and CLAUDE.md if this is a new Anthropic model.")
@@ -1495,7 +1515,7 @@ def build_skill_attribution_summary(turns: list[dict]) -> dict | None:
         b["cache_create_tokens"] += usage.get("cache_creation", 0)
         turn_cost, _i, _o, _cd = calculate_turn_cost(
             usage,
-            t.get("model") or DEFAULT_MODEL,
+            t.get("model") or "",
             t.get("cache_ephemeral_5m", 0),
             t.get("cache_ephemeral_1h", 0),
             speed=t.get("speed", ""),
@@ -1706,6 +1726,13 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
         elif m and m != "<synthetic>":
             model_families.add("sonnet")
 
+    # A turn with billable tokens but no model would otherwise be silently
+    # mispriced (was: defaulted to Opus). Surface it as a filterable trace tag.
+    has_missing_model = any(
+        not (t.get("model") or "") and _has_billable_tokens(t.get("usage") or {})
+        for t in turns
+    )
+
     # Aggregate totals for the trace
     total_tokens = sum(t["usage"]["total"] for t in turns)
     total_input = sum(t["usage"]["input"] for t in turns)
@@ -1806,6 +1833,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 session_meta.get("entrypoint") or None,
                 "fast" if has_fast else None,
                 "has-errors" if has_errors else None,
+                "model-missing" if has_missing_model else None,
                 f"permission:{permission_mode}" if permission_mode else None,
                 f"agent-name:{agent_name}" if agent_name else None,
                 f"session-kind:{session_kind}" if session_kind else None,
@@ -1831,7 +1859,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
         first_token_time = turn.get("first_token_time")
         duration_ms = turn.get("duration_ms")
         usage = turn["usage"]
-        model = turn.get("model") or DEFAULT_MODEL
+        model = turn.get("model") or ""
 
         tool_names = [tc["name"] for tc in turn["tool_calls"]]
 
