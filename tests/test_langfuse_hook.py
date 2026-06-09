@@ -1009,6 +1009,37 @@ class TestCalculateTurnCost:
         assert abs(inp_cost - 0.80) < 0.001  # $0.80/1M input
         assert abs(out_cost - 4.00) < 0.001  # $4/1M output
 
+    def test_fable_pricing(self):
+        usage = self._usage(inp=1_000_000, out=1_000_000)
+        cost, inp_cost, out_cost, details = hook.calculate_turn_cost(usage, "claude-fable-5")
+        assert abs(inp_cost - 10.0) < 0.001   # $10/1M input
+        assert abs(out_cost - 50.0) < 0.001   # $50/1M output
+
+    def test_fable_cache_read_and_write_5m(self):
+        usage = self._usage(cache_read=1_000_000, cache_creation=1_000_000)
+        cost, inp_cost, out_cost, details = hook.calculate_turn_cost(usage, "claude-fable-5")
+        assert abs(details["cache_read_input_tokens"] - 1.00) < 0.001       # $1.00/1M read
+        assert abs(details["cache_creation_input_tokens"] - 12.50) < 0.001  # $12.50/1M write 5m
+
+    def test_fable_cache_write_1h(self):
+        usage = self._usage(cache_creation=1_000_000)
+        cost, _i, _o, details = hook.calculate_turn_cost(
+            usage, "claude-fable-5", cache_5m=0, cache_1h=1_000_000
+        )
+        assert abs(details["cache_creation_input_tokens"] - 20.00) < 0.001  # $20.00/1M write 1h
+
+    def test_bedrock_prefixed_fable_bills_same(self):
+        usage = self._usage(inp=1_000_000, out=1_000_000)
+        _c, inp_cost, out_cost, _d = hook.calculate_turn_cost(usage, "anthropic.claude-fable-5")
+        assert abs(inp_cost - 10.0) < 0.001
+        assert abs(out_cost - 50.0) < 0.001
+
+    def test_fable_fast_mode_no_multiplier(self):
+        # Fable has no /fast variant — speed="fast" must not scale the rate.
+        usage = self._usage(inp=1_000_000, out=1_000_000)
+        _c, inp_cost, _o, _d = hook.calculate_turn_cost(usage, "claude-fable-5", speed="fast")
+        assert abs(inp_cost - 10.0) < 0.001
+
     def test_cache_read_cost(self):
         usage = self._usage(cache_read=1_000_000)
         cost, inp_cost, out_cost, details = hook.calculate_turn_cost(usage, "claude-sonnet-4-6")
@@ -1071,6 +1102,12 @@ class TestCalculateTurnCost:
         ("claude-sonnet-4-5-20250929",   3.0,   15.0),
         ("claude-sonnet-4-20250514",     3.0,   15.0),
         ("claude-haiku-4-5-20251001",    1.0,    5.0),
+        # Fable 5 + Bedrock provider-prefixed IDs (substring match → base rate)
+        ("claude-fable-5",               10.0,   50.0),
+        ("anthropic.claude-fable-5",     10.0,   50.0),
+        ("anthropic.claude-opus-4-8",     5.0,   25.0),
+        ("us.anthropic.claude-opus-4-8",  5.0,   25.0),
+        ("eu.anthropic.claude-sonnet-4-6", 3.0,  15.0),
         # Legacy models
         ("claude-opus-4-1-20250805",    15.0,   75.0),
         ("claude-opus-4-20250514",      15.0,   75.0),

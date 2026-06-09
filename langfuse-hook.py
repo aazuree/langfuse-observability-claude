@@ -1344,6 +1344,10 @@ def calculate_turn_cost(
         p_in, p_out, p_cr, p_cc5, p_cc1 = 3.0, 15.0, 0.30, 3.75, 6.00
         if "sonnet-4-6" in m:
             supports_inference_geo = True
+    elif "fable" in m:                               # Fable 5 (top tier, $10/$50)
+        # supports_fast_mode / supports_inference_geo stay False: Fable has no
+        # /fast variant, and its data-residency multiplier is unverified.
+        p_in, p_out, p_cr, p_cc5, p_cc1 = 10.00, 50.00, 1.00, 12.50, 20.00
     else:
         log(f"[WARN] calculate_turn_cost: unrecognised model '{model}' — cost reported as $0. "
             "Update calculate_turn_cost() and CLAUDE.md if this is a new Anthropic model.")
