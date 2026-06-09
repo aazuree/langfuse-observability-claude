@@ -1040,6 +1040,31 @@ class TestCalculateTurnCost:
         _c, inp_cost, _o, _d = hook.calculate_turn_cost(usage, "claude-fable-5", speed="fast")
         assert abs(inp_cost - 10.0) < 0.001
 
+    def test_has_billable_tokens(self):
+        assert hook._has_billable_tokens({"input": 1}) is True
+        assert hook._has_billable_tokens({"cache_read": 5}) is True
+        assert hook._has_billable_tokens({"cache_creation": 7}) is True
+        assert hook._has_billable_tokens(
+            {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0}
+        ) is False
+        assert hook._has_billable_tokens({}) is False
+
+    def test_empty_model_billable_returns_zero_and_warns(self, monkeypatch):
+        warnings = []
+        monkeypatch.setattr(hook, "log", lambda msg: warnings.append(msg))
+        usage = self._usage(inp=1_000_000, out=1_000_000)
+        cost, inp_cost, out_cost, details = hook.calculate_turn_cost(usage, "")
+        assert cost == 0.0 and inp_cost == 0.0 and out_cost == 0.0
+        assert details == {}
+        assert any("[WARN]" in w and "no model" in w for w in warnings)
+
+    def test_empty_model_zero_usage_is_silent(self, monkeypatch):
+        warnings = []
+        monkeypatch.setattr(hook, "log", lambda msg: warnings.append(msg))
+        cost, _i, _o, details = hook.calculate_turn_cost(self._usage(), "")
+        assert cost == 0.0 and details == {}
+        assert not any("[WARN]" in w for w in warnings)
+
     def test_cache_read_cost(self):
         usage = self._usage(cache_read=1_000_000)
         cost, inp_cost, out_cost, details = hook.calculate_turn_cost(usage, "claude-sonnet-4-6")

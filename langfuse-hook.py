@@ -1286,6 +1286,15 @@ def _otel_genai_attrs(
     return attrs
 
 
+def _has_billable_tokens(usage: dict) -> bool:
+    """True when a turn has any cost-bearing tokens (input/output/cache).
+
+    Used to suppress the missing-model warning/tag for zero-usage stub turns
+    (slash commands, synthetic prompts) whose cost is legitimately $0.
+    """
+    return any(usage.get(k, 0) for k in ("input", "output", "cache_read", "cache_creation"))
+
+
 def calculate_turn_cost(
     usage: dict,
     model: str,
@@ -1310,6 +1319,15 @@ def calculate_turn_cost(
         return 0.0, 0.0, 0.0, {}
 
     m = model.lower()
+    if not m:
+        # No model on the turn. Do NOT fabricate a default — report $0 so the
+        # dashboard shows an obvious gap. Warn only when tokens are actually
+        # billable; zero-usage stub turns ($0 regardless) stay silent.
+        if _has_billable_tokens(usage):
+            log("[WARN] calculate_turn_cost: turn has no model field but carries "
+                "billable tokens — cost reported as $0. Upstream transcript is missing "
+                "the assistant 'model' value; FIX the source.")
+        return 0.0, 0.0, 0.0, {}
     # Pricing per 1M tokens: (input, output, cache_read, cache_write_5m, cache_write_1h)
     # Source: platform.claude.com/docs/en/about-claude/pricing (verified 2026-05-13)
     # When a new model releases, its name will fall through to Sonnet pricing and log a warning.
