@@ -50,8 +50,6 @@ _SYNTHETIC_PROMPT_RE = re.compile(r"^<[a-z][a-z0-9-]*>")
 
 SUBAGENT_MATCH_WINDOW_S = 60  # Max seconds between Agent tool_use and subagent start
 
-# Default model for cost calculation when model field is missing
-DEFAULT_MODEL = "claude-opus-4-6"
 
 # Pro subscription: $0 marginal cost. Set to True to report equivalent API cost instead.
 REPORT_API_EQUIVALENT_COST = True
@@ -363,7 +361,7 @@ def ingest_subagent(
         start_time = turn["start_time"]
         end_time = turn["end_time"]
         usage = turn["usage"]
-        model = turn.get("model", "claude-sonnet-4-6") or "claude-sonnet-4-6"
+        model = turn.get("model") or ""
 
         turn_cost, input_cost, output_cost, cost_details = calculate_turn_cost(
             usage,
@@ -1517,7 +1515,7 @@ def build_skill_attribution_summary(turns: list[dict]) -> dict | None:
         b["cache_create_tokens"] += usage.get("cache_creation", 0)
         turn_cost, _i, _o, _cd = calculate_turn_cost(
             usage,
-            t.get("model") or DEFAULT_MODEL,
+            t.get("model") or "",
             t.get("cache_ephemeral_5m", 0),
             t.get("cache_ephemeral_1h", 0),
             speed=t.get("speed", ""),
@@ -1853,7 +1851,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
         first_token_time = turn.get("first_token_time")
         duration_ms = turn.get("duration_ms")
         usage = turn["usage"]
-        model = turn.get("model") or DEFAULT_MODEL
+        model = turn.get("model") or ""
 
         tool_names = [tc["name"] for tc in turn["tool_calls"]]
 

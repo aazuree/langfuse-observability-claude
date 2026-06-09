@@ -1040,6 +1040,10 @@ class TestCalculateTurnCost:
         _c, inp_cost, _o, _d = hook.calculate_turn_cost(usage, "claude-fable-5", speed="fast")
         assert abs(inp_cost - 10.0) < 0.001
 
+    def test_no_default_model_constant(self):
+        assert not hasattr(hook, "DEFAULT_MODEL"), \
+            "DEFAULT_MODEL must be removed — missing models report $0, not a fabricated default"
+
     def test_has_billable_tokens(self):
         assert hook._has_billable_tokens({"input": 1}) is True
         assert hook._has_billable_tokens({"cache_read": 5}) is True
