@@ -109,10 +109,11 @@ uv run pytest tests/ -k "discover" -v  # Run tests matching pattern
 
 ## Cost Model
 
-Pricing is model-aware (per 1M tokens). Source: [platform.claude.com/docs/en/about-claude/pricing](https://platform.claude.com/docs/en/about-claude/pricing) (last verified 2026-06-01).
+Pricing is model-aware (per 1M tokens). Source: [platform.claude.com/docs/en/about-claude/pricing](https://platform.claude.com/docs/en/about-claude/pricing) (last verified 2026-06-09).
 
 | Model | Input | Output | Cache Read | Cache Write 5m | Cache Write 1h |
 |-------|-------|--------|------------|----------------|----------------|
+| Fable 5 | $10.00 | $50.00 | $1.00 | $12.50 | $20.00 |
 | Opus 4.8 / 4.7 / 4.6 / 4.5 | $5.00 | $25.00 | $0.50 | $6.25 | $10.00 |
 | Opus 4.1 / 4.0 (legacy) | $15.00 | $75.00 | $1.50 | $18.75 | $30.00 |
 | Sonnet (all versions) | $3.00 | $15.00 | $0.30 | $3.75 | $6.00 |
@@ -129,6 +130,7 @@ Cache write cost is split by tier when `cache_5m` / `cache_1h` are available in 
 These stack multiplicatively on the base rates above (and apply uniformly across input, output, cache read, and cache write tiers):
 
 - **Fast mode (`speed="fast"`)**: per-model premium — **6x** on Opus 4.6 / 4.7 ($30/$150), **2x** on Opus 4.8 ($10/$50). Opus 4.5 and Sonnet/Haiku are ineligible and keep base rates. Multipliers live in `FAST_MODE_MULTIPLIERS` in `langfuse-hook.py`.
+- **Fable 5**: ineligible for fast mode (no `/fast` variant) and data residency (`inference_geo` multiplier unverified) — always billed at base $10/$50. Update `calculate_turn_cost` if Anthropic publishes Fable multipliers.
 - **Data residency (`inference_geo="us"`)**: 1.1x on Opus 4.6+/Sonnet 4.6+. Other models do not support the `inference_geo` parameter; multiplier is not applied.
 - **Fast + US-geo stack**: 6x × 1.1x = 6.6x (Opus 4.6/4.7); 2x × 1.1x = 2.2x (Opus 4.8).
 
@@ -141,6 +143,33 @@ These stack multiplicatively on the base rates above (and apply uniformly across
 Set `REPORT_API_EQUIVALENT_COST = False` in `langfuse-hook.py` to report $0.
 
 **Keeping prices up to date:** Pricing is hardcoded in `calculate_turn_cost()` (`langfuse-hook.py`). When Anthropic releases new models or changes prices, update that function and the table above. Unknown models return $0 and emit a `[WARN]` in `langfuse-hook.log` — that's the signal to update. We send explicit costs rather than relying on Langfuse's built-in model table because Langfuse's table lags new model releases by days/weeks.
+
+### AWS Bedrock Pricing (reference)
+
+Claude Code sessions routed through AWS Bedrock carry provider-prefixed model IDs
+(`anthropic.claude-*`, `us.anthropic.claude-*`, `eu.anthropic.claude-*`,
+`global.anthropic.claude-*`). The substring matcher in `calculate_turn_cost`
+already bills these at the **base** first-party rate (e.g. `anthropic.claude-opus-4-8`
+→ $5/$25).
+
+Bedrock list price matches the first-party Anthropic API for the same model. The
+price axis on Bedrock is **endpoint type, not geography** — EU and US base rates are
+identical (verified on the AWS Bedrock pricing page, June 2026: Claude 3.5 Sonnet
+shows $6/$30 across both US East and Europe regions). Cross-region inference
+(geo/regional `us.`/`eu.` endpoints) adds a **+10%** premium over the global
+endpoint; the premium is the same for US and EU.
+
+| Model | First-party API ($/1M in / out) | Bedrock global | Bedrock US/EU geo (`us.`/`eu.`, +10%) |
+|-------|----------------------------------|----------------|----------------------------------------|
+| Fable 5 | $10 / $50 | not on Bedrock | — |
+| Opus 4.8 / 4.7 / 4.6 | $5 / $25 | $5 / $25 | $5.50 / $27.50 |
+| Sonnet 4.x | $3 / $15 | $3 / $15 | $3.30 / $16.50 |
+| Haiku 4.5 | $1 / $5 | $1 / $5 | $1.10 / $5.50 |
+
+**Known gap (not coded):** the +10% geo premium is **not** auto-applied — Claude Code
+transcripts do not expose the Bedrock endpoint type, so the matcher cannot tell a
+global call from a geo call and bills both at base. Fable 5 is not yet available on
+Bedrock. Canonical source: aws.amazon.com/bedrock/pricing (verified June 2026).
 
 ## Tags and Metadata
 
@@ -158,6 +187,7 @@ Each trace is enriched with:
 - entrypoint — `cli` or other launch method
 - `fast` — present if any turn used `/fast` mode
 - `has-errors` — present if API errors occurred during the session
+- `model-missing` — present when any turn had **billable tokens but no `model` field**; that turn's cost is reported as `$0` (never defaulted to a priced model) and a `[WARN]` is logged. Filter on this to find sessions with under-reported cost from upstream transcript gaps.
 - `permission:<mode>` — current permission mode (`default`, `acceptEdits`, `plan`, `bypassPermissions`)
 - `pr:<N>` — one tag per PR linked from the session (via `pr-link` transcript entries)
 - `agent-name:{slug}` — present when `type: "agent-name"` entry exists (e.g., `agent-name:langfuse-usagedetails-fix`)
@@ -251,6 +281,8 @@ Reference: [opentelemetry.io/docs/specs/semconv/gen-ai/](https://opentelemetry.i
 ## Extended Thinking
 
 Extended thinking capture was removed (Claude Code v2.1.112+). As of that version, Claude Code no longer writes thinking text to transcript JSONL files — `thinking` blocks always have an empty `thinking` field. The `has-thinking` tag and `thinking_chars` metadata are no longer emitted.
+
+Visible model reasoning is gated by the API `thinking.display` parameter (default `"omitted"` on Opus 4.7/4.8 and Fable 5, `"summarized"` on older models) — a model-level default applied uniformly across providers. Any difference you observe between Bedrock and first-party/Pro reflects the requesting client's chosen `display` value, not provider-specific gating. Either way it is moot for this hook, which never sees thinking text post-v2.1.112.
 
 ## Langfuse API Gotchas
 
