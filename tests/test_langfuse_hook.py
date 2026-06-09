@@ -2242,6 +2242,29 @@ class TestProcessSession:
         trace = [e for e in sent_batches[0] if e["type"] == "trace-create"][0]
         assert "opus" in trace["body"]["tags"]
 
+    def test_background_tasks_metadata_and_tag(self, tmp_path, monkeypatch):
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        monkeypatch.setattr(hook, "STATE_DIR", str(state_dir))
+        sent = []
+        monkeypatch.setattr(hook, "send_to_langfuse", lambda b: sent.append(b) or True)
+        entries = [
+            {"type": "user", "timestamp": "2026-03-29T10:00:00+00:00",
+             "message": {"role": "user", "content": "go"}},
+            {"type": "assistant", "timestamp": "2026-03-29T10:00:01+00:00",
+             "message": {"id": "m1", "role": "assistant", "model": "claude-opus-4-8",
+                         "content": [{"type": "text", "text": "ok"}],
+                         "usage": {"input_tokens": 5, "output_tokens": 5,
+                                   "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}},
+        ]
+        path = self._make_transcript(tmp_path, entries)
+        hook.process_session("bg-sess", path, "/test",
+                             background_tasks=[{"id": "t1"}], session_crons=[{"id": "c1"}])
+        trace = [e for e in sent[0] if e["type"] == "trace-create"][0]
+        assert "has-background-tasks" in trace["body"]["tags"]
+        assert trace["body"]["metadata"]["background_tasks"] == [{"id": "t1"}]
+        assert trace["body"]["metadata"]["session_crons"] == [{"id": "c1"}]
+
     def test_model_missing_tag_when_billable_turn_lacks_model(self, tmp_path, monkeypatch):
         state_dir = tmp_path / "state"
         state_dir.mkdir()

@@ -1658,7 +1658,7 @@ def gen_metadata_cache_miss(turn: dict) -> dict:
     }
 
 
-def process_session(session_id: str, transcript_path: str, cwd: str, last_assistant_message: str = "", live: bool = True) -> None:
+def process_session(session_id: str, transcript_path: str, cwd: str, last_assistant_message: str = "", live: bool = True, background_tasks: list = None, session_crons: list = None) -> None:
     """Core processing logic for a single session transcript."""
     # effort comes from the live hook process environment ($CLAUDE_EFFORT,
     # v2.1.133+). It is NOT in the transcript, so it cannot be recovered on
@@ -1825,6 +1825,8 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 "total_iterations": sum(t.get("iteration_count", 0) for t in turns),
                 "cache_miss": build_cache_miss_summary(turns),
                 "effort_level": effort or None,
+                "background_tasks": background_tasks or None,
+                "session_crons": session_crons or None,
             },
             "tags": [t for t in [
                 "claude-code",
@@ -1833,6 +1835,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 session_meta.get("entrypoint") or None,
                 "fast" if has_fast else None,
                 "has-errors" if has_errors else None,
+                "has-background-tasks" if background_tasks else None,
                 "model-missing" if has_missing_model else None,
                 f"permission:{permission_mode}" if permission_mode else None,
                 f"agent-name:{agent_name}" if agent_name else None,
@@ -2199,7 +2202,9 @@ def main() -> None:
         log("No transcript_path provided")
         return
 
-    process_session(session_id, transcript_path, cwd, last_assistant_message)
+    process_session(session_id, transcript_path, cwd, last_assistant_message,
+                    background_tasks=hook_input.get("background_tasks"),
+                    session_crons=hook_input.get("session_crons"))
 
 
 if __name__ == "__main__":
