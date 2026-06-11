@@ -148,6 +148,35 @@ def _project_dir_from_cwd(cwd: str) -> str:
     return cwd.replace("/", "-").replace(".", "-")
 
 
+def _subagent_search_dirs(transcript_path: str, cwd: str = "") -> list:
+    """Resolve candidate subagents/ directories for a session.
+
+    Primary: <transcript without .jsonl>/subagents/. Fallback: cwd-derived
+    project dir (sessions that moved into a worktree mid-run). Earlier
+    entries win on duplicates.
+    """
+    base = transcript_path
+    if base.endswith(".jsonl"):
+        base = base[:-6]
+    primary_dir = os.path.join(base, "subagents")
+
+    search_dirs = []
+    if os.path.isdir(primary_dir):
+        search_dirs.append(primary_dir)
+
+    if cwd:
+        session_id = os.path.basename(base)
+        alt_dir = os.path.join(
+            PROJECTS_DIR,
+            _project_dir_from_cwd(cwd),
+            session_id,
+            "subagents",
+        )
+        if alt_dir not in search_dirs and os.path.isdir(alt_dir):
+            search_dirs.append(alt_dir)
+    return search_dirs
+
+
 def discover_subagents(
     transcript_path: str,
     agent_tool_uses: list,
@@ -173,28 +202,7 @@ def discover_subagents(
     if not agent_tool_uses:
         return []
 
-    # Primary location: <transcript without .jsonl>/subagents/
-    base = transcript_path
-    if base.endswith(".jsonl"):
-        base = base[:-6]
-    primary_dir = os.path.join(base, "subagents")
-
-    search_dirs = []
-    if os.path.isdir(primary_dir):
-        search_dirs.append(primary_dir)
-
-    # Worktree fallback: cwd-derived project dir.
-    if cwd:
-        session_id = os.path.basename(base)
-        alt_dir = os.path.join(
-            PROJECTS_DIR,
-            _project_dir_from_cwd(cwd),
-            session_id,
-            "subagents",
-        )
-        if alt_dir not in search_dirs and os.path.isdir(alt_dir):
-            search_dirs.append(alt_dir)
-
+    search_dirs = _subagent_search_dirs(transcript_path, cwd)
     if not search_dirs:
         return []
 
