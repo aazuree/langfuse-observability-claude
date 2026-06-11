@@ -163,7 +163,7 @@ This finds all transcript files, deletes any existing traces to avoid duplicates
 
 When Claude Code spawns subagents via the Agent tool, the hook automatically discovers their transcripts at `<session>/subagents/agent-{id}.jsonl`, correlates them by timestamp, and ingests them as nested generations/spans under the parent Agent tool span.
 
-Traces with subagents get `has-subagents` and `subagents:{count}` tags, and trace metadata includes a `subagent_costs` summary with per-agent cost breakdowns and total harness cost.
+Traces with subagents get `has-subagents` and `subagents:{count}` tags, and trace metadata includes a `subagent_costs` summary with per-agent cost breakdowns and total harness cost. Nested sub-agent dispatches (CC 2.1.172+) are followed recursively up to 5 levels and appear as nested generations/spans with per-agent lineage in `subagent_costs`.
 
 ## Running Tests
 
