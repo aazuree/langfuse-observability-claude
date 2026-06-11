@@ -199,6 +199,9 @@ Each trace is enriched with:
 - `compact-trigger:<trigger>` — one per distinct compaction trigger (`manual`/`auto`; `unknown` omitted)
 - `remote-control` — present when the session was bridged to claude.ai (Remote Control / `/remote-control`)
 - `permission-bypass` — present when `bypassPermissions` was active at any point in the session
+- `worktree:<name>` — present when the session ran inside a Claude Code worktree (from the last `worktree-state` entry)
+- `has-background-tasks` — present when the Stop payload carried running background tasks
+- `nested-subagents` — present when any ingested subagent was spawned by another subagent (depth ≥ 2; CC 2.1.172+)
 
 **Trace Name precedence:**
 1. `customTitle` from `type: "custom-title"` (user-set via in-CLI title command)
@@ -237,6 +240,8 @@ via Langfuse's upsert-on-id behaviour.
 - `compaction` — rollup of `system/compact_boundary` events: `{count, triggers: {<trigger>: n}, total_tokens_reclaimed (Σ preTokens−postTokens), total_pre_tokens, total_post_tokens, total_duration_ms, events: [{trigger, pre_tokens, post_tokens, tokens_reclaimed, duration_ms, timestamp}]}`. Surfaces context-window pressure and the token/time cost of compaction. Legacy `type:"summary"` entries (pre-`compactMetadata`) count with `trigger:"legacy"` and no token fields. Unknown triggers pass through verbatim. Null when never compacted. The bare `compaction_occurred` bool (via `detect_compaction`) is retained alongside for back-compat. From `extract_compaction()`.
 - `remote_control` — `{bridge_session_id, url}` from `bridge-session` + `system/bridge_status` entries (the Remote Control / phone-web bridge). Either field may be absent independently; `url` correlates with the claude.ai session. **No timestamps** on these entries. Null when the session was never bridged. From `extract_bridge()`.
 - `permission_timeline` — `{modes_used (sorted distinct), sequence (file-order, consecutive dups collapsed), transition_count, ever_bypass, ever_accept_edits}` from `permission-mode` entries. Complements the last-observed `permission_mode`/`permission:<mode>` tag with the full transition history. **No timestamps** on these entries → sequence is order-only, not timed. Null when no `permission-mode` entries. From `extract_permission_timeline()`.
+- `worktree` — `{name, branch, original_cwd, original_branch, original_head_commit}` from the last `type: "worktree-state"` entry. Null when the session never entered a worktree. From `extract_worktree_state()`.
+- `background_tasks` / `session_crons` — raw lists from the Stop hook stdin payload (v2.1.145+). Live fires only; null on reprocess.
 
 Extracted from the first `type: "user"` entry in the JSONL transcript via `extract_session_metadata()`.
 API errors extracted from `type: "system"` / `subtype: "api_error"` entries via `extract_api_errors()`.
@@ -312,9 +317,19 @@ When Claude Code spawns subagents via the Agent tool, the hook automatically dis
 **How it works:**
 1. Hook detects `Agent` tool_use events in parent assistant messages
 2. Discovers matching subagent transcripts at `<session>/subagents/agent-{id}.jsonl`
-3. Correlates by timestamp proximity (within `SUBAGENT_MATCH_WINDOW_S = 60` seconds)
+3. Correlates via three passes: `.meta.json` `toolUseId` match (exact) → tool_result
+   `agentId` regex (exact) → timestamp proximity (within
+   `SUBAGENT_MATCH_WINDOW_S = 60` seconds). Per-generation
+   `subagent_correlation` records which pass matched (`meta` / `deterministic` /
+   `timestamp`).
 4. Ingests subagent turns as generations nested under the Agent tool span
 5. Rolls up per-subagent and total harness cost in trace metadata
+
+**Nested sub-agents (CC 2.1.172+):** sub-agents can spawn sub-agents up to 5 levels deep.
+Transcripts stay in the flat `<session>/subagents/` dir; each `.meta.json`'s `toolUseId`
+points at the `Agent` tool_use in the *spawner's* transcript. `ingest_subagent` recurses
+(depth cap 5, cycle guard), nesting child generations under the parent agent's tool span.
+Each agent appears once in `subagent_costs.agents` with `depth` and `parent_agent_id`.
 
 **Langfuse hierarchy:**
 ```
@@ -324,7 +339,9 @@ Trace (parent session)
 │       ├── Generation (subagent turn 1)
 │       │   └── Span (Read tool)
 │       └── Generation (subagent turn 2)
-│           └── Span (Bash tool)
+│           └── Span (Agent tool call — nested dispatch)
+│               └── Generation (nested subagent turn 1)
+│                   └── Span (Bash tool)
 └── [metadata: subagent_costs summary]
 ```
 

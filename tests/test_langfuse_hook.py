@@ -2242,6 +2242,54 @@ class TestProcessSession:
         trace = [e for e in sent_batches[0] if e["type"] == "trace-create"][0]
         assert "opus" in trace["body"]["tags"]
 
+    def test_background_tasks_metadata_and_tag(self, tmp_path, monkeypatch):
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        monkeypatch.setattr(hook, "STATE_DIR", str(state_dir))
+        sent = []
+        monkeypatch.setattr(hook, "send_to_langfuse", lambda b: sent.append(b) or True)
+        entries = [
+            {"type": "user", "timestamp": "2026-03-29T10:00:00+00:00",
+             "message": {"role": "user", "content": "go"}},
+            {"type": "assistant", "timestamp": "2026-03-29T10:00:01+00:00",
+             "message": {"id": "m1", "role": "assistant", "model": "claude-opus-4-8",
+                         "content": [{"type": "text", "text": "ok"}],
+                         "usage": {"input_tokens": 5, "output_tokens": 5,
+                                   "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}},
+        ]
+        path = self._make_transcript(tmp_path, entries)
+        hook.process_session("bg-sess", path, "/test",
+                             background_tasks=[{"id": "t1"}], session_crons=[{"id": "c1"}])
+        trace = [e for e in sent[0] if e["type"] == "trace-create"][0]
+        assert "has-background-tasks" in trace["body"]["tags"]
+        assert trace["body"]["metadata"]["background_tasks"] == [{"id": "t1"}]
+        assert trace["body"]["metadata"]["session_crons"] == [{"id": "c1"}]
+
+    def test_worktree_metadata_and_tag(self, tmp_path, monkeypatch):
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        monkeypatch.setattr(hook, "STATE_DIR", str(state_dir))
+        sent = []
+        monkeypatch.setattr(hook, "send_to_langfuse", lambda b: sent.append(b) or True)
+        entries = [
+            {"type": "worktree-state", "worktreeSession": {
+                "worktreeName": "my-feature", "worktreeBranch": "worktree-my-feature",
+                "originalCwd": "/repo", "originalBranch": "main",
+                "originalHeadCommit": "abc123"}},
+            {"type": "user", "timestamp": "2026-03-29T10:00:00+00:00",
+             "message": {"role": "user", "content": "go"}},
+            {"type": "assistant", "timestamp": "2026-03-29T10:00:01+00:00",
+             "message": {"id": "m1", "role": "assistant", "model": "claude-opus-4-8",
+                         "content": [{"type": "text", "text": "ok"}],
+                         "usage": {"input_tokens": 5, "output_tokens": 5,
+                                   "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}},
+        ]
+        path = self._make_transcript(tmp_path, entries)
+        hook.process_session("wt-sess", path, "/test")
+        trace = [e for e in sent[0] if e["type"] == "trace-create"][0]
+        assert "worktree:my-feature" in trace["body"]["tags"]
+        assert trace["body"]["metadata"]["worktree"]["branch"] == "worktree-my-feature"
+
     def test_model_missing_tag_when_billable_turn_lacks_model(self, tmp_path, monkeypatch):
         state_dir = tmp_path / "state"
         state_dir.mkdir()
@@ -3529,3 +3577,35 @@ class TestEffortCapture:
         trace = self._capture_trace(monkeypatch, tmp_path, live=False, effort="high")
         assert not any(t.startswith("effort:") for t in trace["tags"])
         assert trace["metadata"].get("effort_level") is None
+
+
+def _write_jsonl(tmp_path, entries, name="t.jsonl"):
+    p = tmp_path / name
+    p.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+    return str(p)
+
+
+def test_extract_worktree_state_absent(tmp_path):
+    path = _write_jsonl(tmp_path, [{"type": "user", "message": {"role": "user", "content": "hi"}}])
+    assert hook.extract_worktree_state(path) is None
+
+
+def test_extract_worktree_state_last_entry_wins(tmp_path):
+    path = _write_jsonl(tmp_path, [
+        {"type": "worktree-state", "worktreeSession": {
+            "worktreeName": "first", "worktreeBranch": "b1",
+            "originalCwd": "/repo", "originalBranch": "main",
+            "originalHeadCommit": "aaa"}},
+        {"type": "worktree-state", "worktreeSession": {
+            "worktreeName": "second", "worktreeBranch": "b2",
+            "originalCwd": "/repo", "originalBranch": "main",
+            "originalHeadCommit": "bbb"}},
+    ])
+    ws = hook.extract_worktree_state(path)
+    assert ws == {"name": "second", "branch": "b2", "original_cwd": "/repo",
+                  "original_branch": "main", "original_head_commit": "bbb"}
+
+
+def test_extract_worktree_state_empty_session_object(tmp_path):
+    path = _write_jsonl(tmp_path, [{"type": "worktree-state", "worktreeSession": {}}])
+    assert hook.extract_worktree_state(path) is None

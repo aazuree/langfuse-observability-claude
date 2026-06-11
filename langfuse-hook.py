@@ -49,6 +49,7 @@ SAFE_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 _SYNTHETIC_PROMPT_RE = re.compile(r"^<[a-z][a-z0-9-]*>")
 
 SUBAGENT_MATCH_WINDOW_S = 60  # Max seconds between Agent tool_use and subagent start
+MAX_SUBAGENT_DEPTH = 5  # CC 2.1.172: sub-agents can spawn sub-agents up to 5 levels
 
 
 # Pro subscription: $0 marginal cost. Set to True to report equivalent API cost instead.
@@ -148,32 +149,13 @@ def _project_dir_from_cwd(cwd: str) -> str:
     return cwd.replace("/", "-").replace(".", "-")
 
 
-def discover_subagents(
-    transcript_path: str,
-    agent_tool_uses: list,
-    cwd: str = "",
-) -> list:
-    """Match Agent tool_uses to subagent transcripts by timestamp proximity.
+def _subagent_search_dirs(transcript_path: str, cwd: str = "") -> list:
+    """Resolve candidate subagents/ directories for a session.
 
-    Args:
-        transcript_path: Path to parent session JSONL (e.g., .../session.jsonl)
-        agent_tool_uses: List of (description, subagent_type, timestamp, content_index)
-        cwd: Session cwd. When the session moved into a worktree mid-run,
-            new subagent transcripts land under a cwd-derived project dir
-            that differs from the parent transcript's project dir. Both
-            locations are searched; agent_ids seen in the primary location
-            win on duplicates.
-
-    Returns:
-        List of (agent_id, subagent_transcript_path, description, subagent_type,
-        tool_use_content_index, correlation) where correlation is "deterministic"
-        (agentId link from tool_result) or "timestamp" (proximity fallback).
-        Unmatched entries are omitted.
+    Primary: <transcript without .jsonl>/subagents/. Fallback: cwd-derived
+    project dir (sessions that moved into a worktree mid-run). Earlier
+    entries win on duplicates.
     """
-    if not agent_tool_uses:
-        return []
-
-    # Primary location: <transcript without .jsonl>/subagents/
     base = transcript_path
     if base.endswith(".jsonl"):
         base = base[:-6]
@@ -183,7 +165,6 @@ def discover_subagents(
     if os.path.isdir(primary_dir):
         search_dirs.append(primary_dir)
 
-    # Worktree fallback: cwd-derived project dir.
     if cwd:
         session_id = os.path.basename(base)
         alt_dir = os.path.join(
@@ -194,7 +175,81 @@ def discover_subagents(
         )
         if alt_dir not in search_dirs and os.path.isdir(alt_dir):
             search_dirs.append(alt_dir)
+    return search_dirs
 
+
+def build_subagent_meta_index(search_dirs: list) -> dict:
+    """Map Agent tool_use ids to subagent transcripts via .meta.json sidecars.
+
+    Each agent-<id>.meta.json carries {"agentType", "description", "toolUseId"}
+    where toolUseId is the Agent tool_use id in the *spawner's* transcript
+    (main session at depth 1, the parent agent's transcript at depth 2+).
+    The subagents/ dir is flat at every nesting depth.
+
+    Returns {toolUseId: {"agent_id", "path", "agent_type", "description"}}.
+    Earlier search_dirs win on duplicates. aside_question agents are skipped.
+    """
+    index = {}
+    for sdir in search_dirs:
+        try:
+            fnames = sorted(os.listdir(sdir))
+        except OSError:
+            continue
+        for fname in fnames:
+            if not fname.startswith("agent-") or not fname.endswith(".meta.json"):
+                continue
+            if fname.startswith("agent-aside_question-"):
+                continue
+            agent_id = fname[len("agent-"):-len(".meta.json")]
+            jsonl_path = os.path.join(sdir, f"agent-{agent_id}.jsonl")
+            if not os.path.isfile(jsonl_path):
+                continue
+            try:
+                meta = json.loads(Path(os.path.join(sdir, fname)).read_text())
+            except (IOError, OSError, json.JSONDecodeError):
+                continue
+            tool_use_id = meta.get("toolUseId")
+            if tool_use_id and tool_use_id not in index:
+                index[tool_use_id] = {
+                    "agent_id": agent_id,
+                    "path": jsonl_path,
+                    "agent_type": meta.get("agentType", ""),
+                    "description": meta.get("description", ""),
+                }
+    return index
+
+
+def discover_subagents(
+    transcript_path: str,
+    agent_tool_uses: list,
+    cwd: str = "",
+    meta_index: dict = None,
+) -> list:
+    """Match Agent tool_uses to subagent transcripts by timestamp proximity.
+
+    Args:
+        transcript_path: Path to parent session JSONL (e.g., .../session.jsonl)
+        agent_tool_uses: List of (description, subagent_type, timestamp, content_index)
+            tuples; may carry a 5th element agent_id (from tool_result text) and a
+            6th element tool_use_id (for meta.json correlation).
+        cwd: Session cwd. When the session moved into a worktree mid-run,
+            new subagent transcripts land under a cwd-derived project dir
+            that differs from the parent transcript's project dir. Both
+            locations are searched; agent_ids seen in the primary location
+            win on duplicates.
+        meta_index: Optional {toolUseId: {...}} map from build_subagent_meta_index.
+
+    Returns:
+        List of (agent_id, subagent_transcript_path, description, subagent_type,
+        tool_use_content_index, correlation) where correlation is "meta"
+        (.meta.json toolUseId link), "deterministic" (agentId link from
+        tool_result) or "timestamp" (proximity fallback).
+        Unmatched entries are omitted.
+    """
+    if not agent_tool_uses:
+        return []
+
+    search_dirs = _subagent_search_dirs(transcript_path, cwd)
     if not search_dirs:
         return []
 
@@ -243,11 +298,26 @@ def discover_subagents(
 
     matched = []
     used_candidates = set()  # indices into `candidates` consumed by timestamp matching
-    used_ids = set()         # agent_ids consumed by deterministic matching
-    pending_timestamp = []   # tool_uses with no usable agentId link
+    used_ids = set()         # agent_ids consumed by meta/deterministic matching
+    pending_deterministic = []
+    pending_timestamp = []   # tool_uses with no usable link at all
+    meta_index = meta_index or {}
+
+    # Pass 0: .meta.json toolUseId match (exact; the only link that works for
+    # nested agent→agent dispatches, whose tool_results carry no agentId text).
+    for tu in sorted_tool_uses:
+        desc, sa_type, tu_ts_str, content_idx = tu[0], tu[1], tu[2], tu[3]
+        tool_use_id = tu[5] if len(tu) > 5 else None
+        m = meta_index.get(tool_use_id)
+        if m and m["agent_id"] not in used_ids:
+            used_ids.add(m["agent_id"])
+            log(f"Matched subagent {m['agent_id']} via meta.json toolUseId")
+            matched.append((m["agent_id"], m["path"], desc, sa_type, content_idx, "meta"))
+        else:
+            pending_deterministic.append(tu)
 
     # Pass 1: deterministic agentId match (exact, ignores timestamps).
-    for tu in sorted_tool_uses:
+    for tu in pending_deterministic:
         desc, sa_type, tu_ts_str, content_idx = tu[0], tu[1], tu[2], tu[3]
         agent_id = tu[4] if len(tu) > 4 else None
         if agent_id and agent_id in by_id and agent_id not in used_ids:
@@ -321,11 +391,24 @@ def ingest_subagent(
     subagent_offset: int,
     prior_turn_count: int = 0,
     correlation: str = "timestamp",
+    meta_index: dict = None,
+    depth: int = 1,
+    visited: set = None,
+    sa_state: dict = None,
 ) -> tuple:
     """Parse a subagent transcript and build Langfuse events.
 
+    Recurses into nested Agent dispatches (CC 2.1.172+) resolved via
+    meta_index, up to MAX_SUBAGENT_DEPTH levels; `visited` guards cycles.
+    Nested children are recorded in sa_state with depth/parent lineage.
+
     Returns: (events, cost_summary, new_offset, new_turn_count, status)
     """
+    if visited is None:
+        visited = set()
+    visited.add(agent_id)
+    meta_index = meta_index or {}
+
     empty_cost = {"agent_id": agent_id, "total_cost": 0, "total_tokens": 0,
                   "turns": 0, "status": "partial",
                   "cost_breakdown": {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0}}
@@ -393,6 +476,7 @@ def ingest_subagent(
             "subagent_id": agent_id,
             "agent_id": agent_id,
             "subagent_correlation": correlation,
+            "subagent_depth": depth,
             "tools_used": [tc["name"] for tc in turn["tool_calls"]],
             "tool_count": len(turn["tool_calls"]),
             "speed": turn.get("speed", ""),
@@ -465,6 +549,46 @@ def ingest_subagent(
                 },
             })
 
+            if (tc["name"] == "Agent" and depth < MAX_SUBAGENT_DEPTH
+                    and tc["id"] in meta_index):
+                child = meta_index[tc["id"]]
+                child_id = child["agent_id"]
+                if child_id not in visited:
+                    child_prev = (sa_state or {}).get(child_id, {})
+                    c_events, c_cost, c_offset, c_tc, c_status = ingest_subagent(
+                        agent_id=child_id,
+                        transcript_path=child["path"],
+                        parent_span_id=span_id,
+                        trace_id=trace_id,
+                        session_id=session_id,
+                        subagent_offset=child_prev.get("offset", 0),
+                        prior_turn_count=child_prev.get("turn_count", 0),
+                        correlation="meta",
+                        meta_index=meta_index,
+                        depth=depth + 1,
+                        visited=visited,
+                        sa_state=sa_state,
+                    )
+                    events.extend(c_events)
+                    # Nested-child cost stays out of this agent's own cost_summary;
+                    # the trace-level subagent_costs rollup sums all agents flat.
+                    if sa_state is not None:
+                        sa_state[child_id] = {
+                            "offset": c_offset,
+                            "turn_count": c_tc,
+                            "status": c_status,
+                            "total_cost": round(child_prev.get("total_cost", 0.0) + c_cost["total_cost"], 6),
+                            "total_tokens": child_prev.get("total_tokens", 0) + c_cost["total_tokens"],
+                            "cost_breakdown": {
+                                k: round(child_prev.get("cost_breakdown", {}).get(k, 0.0) + v, 6)
+                                for k, v in c_cost["cost_breakdown"].items()
+                            },
+                            "description": child["description"],
+                            "subagent_type": child["agent_type"],
+                            "parent_agent_id": agent_id,
+                            "depth": depth + 1,
+                        }
+
     new_turn_count = prior_turn_count + len(turns)
     cost_summary = {
         "agent_id": agent_id,
@@ -528,6 +652,27 @@ def extract_agent_name(transcript_path: str) -> str:
             if name:
                 return name
     return ""
+
+
+def extract_worktree_state(transcript_path: str) -> dict | None:
+    """Last type:'worktree-state' entry (worktree sessions, v2.1.16x+).
+
+    Sessions can enter/exit worktrees mid-run; the last entry reflects the
+    final state. None when the session never entered a worktree.
+    """
+    worktree = None
+    for entry in iter_transcript(transcript_path):
+        if entry.get("type") == "worktree-state":
+            ws = entry.get("worktreeSession") or {}
+            if ws:
+                worktree = {
+                    "name": ws.get("worktreeName", ""),
+                    "branch": ws.get("worktreeBranch", ""),
+                    "original_cwd": ws.get("originalCwd", ""),
+                    "original_branch": ws.get("originalBranch", ""),
+                    "original_head_commit": ws.get("originalHeadCommit", ""),
+                }
+    return worktree
 
 
 _AGENT_ID_RE = re.compile(r"agentId:\s*([0-9a-f]+)")
@@ -1658,7 +1803,7 @@ def gen_metadata_cache_miss(turn: dict) -> dict:
     }
 
 
-def process_session(session_id: str, transcript_path: str, cwd: str, last_assistant_message: str = "", live: bool = True) -> None:
+def process_session(session_id: str, transcript_path: str, cwd: str, last_assistant_message: str = "", live: bool = True, background_tasks: list = None, session_crons: list = None) -> None:
     """Core processing logic for a single session transcript."""
     # effort comes from the live hook process environment ($CLAUDE_EFFORT,
     # v2.1.133+). It is NOT in the transcript, so it cannot be recovered on
@@ -1679,6 +1824,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
     local_commands = extract_local_commands(transcript_path)
     file_history_stats = extract_file_history_stats(transcript_path)
     stop_hook_stats = extract_stop_hook_stats(transcript_path)
+    worktree_state = extract_worktree_state(transcript_path)
     entries, total_lines, read_ok = parse_transcript(transcript_path, skip_lines=prev_line_offset)
 
     if not read_ok:
@@ -1825,6 +1971,9 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 "total_iterations": sum(t.get("iteration_count", 0) for t in turns),
                 "cache_miss": build_cache_miss_summary(turns),
                 "effort_level": effort or None,
+                "worktree": worktree_state,
+                "background_tasks": background_tasks or None,
+                "session_crons": session_crons or None,
             },
             "tags": [t for t in [
                 "claude-code",
@@ -1833,10 +1982,12 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 session_meta.get("entrypoint") or None,
                 "fast" if has_fast else None,
                 "has-errors" if has_errors else None,
+                "has-background-tasks" if background_tasks else None,
                 "model-missing" if has_missing_model else None,
                 f"permission:{permission_mode}" if permission_mode else None,
                 f"agent-name:{agent_name}" if agent_name else None,
                 f"session-kind:{session_kind}" if session_kind else None,
+                f"worktree:{worktree_state['name']}" if worktree_state and worktree_state.get("name") else None,
                 f"effort:{effort}" if effort else None,
                 "compacted" if detect_compaction(transcript_path) else None,
                 "remote-control" if remote_control else None,
@@ -1849,6 +2000,10 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
     })
 
     # 2. Generation + spans per turn
+    # Meta index rebuilt on every fire — subagent dirs appear mid-session.
+    sa_search_dirs = _subagent_search_dirs(transcript_path, cwd)
+    sa_meta_index = build_subagent_meta_index(sa_search_dirs)
+    sa_visited = set()
     for turn_idx, turn in enumerate(turns):
         # Deterministic IDs so re-ingestion updates rather than duplicates
         turn_id = uuid.uuid5(uuid.NAMESPACE_URL, f"{session_id}:turn:{prev_turn_count + turn_idx}")
@@ -2004,11 +2159,13 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                         tc.get("start_time", start_time),
                         tc_idx,
                         extract_agent_id_from_result(tc.get("output", "")),
+                        tc["id"],
                     ))
 
         # Discover and ingest subagents for this turn
         if agent_tool_uses_this_turn:
-            matches = discover_subagents(transcript_path, agent_tool_uses_this_turn, cwd=cwd)
+            matches = discover_subagents(transcript_path, agent_tool_uses_this_turn,
+                                         cwd=cwd, meta_index=sa_meta_index)
             for sa_id, sa_path, sa_desc, sa_type, sa_tc_idx, sa_corr in matches:
                 sa_prev_offset = sa_state.get(sa_id, {}).get("offset", 0)
                 sa_prior_turns = sa_state.get(sa_id, {}).get("turn_count", 0)
@@ -2023,6 +2180,9 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                     subagent_offset=sa_prev_offset,
                     prior_turn_count=sa_prior_turns,
                     correlation=sa_corr,
+                    meta_index=sa_meta_index,
+                    visited=sa_visited,
+                    sa_state=sa_state,
                 )
                 batch.extend(sa_events)
                 _prev = sa_state.get(sa_id, {})
@@ -2079,6 +2239,8 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 }
                 evt["body"]["tags"].append("has-subagents")
                 evt["body"]["tags"].append(f"subagents:{len(subagent_cost_summaries)}")
+                if any(s.get("depth", 1) >= 2 for s in subagent_cost_summaries):
+                    evt["body"]["tags"].append("nested-subagents")
                 break
 
     # Hook-level scores (trace-level)
@@ -2199,7 +2361,9 @@ def main() -> None:
         log("No transcript_path provided")
         return
 
-    process_session(session_id, transcript_path, cwd, last_assistant_message)
+    process_session(session_id, transcript_path, cwd, last_assistant_message,
+                    background_tasks=hook_input.get("background_tasks"),
+                    session_crons=hook_input.get("session_crons"))
 
 
 if __name__ == "__main__":

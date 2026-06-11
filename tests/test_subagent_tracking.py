@@ -81,11 +81,14 @@ def _make_subagent_jsonl(directory, agent_id, timestamp, lines=3):
     return jsonl_path
 
 
-def _make_meta_json(directory, agent_id, agent_type="general-purpose", description=None):
+def _make_meta_json(directory, agent_id, agent_type="general-purpose", description=None,
+                    tool_use_id=None):
     """Helper: create a .meta.json file for a subagent."""
     meta = {"agentType": agent_type}
     if description is not None:
         meta["description"] = description
+    if tool_use_id is not None:
+        meta["toolUseId"] = tool_use_id
     meta_path = directory / f"agent-{agent_id}.meta.json"
     meta_path.write_text(json.dumps(meta))
     return meta_path
@@ -942,3 +945,199 @@ def test_ingest_subagent_correlation_defaults_to_timestamp(tmp_path):
     )
     gens = [e for e in events if e["type"] == "generation-create"]
     assert gens[0]["body"]["metadata"]["subagent_correlation"] == "timestamp"
+
+
+# --- build_subagent_meta_index tests ---
+
+def test_build_meta_index_maps_tool_use_id(tmp_path):
+    sa_dir = tmp_path / "subagents"
+    sa_dir.mkdir()
+    _make_subagent_jsonl(sa_dir, "abc123", "2026-06-10T10:00:01+00:00")
+    _make_meta_json(sa_dir, "abc123", agent_type="Explore",
+                    description="probe", tool_use_id="toolu_X1")
+    idx = langfuse_hook.build_subagent_meta_index([str(sa_dir)])
+    assert idx == {"toolu_X1": {
+        "agent_id": "abc123",
+        "path": str(sa_dir / "agent-abc123.jsonl"),
+        "agent_type": "Explore",
+        "description": "probe",
+    }}
+
+
+def test_build_meta_index_skips_orphan_meta_and_aside(tmp_path):
+    sa_dir = tmp_path / "subagents"
+    sa_dir.mkdir()
+    # meta.json without a matching .jsonl -> skipped
+    _make_meta_json(sa_dir, "orphan", tool_use_id="toolu_O")
+    # aside_question agents -> skipped
+    _make_subagent_jsonl(sa_dir, "aside_question-1", "2026-06-10T10:00:01+00:00")
+    _make_meta_json(sa_dir, "aside_question-1", tool_use_id="toolu_A")
+    assert langfuse_hook.build_subagent_meta_index([str(sa_dir)]) == {}
+
+
+def test_build_meta_index_missing_dir(tmp_path):
+    assert langfuse_hook.build_subagent_meta_index([str(tmp_path / "nope")]) == {}
+
+
+def test_discover_meta_index_match_beats_regex_and_timestamp(tmp_path):
+    sa_dir = tmp_path / "session" / "subagents"
+    sa_dir.mkdir(parents=True)
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text("")
+    _make_subagent_jsonl(sa_dir, "metakid", "2026-06-10T10:59:00+00:00")  # far outside 60s window
+    _make_meta_json(sa_dir, "metakid", agent_type="Explore",
+                    description="meta match", tool_use_id="toolu_M")
+    meta_index = langfuse_hook.build_subagent_meta_index([str(sa_dir)])
+    # 6-tuple: (description, type, timestamp, content_index, agent_id_from_result, tool_use_id)
+    tool_uses = [("meta match", "Explore", "2026-06-10T10:00:00+00:00", 0, None, "toolu_M")]
+    matches = langfuse_hook.discover_subagents(str(transcript), tool_uses, meta_index=meta_index)
+    assert len(matches) == 1
+    agent_id, path, desc, sa_type, idx, corr = matches[0]
+    assert agent_id == "metakid"
+    assert corr == "meta"
+
+
+# --- recursive ingest_subagent tests ---
+
+def _make_agent_spawning_jsonl(directory, agent_id, child_tool_use_id,
+                               start_ts="2026-06-10T10:00:01+00:00"):
+    """Subagent transcript whose single turn dispatches a nested Agent."""
+    lines = [
+        {"type": "user", "agentId": agent_id, "timestamp": start_ts,
+         "message": {"role": "user", "content": "spawn child"}},
+        {"type": "assistant", "timestamp": "2026-06-10T10:00:02+00:00",
+         "message": {"id": f"m-{agent_id}", "role": "assistant",
+                     "model": "claude-opus-4-8",
+                     "content": [{"type": "tool_use", "id": child_tool_use_id,
+                                  "name": "Agent",
+                                  "input": {"description": "child probe",
+                                            "subagent_type": "Explore",
+                                            "prompt": "do it"}}],
+                     "usage": {"input_tokens": 10, "output_tokens": 10,
+                               "cache_read_input_tokens": 0,
+                               "cache_creation_input_tokens": 0}}},
+        {"type": "user", "timestamp": "2026-06-10T10:00:09+00:00",
+         "message": {"role": "user", "content": [
+             {"type": "tool_result", "tool_use_id": child_tool_use_id,
+              "content": "done"}]}},
+        {"type": "assistant", "timestamp": "2026-06-10T10:00:10+00:00",
+         "stop_reason": "end_turn",
+         "message": {"id": f"m2-{agent_id}", "role": "assistant",
+                     "model": "claude-opus-4-8",
+                     "content": [{"type": "text", "text": "child done"}],
+                     "usage": {"input_tokens": 5, "output_tokens": 5,
+                               "cache_read_input_tokens": 0,
+                               "cache_creation_input_tokens": 0}}},
+    ]
+    path = directory / f"agent-{agent_id}.jsonl"
+    path.write_text("\n".join(json.dumps(e) for e in lines) + "\n")
+    return str(path)
+
+
+def test_ingest_subagent_recurses_into_nested_agent(tmp_path):
+    sa_dir = tmp_path / "subagents"
+    sa_dir.mkdir()
+    parent_path = _make_agent_spawning_jsonl(sa_dir, "parentaid", "toolu_CHILD")
+    _make_meta_json(sa_dir, "parentaid", tool_use_id="toolu_PARENT")
+    _make_full_subagent_jsonl(sa_dir, "childaid", start_ts="2026-06-10T10:00:03+00:00")
+    _make_meta_json(sa_dir, "childaid", agent_type="Explore",
+                    description="child probe", tool_use_id="toolu_CHILD")
+
+    meta_index = langfuse_hook.build_subagent_meta_index([str(sa_dir)])
+    sa_state = {}
+    events, cost, offset, tc, status = langfuse_hook.ingest_subagent(
+        agent_id="parentaid",
+        transcript_path=parent_path,
+        parent_span_id="span-x",
+        trace_id="trace-x",
+        session_id="sess-x",
+        subagent_offset=0,
+        meta_index=meta_index,
+        sa_state=sa_state,
+    )
+    # Child generations present, parented under the parent's nested Agent tool span
+    child_gens = [e for e in events if e["type"] == "generation-create"
+                  and "subagent-childaid" in e["body"]["id"]]
+    assert child_gens, "nested child generations missing"
+    parent_agent_spans = [e for e in events if e["type"] == "span-create"
+                          and e["body"]["metadata"].get("tool_use_id") == "toolu_CHILD"]
+    assert parent_agent_spans
+    nested_span_id = parent_agent_spans[0]["body"]["id"]
+    assert all(g["body"]["parentObservationId"] == nested_span_id for g in child_gens)
+    # State recorded for the child with lineage
+    assert sa_state["childaid"]["parent_agent_id"] == "parentaid"
+    assert sa_state["childaid"]["depth"] == 2
+    assert sa_state["childaid"]["total_tokens"] > 0
+
+
+def test_ingest_subagent_depth_limit_and_cycle_guard(tmp_path):
+    sa_dir = tmp_path / "subagents"
+    sa_dir.mkdir()
+    # Agent that "spawns itself" -- cycle guard must stop recursion
+    path = _make_agent_spawning_jsonl(sa_dir, "loopy", "toolu_SELF")
+    _make_meta_json(sa_dir, "loopy", tool_use_id="toolu_SELF")
+    meta_index = langfuse_hook.build_subagent_meta_index([str(sa_dir)])
+    sa_state = {}
+    events, cost, offset, tc, status = langfuse_hook.ingest_subagent(
+        agent_id="loopy", transcript_path=path, parent_span_id="s",
+        trace_id="t", session_id="sess", subagent_offset=0,
+        meta_index=meta_index, sa_state=sa_state,
+    )
+    # Exactly one ingestion of loopy: its own turn generations, no infinite recursion
+    loopy_gens = [e for e in events if e["type"] == "generation-create"]
+    assert 0 < len(loopy_gens) <= 2
+
+
+def test_process_session_nested_subagents_tag_and_rollup(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    monkeypatch.setattr(langfuse_hook, "STATE_DIR", str(state_dir))
+    sent = []
+    monkeypatch.setattr(langfuse_hook, "send_to_langfuse", lambda b: sent.append(b) or True)
+
+    session_dir = tmp_path / "sess-nested"
+    sa_dir = session_dir / "subagents"
+    sa_dir.mkdir(parents=True)
+    _make_agent_spawning_jsonl(sa_dir, "p1", "toolu_C1",
+                               start_ts="2026-06-10T10:00:02+00:00")
+    _make_meta_json(sa_dir, "p1", description="parent agent", tool_use_id="toolu_P1")
+    _make_full_subagent_jsonl(sa_dir, "c1", start_ts="2026-06-10T10:00:04+00:00")
+    _make_meta_json(sa_dir, "c1", agent_type="Explore",
+                    description="child probe", tool_use_id="toolu_C1")
+
+    main_entries = [
+        {"type": "user", "timestamp": "2026-06-10T10:00:00+00:00",
+         "message": {"role": "user", "content": "dispatch"}},
+        {"type": "assistant", "timestamp": "2026-06-10T10:00:01+00:00",
+         "message": {"id": "mm1", "role": "assistant", "model": "claude-opus-4-8",
+                     "content": [{"type": "tool_use", "id": "toolu_P1", "name": "Agent",
+                                  "input": {"description": "parent agent",
+                                            "subagent_type": "general-purpose",
+                                            "prompt": "go"}}],
+                     "usage": {"input_tokens": 10, "output_tokens": 10,
+                               "cache_read_input_tokens": 0,
+                               "cache_creation_input_tokens": 0}}},
+        {"type": "user", "timestamp": "2026-06-10T10:00:20+00:00",
+         "message": {"role": "user", "content": [
+             {"type": "tool_result", "tool_use_id": "toolu_P1", "content": "done"}]}},
+        {"type": "assistant", "timestamp": "2026-06-10T10:00:21+00:00",
+         "stop_reason": "end_turn",
+         "message": {"id": "mm2", "role": "assistant", "model": "claude-opus-4-8",
+                     "content": [{"type": "text", "text": "all done"}],
+                     "usage": {"input_tokens": 5, "output_tokens": 5,
+                               "cache_read_input_tokens": 0,
+                               "cache_creation_input_tokens": 0}}},
+    ]
+    transcript = tmp_path / "sess-nested.jsonl"
+    transcript.write_text("\n".join(json.dumps(e) for e in main_entries) + "\n")
+
+    langfuse_hook.process_session("sess-nested", str(transcript), "/test")
+    trace = [e for e in sent[0] if e["type"] == "trace-create"][0]
+    assert "nested-subagents" in trace["body"]["tags"]
+    agents = trace["body"]["metadata"]["subagent_costs"]["agents"]
+    by_id = {a["agent_id"]: a for a in agents}
+    assert by_id["c1"]["parent_agent_id"] == "p1"
+    assert by_id["c1"]["depth"] == 2
+    # No double counting: total = exact sum of per-agent costs
+    total = trace["body"]["metadata"]["subagent_costs"]["total_subagent_cost"]
+    assert abs(total - sum(a["total_cost"] for a in agents)) < 1e-9
