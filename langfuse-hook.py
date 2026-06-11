@@ -177,6 +177,47 @@ def _subagent_search_dirs(transcript_path: str, cwd: str = "") -> list:
     return search_dirs
 
 
+def build_subagent_meta_index(search_dirs: list) -> dict:
+    """Map Agent tool_use ids to subagent transcripts via .meta.json sidecars.
+
+    Each agent-<id>.meta.json carries {"agentType", "description", "toolUseId"}
+    where toolUseId is the Agent tool_use id in the *spawner's* transcript
+    (main session at depth 1, the parent agent's transcript at depth 2+).
+    The subagents/ dir is flat at every nesting depth.
+
+    Returns {toolUseId: {"agent_id", "path", "agent_type", "description"}}.
+    Earlier search_dirs win on duplicates. aside_question agents are skipped.
+    """
+    index = {}
+    for sdir in search_dirs:
+        try:
+            fnames = sorted(os.listdir(sdir))
+        except OSError:
+            continue
+        for fname in fnames:
+            if not fname.startswith("agent-") or not fname.endswith(".meta.json"):
+                continue
+            if fname.startswith("agent-aside_question-"):
+                continue
+            agent_id = fname[len("agent-"):-len(".meta.json")]
+            jsonl_path = os.path.join(sdir, f"agent-{agent_id}.jsonl")
+            if not os.path.isfile(jsonl_path):
+                continue
+            try:
+                meta = json.loads(Path(os.path.join(sdir, fname)).read_text())
+            except (IOError, OSError, json.JSONDecodeError):
+                continue
+            tool_use_id = meta.get("toolUseId")
+            if tool_use_id and tool_use_id not in index:
+                index[tool_use_id] = {
+                    "agent_id": agent_id,
+                    "path": jsonl_path,
+                    "agent_type": meta.get("agentType", ""),
+                    "description": meta.get("description", ""),
+                }
+    return index
+
+
 def discover_subagents(
     transcript_path: str,
     agent_tool_uses: list,

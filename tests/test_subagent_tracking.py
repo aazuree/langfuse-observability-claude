@@ -81,11 +81,14 @@ def _make_subagent_jsonl(directory, agent_id, timestamp, lines=3):
     return jsonl_path
 
 
-def _make_meta_json(directory, agent_id, agent_type="general-purpose", description=None):
+def _make_meta_json(directory, agent_id, agent_type="general-purpose", description=None,
+                    tool_use_id=None):
     """Helper: create a .meta.json file for a subagent."""
     meta = {"agentType": agent_type}
     if description is not None:
         meta["description"] = description
+    if tool_use_id is not None:
+        meta["toolUseId"] = tool_use_id
     meta_path = directory / f"agent-{agent_id}.meta.json"
     meta_path.write_text(json.dumps(meta))
     return meta_path
@@ -942,3 +945,35 @@ def test_ingest_subagent_correlation_defaults_to_timestamp(tmp_path):
     )
     gens = [e for e in events if e["type"] == "generation-create"]
     assert gens[0]["body"]["metadata"]["subagent_correlation"] == "timestamp"
+
+
+# --- build_subagent_meta_index tests ---
+
+def test_build_meta_index_maps_tool_use_id(tmp_path):
+    sa_dir = tmp_path / "subagents"
+    sa_dir.mkdir()
+    _make_subagent_jsonl(sa_dir, "abc123", "2026-06-10T10:00:01+00:00")
+    _make_meta_json(sa_dir, "abc123", agent_type="Explore",
+                    description="probe", tool_use_id="toolu_X1")
+    idx = langfuse_hook.build_subagent_meta_index([str(sa_dir)])
+    assert idx == {"toolu_X1": {
+        "agent_id": "abc123",
+        "path": str(sa_dir / "agent-abc123.jsonl"),
+        "agent_type": "Explore",
+        "description": "probe",
+    }}
+
+
+def test_build_meta_index_skips_orphan_meta_and_aside(tmp_path):
+    sa_dir = tmp_path / "subagents"
+    sa_dir.mkdir()
+    # meta.json without a matching .jsonl -> skipped
+    _make_meta_json(sa_dir, "orphan", tool_use_id="toolu_O")
+    # aside_question agents -> skipped
+    _make_subagent_jsonl(sa_dir, "aside_question-1", "2026-06-10T10:00:01+00:00")
+    _make_meta_json(sa_dir, "aside_question-1", tool_use_id="toolu_A")
+    assert langfuse_hook.build_subagent_meta_index([str(sa_dir)]) == {}
+
+
+def test_build_meta_index_missing_dir(tmp_path):
+    assert langfuse_hook.build_subagent_meta_index([str(tmp_path / "nope")]) == {}
