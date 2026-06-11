@@ -2239,6 +2239,8 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 }
                 evt["body"]["tags"].append("has-subagents")
                 evt["body"]["tags"].append(f"subagents:{len(subagent_cost_summaries)}")
+                if any(s.get("depth", 1) >= 2 for s in subagent_cost_summaries):
+                    evt["body"]["tags"].append("nested-subagents")
                 break
 
     # Hook-level scores (trace-level)

@@ -1086,3 +1086,58 @@ def test_ingest_subagent_depth_limit_and_cycle_guard(tmp_path):
     # Exactly one ingestion of loopy: its own turn generations, no infinite recursion
     loopy_gens = [e for e in events if e["type"] == "generation-create"]
     assert 0 < len(loopy_gens) <= 2
+
+
+def test_process_session_nested_subagents_tag_and_rollup(tmp_path, monkeypatch):
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    monkeypatch.setattr(langfuse_hook, "STATE_DIR", str(state_dir))
+    sent = []
+    monkeypatch.setattr(langfuse_hook, "send_to_langfuse", lambda b: sent.append(b) or True)
+
+    session_dir = tmp_path / "sess-nested"
+    sa_dir = session_dir / "subagents"
+    sa_dir.mkdir(parents=True)
+    _make_agent_spawning_jsonl(sa_dir, "p1", "toolu_C1",
+                               start_ts="2026-06-10T10:00:02+00:00")
+    _make_meta_json(sa_dir, "p1", description="parent agent", tool_use_id="toolu_P1")
+    _make_full_subagent_jsonl(sa_dir, "c1", start_ts="2026-06-10T10:00:04+00:00")
+    _make_meta_json(sa_dir, "c1", agent_type="Explore",
+                    description="child probe", tool_use_id="toolu_C1")
+
+    main_entries = [
+        {"type": "user", "timestamp": "2026-06-10T10:00:00+00:00",
+         "message": {"role": "user", "content": "dispatch"}},
+        {"type": "assistant", "timestamp": "2026-06-10T10:00:01+00:00",
+         "message": {"id": "mm1", "role": "assistant", "model": "claude-opus-4-8",
+                     "content": [{"type": "tool_use", "id": "toolu_P1", "name": "Agent",
+                                  "input": {"description": "parent agent",
+                                            "subagent_type": "general-purpose",
+                                            "prompt": "go"}}],
+                     "usage": {"input_tokens": 10, "output_tokens": 10,
+                               "cache_read_input_tokens": 0,
+                               "cache_creation_input_tokens": 0}}},
+        {"type": "user", "timestamp": "2026-06-10T10:00:20+00:00",
+         "message": {"role": "user", "content": [
+             {"type": "tool_result", "tool_use_id": "toolu_P1", "content": "done"}]}},
+        {"type": "assistant", "timestamp": "2026-06-10T10:00:21+00:00",
+         "stop_reason": "end_turn",
+         "message": {"id": "mm2", "role": "assistant", "model": "claude-opus-4-8",
+                     "content": [{"type": "text", "text": "all done"}],
+                     "usage": {"input_tokens": 5, "output_tokens": 5,
+                               "cache_read_input_tokens": 0,
+                               "cache_creation_input_tokens": 0}}},
+    ]
+    transcript = tmp_path / "sess-nested.jsonl"
+    transcript.write_text("\n".join(json.dumps(e) for e in main_entries) + "\n")
+
+    langfuse_hook.process_session("sess-nested", str(transcript), "/test")
+    trace = [e for e in sent[0] if e["type"] == "trace-create"][0]
+    assert "nested-subagents" in trace["body"]["tags"]
+    agents = trace["body"]["metadata"]["subagent_costs"]["agents"]
+    by_id = {a["agent_id"]: a for a in agents}
+    assert by_id["c1"]["parent_agent_id"] == "p1"
+    assert by_id["c1"]["depth"] == 2
+    # No double counting: total = exact sum of per-agent costs
+    total = trace["body"]["metadata"]["subagent_costs"]["total_subagent_cost"]
+    assert abs(total - sum(a["total_cost"] for a in agents)) < 1e-9
