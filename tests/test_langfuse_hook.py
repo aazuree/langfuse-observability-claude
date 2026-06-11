@@ -2265,6 +2265,31 @@ class TestProcessSession:
         assert trace["body"]["metadata"]["background_tasks"] == [{"id": "t1"}]
         assert trace["body"]["metadata"]["session_crons"] == [{"id": "c1"}]
 
+    def test_worktree_metadata_and_tag(self, tmp_path, monkeypatch):
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        monkeypatch.setattr(hook, "STATE_DIR", str(state_dir))
+        sent = []
+        monkeypatch.setattr(hook, "send_to_langfuse", lambda b: sent.append(b) or True)
+        entries = [
+            {"type": "worktree-state", "worktreeSession": {
+                "worktreeName": "my-feature", "worktreeBranch": "worktree-my-feature",
+                "originalCwd": "/repo", "originalBranch": "main",
+                "originalHeadCommit": "abc123"}},
+            {"type": "user", "timestamp": "2026-03-29T10:00:00+00:00",
+             "message": {"role": "user", "content": "go"}},
+            {"type": "assistant", "timestamp": "2026-03-29T10:00:01+00:00",
+             "message": {"id": "m1", "role": "assistant", "model": "claude-opus-4-8",
+                         "content": [{"type": "text", "text": "ok"}],
+                         "usage": {"input_tokens": 5, "output_tokens": 5,
+                                   "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}},
+        ]
+        path = self._make_transcript(tmp_path, entries)
+        hook.process_session("wt-sess", path, "/test")
+        trace = [e for e in sent[0] if e["type"] == "trace-create"][0]
+        assert "worktree:my-feature" in trace["body"]["tags"]
+        assert trace["body"]["metadata"]["worktree"]["branch"] == "worktree-my-feature"
+
     def test_model_missing_tag_when_billable_turn_lacks_model(self, tmp_path, monkeypatch):
         state_dir = tmp_path / "state"
         state_dir.mkdir()

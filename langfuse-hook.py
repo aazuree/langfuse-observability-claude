@@ -1700,6 +1700,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
     local_commands = extract_local_commands(transcript_path)
     file_history_stats = extract_file_history_stats(transcript_path)
     stop_hook_stats = extract_stop_hook_stats(transcript_path)
+    worktree_state = extract_worktree_state(transcript_path)
     entries, total_lines, read_ok = parse_transcript(transcript_path, skip_lines=prev_line_offset)
 
     if not read_ok:
@@ -1846,6 +1847,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 "total_iterations": sum(t.get("iteration_count", 0) for t in turns),
                 "cache_miss": build_cache_miss_summary(turns),
                 "effort_level": effort or None,
+                "worktree": worktree_state,
                 "background_tasks": background_tasks or None,
                 "session_crons": session_crons or None,
             },
@@ -1861,6 +1863,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 f"permission:{permission_mode}" if permission_mode else None,
                 f"agent-name:{agent_name}" if agent_name else None,
                 f"session-kind:{session_kind}" if session_kind else None,
+                f"worktree:{worktree_state['name']}" if worktree_state and worktree_state.get("name") else None,
                 f"effort:{effort}" if effort else None,
                 "compacted" if detect_compaction(transcript_path) else None,
                 "remote-control" if remote_control else None,
