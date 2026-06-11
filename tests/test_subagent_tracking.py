@@ -977,3 +977,21 @@ def test_build_meta_index_skips_orphan_meta_and_aside(tmp_path):
 
 def test_build_meta_index_missing_dir(tmp_path):
     assert langfuse_hook.build_subagent_meta_index([str(tmp_path / "nope")]) == {}
+
+
+def test_discover_meta_index_match_beats_regex_and_timestamp(tmp_path):
+    sa_dir = tmp_path / "session" / "subagents"
+    sa_dir.mkdir(parents=True)
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text("")
+    _make_subagent_jsonl(sa_dir, "metakid", "2026-06-10T10:59:00+00:00")  # far outside 60s window
+    _make_meta_json(sa_dir, "metakid", agent_type="Explore",
+                    description="meta match", tool_use_id="toolu_M")
+    meta_index = langfuse_hook.build_subagent_meta_index([str(sa_dir)])
+    # 6-tuple: (description, type, timestamp, content_index, agent_id_from_result, tool_use_id)
+    tool_uses = [("meta match", "Explore", "2026-06-10T10:00:00+00:00", 0, None, "toolu_M")]
+    matches = langfuse_hook.discover_subagents(str(transcript), tool_uses, meta_index=meta_index)
+    assert len(matches) == 1
+    agent_id, path, desc, sa_type, idx, corr = matches[0]
+    assert agent_id == "metakid"
+    assert corr == "meta"

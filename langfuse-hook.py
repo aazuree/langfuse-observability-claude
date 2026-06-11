@@ -222,22 +222,27 @@ def discover_subagents(
     transcript_path: str,
     agent_tool_uses: list,
     cwd: str = "",
+    meta_index: dict = None,
 ) -> list:
     """Match Agent tool_uses to subagent transcripts by timestamp proximity.
 
     Args:
         transcript_path: Path to parent session JSONL (e.g., .../session.jsonl)
         agent_tool_uses: List of (description, subagent_type, timestamp, content_index)
+            tuples; may carry a 5th element agent_id (from tool_result text) and a
+            6th element tool_use_id (for meta.json correlation).
         cwd: Session cwd. When the session moved into a worktree mid-run,
             new subagent transcripts land under a cwd-derived project dir
             that differs from the parent transcript's project dir. Both
             locations are searched; agent_ids seen in the primary location
             win on duplicates.
+        meta_index: Optional {toolUseId: {...}} map from build_subagent_meta_index.
 
     Returns:
         List of (agent_id, subagent_transcript_path, description, subagent_type,
-        tool_use_content_index, correlation) where correlation is "deterministic"
-        (agentId link from tool_result) or "timestamp" (proximity fallback).
+        tool_use_content_index, correlation) where correlation is "meta"
+        (.meta.json toolUseId link), "deterministic" (agentId link from
+        tool_result) or "timestamp" (proximity fallback).
         Unmatched entries are omitted.
     """
     if not agent_tool_uses:
@@ -292,11 +297,26 @@ def discover_subagents(
 
     matched = []
     used_candidates = set()  # indices into `candidates` consumed by timestamp matching
-    used_ids = set()         # agent_ids consumed by deterministic matching
-    pending_timestamp = []   # tool_uses with no usable agentId link
+    used_ids = set()         # agent_ids consumed by meta/deterministic matching
+    pending_deterministic = []
+    pending_timestamp = []   # tool_uses with no usable link at all
+    meta_index = meta_index or {}
+
+    # Pass 0: .meta.json toolUseId match (exact; the only link that works for
+    # nested agent→agent dispatches, whose tool_results carry no agentId text).
+    for tu in sorted_tool_uses:
+        desc, sa_type, tu_ts_str, content_idx = tu[0], tu[1], tu[2], tu[3]
+        tool_use_id = tu[5] if len(tu) > 5 else None
+        m = meta_index.get(tool_use_id)
+        if m and m["agent_id"] not in used_ids:
+            used_ids.add(m["agent_id"])
+            log(f"Matched subagent {m['agent_id']} via meta.json toolUseId")
+            matched.append((m["agent_id"], m["path"], desc, sa_type, content_idx, "meta"))
+        else:
+            pending_deterministic.append(tu)
 
     # Pass 1: deterministic agentId match (exact, ignores timestamps).
-    for tu in sorted_tool_uses:
+    for tu in pending_deterministic:
         desc, sa_type, tu_ts_str, content_idx = tu[0], tu[1], tu[2], tu[3]
         agent_id = tu[4] if len(tu) > 4 else None
         if agent_id and agent_id in by_id and agent_id not in used_ids:
@@ -1925,6 +1945,9 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
     })
 
     # 2. Generation + spans per turn
+    # Meta index rebuilt on every fire — subagent dirs appear mid-session.
+    sa_search_dirs = _subagent_search_dirs(transcript_path, cwd)
+    sa_meta_index = build_subagent_meta_index(sa_search_dirs)
     for turn_idx, turn in enumerate(turns):
         # Deterministic IDs so re-ingestion updates rather than duplicates
         turn_id = uuid.uuid5(uuid.NAMESPACE_URL, f"{session_id}:turn:{prev_turn_count + turn_idx}")
@@ -2080,11 +2103,13 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                         tc.get("start_time", start_time),
                         tc_idx,
                         extract_agent_id_from_result(tc.get("output", "")),
+                        tc["id"],
                     ))
 
         # Discover and ingest subagents for this turn
         if agent_tool_uses_this_turn:
-            matches = discover_subagents(transcript_path, agent_tool_uses_this_turn, cwd=cwd)
+            matches = discover_subagents(transcript_path, agent_tool_uses_this_turn,
+                                         cwd=cwd, meta_index=sa_meta_index)
             for sa_id, sa_path, sa_desc, sa_type, sa_tc_idx, sa_corr in matches:
                 sa_prev_offset = sa_state.get(sa_id, {}).get("offset", 0)
                 sa_prior_turns = sa_state.get(sa_id, {}).get("turn_count", 0)
