@@ -3552,3 +3552,35 @@ class TestEffortCapture:
         trace = self._capture_trace(monkeypatch, tmp_path, live=False, effort="high")
         assert not any(t.startswith("effort:") for t in trace["tags"])
         assert trace["metadata"].get("effort_level") is None
+
+
+def _write_jsonl(tmp_path, entries, name="t.jsonl"):
+    p = tmp_path / name
+    p.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+    return str(p)
+
+
+def test_extract_worktree_state_absent(tmp_path):
+    path = _write_jsonl(tmp_path, [{"type": "user", "message": {"role": "user", "content": "hi"}}])
+    assert hook.extract_worktree_state(path) is None
+
+
+def test_extract_worktree_state_last_entry_wins(tmp_path):
+    path = _write_jsonl(tmp_path, [
+        {"type": "worktree-state", "worktreeSession": {
+            "worktreeName": "first", "worktreeBranch": "b1",
+            "originalCwd": "/repo", "originalBranch": "main",
+            "originalHeadCommit": "aaa"}},
+        {"type": "worktree-state", "worktreeSession": {
+            "worktreeName": "second", "worktreeBranch": "b2",
+            "originalCwd": "/repo", "originalBranch": "main",
+            "originalHeadCommit": "bbb"}},
+    ])
+    ws = hook.extract_worktree_state(path)
+    assert ws == {"name": "second", "branch": "b2", "original_cwd": "/repo",
+                  "original_branch": "main", "original_head_commit": "bbb"}
+
+
+def test_extract_worktree_state_empty_session_object(tmp_path):
+    path = _write_jsonl(tmp_path, [{"type": "worktree-state", "worktreeSession": {}}])
+    assert hook.extract_worktree_state(path) is None

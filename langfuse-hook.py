@@ -530,6 +530,27 @@ def extract_agent_name(transcript_path: str) -> str:
     return ""
 
 
+def extract_worktree_state(transcript_path: str) -> dict | None:
+    """Last type:'worktree-state' entry (worktree sessions, v2.1.16x+).
+
+    Sessions can enter/exit worktrees mid-run; the last entry reflects the
+    final state. None when the session never entered a worktree.
+    """
+    worktree = None
+    for entry in iter_transcript(transcript_path):
+        if entry.get("type") == "worktree-state":
+            ws = entry.get("worktreeSession") or {}
+            if ws:
+                worktree = {
+                    "name": ws.get("worktreeName", ""),
+                    "branch": ws.get("worktreeBranch", ""),
+                    "original_cwd": ws.get("originalCwd", ""),
+                    "original_branch": ws.get("originalBranch", ""),
+                    "original_head_commit": ws.get("originalHeadCommit", ""),
+                }
+    return worktree
+
+
 _AGENT_ID_RE = re.compile(r"agentId:\s*([0-9a-f]+)")
 
 
