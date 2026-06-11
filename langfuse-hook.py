@@ -49,6 +49,7 @@ SAFE_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 _SYNTHETIC_PROMPT_RE = re.compile(r"^<[a-z][a-z0-9-]*>")
 
 SUBAGENT_MATCH_WINDOW_S = 60  # Max seconds between Agent tool_use and subagent start
+MAX_SUBAGENT_DEPTH = 5  # CC 2.1.172: sub-agents can spawn sub-agents up to 5 levels
 
 
 # Pro subscription: $0 marginal cost. Set to True to report equivalent API cost instead.
@@ -390,11 +391,24 @@ def ingest_subagent(
     subagent_offset: int,
     prior_turn_count: int = 0,
     correlation: str = "timestamp",
+    meta_index: dict = None,
+    depth: int = 1,
+    visited: set = None,
+    sa_state: dict = None,
 ) -> tuple:
     """Parse a subagent transcript and build Langfuse events.
 
+    Recurses into nested Agent dispatches (CC 2.1.172+) resolved via
+    meta_index, up to MAX_SUBAGENT_DEPTH levels; `visited` guards cycles.
+    Nested children are recorded in sa_state with depth/parent lineage.
+
     Returns: (events, cost_summary, new_offset, new_turn_count, status)
     """
+    if visited is None:
+        visited = set()
+    visited.add(agent_id)
+    meta_index = meta_index or {}
+
     empty_cost = {"agent_id": agent_id, "total_cost": 0, "total_tokens": 0,
                   "turns": 0, "status": "partial",
                   "cost_breakdown": {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0}}
@@ -462,6 +476,7 @@ def ingest_subagent(
             "subagent_id": agent_id,
             "agent_id": agent_id,
             "subagent_correlation": correlation,
+            "subagent_depth": depth,
             "tools_used": [tc["name"] for tc in turn["tool_calls"]],
             "tool_count": len(turn["tool_calls"]),
             "speed": turn.get("speed", ""),
@@ -533,6 +548,46 @@ def ingest_subagent(
                     "metadata": {"tool_use_id": tc["id"], "subagent_id": agent_id},
                 },
             })
+
+            if (tc["name"] == "Agent" and depth < MAX_SUBAGENT_DEPTH
+                    and tc["id"] in meta_index):
+                child = meta_index[tc["id"]]
+                child_id = child["agent_id"]
+                if child_id not in visited:
+                    child_prev = (sa_state or {}).get(child_id, {})
+                    c_events, c_cost, c_offset, c_tc, c_status = ingest_subagent(
+                        agent_id=child_id,
+                        transcript_path=child["path"],
+                        parent_span_id=span_id,
+                        trace_id=trace_id,
+                        session_id=session_id,
+                        subagent_offset=child_prev.get("offset", 0),
+                        prior_turn_count=child_prev.get("turn_count", 0),
+                        correlation="meta",
+                        meta_index=meta_index,
+                        depth=depth + 1,
+                        visited=visited,
+                        sa_state=sa_state,
+                    )
+                    events.extend(c_events)
+                    # Nested-child cost stays out of this agent's own cost_summary;
+                    # the trace-level subagent_costs rollup sums all agents flat.
+                    if sa_state is not None:
+                        sa_state[child_id] = {
+                            "offset": c_offset,
+                            "turn_count": c_tc,
+                            "status": c_status,
+                            "total_cost": round(child_prev.get("total_cost", 0.0) + c_cost["total_cost"], 6),
+                            "total_tokens": child_prev.get("total_tokens", 0) + c_cost["total_tokens"],
+                            "cost_breakdown": {
+                                k: round(child_prev.get("cost_breakdown", {}).get(k, 0.0) + v, 6)
+                                for k, v in c_cost["cost_breakdown"].items()
+                            },
+                            "description": child["description"],
+                            "subagent_type": child["agent_type"],
+                            "parent_agent_id": agent_id,
+                            "depth": depth + 1,
+                        }
 
     new_turn_count = prior_turn_count + len(turns)
     cost_summary = {
@@ -1948,6 +2003,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
     # Meta index rebuilt on every fire — subagent dirs appear mid-session.
     sa_search_dirs = _subagent_search_dirs(transcript_path, cwd)
     sa_meta_index = build_subagent_meta_index(sa_search_dirs)
+    sa_visited = set()
     for turn_idx, turn in enumerate(turns):
         # Deterministic IDs so re-ingestion updates rather than duplicates
         turn_id = uuid.uuid5(uuid.NAMESPACE_URL, f"{session_id}:turn:{prev_turn_count + turn_idx}")
@@ -2124,6 +2180,9 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                     subagent_offset=sa_prev_offset,
                     prior_turn_count=sa_prior_turns,
                     correlation=sa_corr,
+                    meta_index=sa_meta_index,
+                    visited=sa_visited,
+                    sa_state=sa_state,
                 )
                 batch.extend(sa_events)
                 _prev = sa_state.get(sa_id, {})

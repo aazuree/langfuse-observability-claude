@@ -995,3 +995,94 @@ def test_discover_meta_index_match_beats_regex_and_timestamp(tmp_path):
     agent_id, path, desc, sa_type, idx, corr = matches[0]
     assert agent_id == "metakid"
     assert corr == "meta"
+
+
+# --- recursive ingest_subagent tests ---
+
+def _make_agent_spawning_jsonl(directory, agent_id, child_tool_use_id,
+                               start_ts="2026-06-10T10:00:01+00:00"):
+    """Subagent transcript whose single turn dispatches a nested Agent."""
+    lines = [
+        {"type": "user", "agentId": agent_id, "timestamp": start_ts,
+         "message": {"role": "user", "content": "spawn child"}},
+        {"type": "assistant", "timestamp": "2026-06-10T10:00:02+00:00",
+         "message": {"id": f"m-{agent_id}", "role": "assistant",
+                     "model": "claude-opus-4-8",
+                     "content": [{"type": "tool_use", "id": child_tool_use_id,
+                                  "name": "Agent",
+                                  "input": {"description": "child probe",
+                                            "subagent_type": "Explore",
+                                            "prompt": "do it"}}],
+                     "usage": {"input_tokens": 10, "output_tokens": 10,
+                               "cache_read_input_tokens": 0,
+                               "cache_creation_input_tokens": 0}}},
+        {"type": "user", "timestamp": "2026-06-10T10:00:09+00:00",
+         "message": {"role": "user", "content": [
+             {"type": "tool_result", "tool_use_id": child_tool_use_id,
+              "content": "done"}]}},
+        {"type": "assistant", "timestamp": "2026-06-10T10:00:10+00:00",
+         "stop_reason": "end_turn",
+         "message": {"id": f"m2-{agent_id}", "role": "assistant",
+                     "model": "claude-opus-4-8",
+                     "content": [{"type": "text", "text": "child done"}],
+                     "usage": {"input_tokens": 5, "output_tokens": 5,
+                               "cache_read_input_tokens": 0,
+                               "cache_creation_input_tokens": 0}}},
+    ]
+    path = directory / f"agent-{agent_id}.jsonl"
+    path.write_text("\n".join(json.dumps(e) for e in lines) + "\n")
+    return str(path)
+
+
+def test_ingest_subagent_recurses_into_nested_agent(tmp_path):
+    sa_dir = tmp_path / "subagents"
+    sa_dir.mkdir()
+    parent_path = _make_agent_spawning_jsonl(sa_dir, "parentaid", "toolu_CHILD")
+    _make_meta_json(sa_dir, "parentaid", tool_use_id="toolu_PARENT")
+    _make_full_subagent_jsonl(sa_dir, "childaid", start_ts="2026-06-10T10:00:03+00:00")
+    _make_meta_json(sa_dir, "childaid", agent_type="Explore",
+                    description="child probe", tool_use_id="toolu_CHILD")
+
+    meta_index = langfuse_hook.build_subagent_meta_index([str(sa_dir)])
+    sa_state = {}
+    events, cost, offset, tc, status = langfuse_hook.ingest_subagent(
+        agent_id="parentaid",
+        transcript_path=parent_path,
+        parent_span_id="span-x",
+        trace_id="trace-x",
+        session_id="sess-x",
+        subagent_offset=0,
+        meta_index=meta_index,
+        sa_state=sa_state,
+    )
+    # Child generations present, parented under the parent's nested Agent tool span
+    child_gens = [e for e in events if e["type"] == "generation-create"
+                  and "subagent-childaid" in e["body"]["id"]]
+    assert child_gens, "nested child generations missing"
+    parent_agent_spans = [e for e in events if e["type"] == "span-create"
+                          and e["body"]["metadata"].get("tool_use_id") == "toolu_CHILD"]
+    assert parent_agent_spans
+    nested_span_id = parent_agent_spans[0]["body"]["id"]
+    assert all(g["body"]["parentObservationId"] == nested_span_id for g in child_gens)
+    # State recorded for the child with lineage
+    assert sa_state["childaid"]["parent_agent_id"] == "parentaid"
+    assert sa_state["childaid"]["depth"] == 2
+    assert sa_state["childaid"]["total_tokens"] > 0
+
+
+def test_ingest_subagent_depth_limit_and_cycle_guard(tmp_path):
+    sa_dir = tmp_path / "subagents"
+    sa_dir.mkdir()
+    # Agent that "spawns itself" -- cycle guard must stop recursion
+    path = _make_agent_spawning_jsonl(sa_dir, "loopy", "toolu_SELF")
+    _make_meta_json(sa_dir, "loopy", tool_use_id="toolu_SELF")
+    meta_index = langfuse_hook.build_subagent_meta_index([str(sa_dir)])
+    sa_state = {}
+    events, cost, offset, tc, status = langfuse_hook.ingest_subagent(
+        agent_id="loopy", transcript_path=path, parent_span_id="s",
+        trace_id="t", session_id="sess", subagent_offset=0,
+        meta_index=meta_index, sa_state=sa_state,
+    )
+    # Exactly one ingestion of loopy: its own turn generations, no infinite recursion
+    loopy_gens = [e for e in events if e["type"] == "generation-create"]
+    assert 0 < len(loopy_gens) <= 2
