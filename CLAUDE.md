@@ -173,10 +173,19 @@ Bedrock. Canonical source: aws.amazon.com/bedrock/pricing (verified June 2026).
 
 ## Tags and Metadata
 
-> Transcript-field coverage verified against Claude Code **v2.1.168** (2026-06-07).
+> Transcript-field coverage verified against Claude Code **v2.1.181** (2026-06-18).
 > Note: `effort.level`, `agent_id`/`parent_agent_id`, and skill `invocation_trigger` are
 > OTel-span / hook-stdin fields, **not** transcript JSONL — unreachable by this hook's
 > transcript parsing. effort is captured via the `$CLAUDE_EFFORT` env var instead.
+>
+> New in v2.1.169–v2.1.181: assistant-channel API-error/auto-retry stubs
+> (`isApiErrorMessage`), user interrupts (`interruptedMessageId`), and the
+> `system:informational` subtype (CLI warnings, e.g. "Unknown command"). The
+> `isApiErrorMessage` stubs are zero-usage synthetic entries (`model:"<synthetic>"`)
+> whose content is error text ("You've hit your session limit", "model not found");
+> `build_turns` **skips** them so they cannot overwrite a turn's real output / timing /
+> `stop_reason`. The high-frequency `mode` and `last-prompt` entry types are internal
+> bookkeeping (current input mode, last-prompt UUID pointer) and deliberately not captured.
 
 Each trace is enriched with:
 
@@ -186,7 +195,9 @@ Each trace is enriched with:
 - model family — `opus`, `sonnet`, or `haiku`
 - entrypoint — `cli` or other launch method
 - `fast` — present if any turn used `/fast` mode
-- `has-errors` — present if API errors occurred during the session
+- `has-errors` — present if API errors occurred during the session (`system/api_error` entries)
+- `has-api-error-messages` — present when the session had assistant-channel API-error/auto-retry stubs (`isApiErrorMessage`); see `api_error_messages` metadata
+- `has-interrupts` — present when the user interrupted (ESC) at least one assistant turn (`interruptedMessageId`)
 - `model-missing` — present when any turn had **billable tokens but no `model` field**; that turn's cost is reported as `$0` (never defaulted to a priced model) and a `[WARN]` is logged. Filter on this to find sessions with under-reported cost from upstream transcript gaps.
 - `permission:<mode>` — current permission mode (`default`, `acceptEdits`, `plan`, `bypassPermissions`)
 - `pr:<N>` — one tag per PR linked from the session (via `pr-link` transcript entries)
@@ -220,7 +231,9 @@ via Langfuse's upsert-on-id behaviour.
 **Trace Metadata** (structured key-value on trace):
 - `git_branch`, `cli_version`, `entrypoint`, `repo_name`, `cwd`
 - `turn_count`, `tool_calls_total`, `total_tokens`, `total_input_tokens`, `total_output_tokens`
-- `api_errors` — error summary: `total_count`, `by_status` (HTTP codes), `first_error_at`, `last_error_at`
+- `api_errors` — error summary from `system/api_error` entries: `total_count`, `by_status` (HTTP codes), `first_error_at`, `last_error_at`
+- `api_error_messages` — **separate** assistant-channel error/retry summary from `isApiErrorMessage` entries (CC 2.1.179+/2.1.181 auto-retry): `{count, by_status (apiErrorStatus, e.g. 404/429/529), by_error (e.g. model_not_found/rate_limit), first_at, last_at}`, plus `max_retry_attempt` when any entry carries `retryAttempt`. Null when none. From `extract_api_error_messages()`. Distinct channel from `api_errors`; these stubs are skipped by `build_turns` so they don't pollute turn output.
+- `interrupts` — `{count}` of user interrupts (ESC mid-turn) from `interruptedMessageId` on `user` entries. A friction / misalignment signal. Null when none. From `extract_interrupts()`.
 - `custom_title` — user-set session title (when present)
 - `permission_mode` — last permission mode observed
 - `pr_links` — list of `{number, url, repository, timestamp}` from `pr-link` entries

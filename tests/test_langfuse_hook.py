@@ -1594,6 +1594,73 @@ class TestBuildTurns:
         assert turns[0]["tool_calls"][0]["output"] == "[ERROR] command not found"
 
 
+class TestBuildTurnsApiErrorMessages:
+    """isApiErrorMessage assistant entries are zero-usage synthetic stubs emitted on
+    API errors / auto-retries (CC 2.1.179+ / 2.1.181). Their content is error text
+    ("You've hit your session limit", "model not found"). They must NOT pollute the
+    turn's real output, stop_reason, or first-token timing."""
+
+    def _user(self, text, ts="2026-03-29T10:00:00+00:00"):
+        return {"type": "user", "timestamp": ts,
+                "message": {"role": "user", "content": text}}
+
+    def _assistant(self, text, ts, mid="msg-real"):
+        return {
+            "type": "assistant", "timestamp": ts,
+            "message": {
+                "id": mid, "role": "assistant", "model": "claude-sonnet-4-6",
+                "content": [{"type": "text", "text": text}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 100, "output_tokens": 50,
+                          "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+            },
+        }
+
+    def _api_error(self, text, ts, status=429, error="rate_limit"):
+        return {
+            "type": "assistant", "timestamp": ts, "requestId": "req_err",
+            "isApiErrorMessage": True, "apiErrorStatus": status, "error": error,
+            "message": {
+                "id": "msg-err", "role": "assistant", "model": "<synthetic>",
+                "content": [{"type": "text", "text": text}],
+                "stop_reason": "stop_sequence",
+                "usage": {"input_tokens": 0, "output_tokens": 0,
+                          "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
+            },
+        }
+
+    def test_error_message_does_not_overwrite_real_output(self):
+        entries = [
+            self._user("Do the thing"),
+            self._assistant("Real response.", "2026-03-29T10:00:02+00:00"),
+            self._api_error("You've hit your session limit", "2026-03-29T10:00:03+00:00"),
+        ]
+        turns = hook.build_turns(entries)
+        assert len(turns) == 1
+        assert turns[0]["assistant_output"] == "Real response."
+
+    def test_error_message_does_not_pollute_stop_reason(self):
+        entries = [
+            self._user("Do the thing"),
+            self._assistant("Real response.", "2026-03-29T10:00:02+00:00"),
+            self._api_error("You've hit your session limit", "2026-03-29T10:00:03+00:00"),
+        ]
+        turns = hook.build_turns(entries)
+        assert turns[0]["stop_reason"] == "end_turn"
+
+    def test_error_only_turn_has_empty_output(self):
+        """Call failed before any real response → no output, not the error text."""
+        entries = [
+            self._user("Do the thing"),
+            self._api_error(
+                "There's an issue with the selected model (claude-fable-5).",
+                "2026-03-29T10:00:02+00:00", status=404, error="model_not_found"),
+        ]
+        turns = hook.build_turns(entries)
+        assert len(turns) == 1
+        assert turns[0]["assistant_output"] == ""
+
+
 # ---------------------------------------------------------------------------
 # TestBuildTurnsNewFields
 # ---------------------------------------------------------------------------
@@ -2660,6 +2727,81 @@ class TestExtractApiErrors:
 # TestProcessSessionApiErrors
 # ---------------------------------------------------------------------------
 
+class TestExtractApiErrorMessages:
+    """Assistant-channel API error / auto-retry stubs (isApiErrorMessage=True).
+    Distinct from system/api_error entries handled by extract_api_errors."""
+
+    def _write(self, tmp_path, entries):
+        f = tmp_path / "t.jsonl"
+        f.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+        return str(f)
+
+    def _err(self, status, error, ts, **extra):
+        e = {
+            "type": "assistant", "timestamp": ts,
+            "isApiErrorMessage": True, "apiErrorStatus": status, "error": error,
+            "message": {"id": "msg-err", "role": "assistant", "model": "<synthetic>",
+                        "content": [{"type": "text", "text": "err"}],
+                        "usage": {"input_tokens": 0, "output_tokens": 0}},
+        }
+        e.update(extra)
+        return e
+
+    def test_none_when_no_error_messages(self, tmp_path):
+        entries = [{"type": "assistant", "timestamp": "2026-03-29T10:00:00+00:00",
+                    "message": {"id": "m", "role": "assistant", "model": "claude-sonnet-4-6",
+                                "content": [{"type": "text", "text": "hi"}], "usage": {}}}]
+        assert hook.extract_api_error_messages(self._write(tmp_path, entries)) is None
+
+    def test_nonexistent_file(self):
+        assert hook.extract_api_error_messages("/no/such/file.jsonl") is None
+
+    def test_single_error_message(self, tmp_path):
+        entries = [self._err(429, "rate_limit", "2026-03-29T10:00:00+00:00")]
+        out = hook.extract_api_error_messages(self._write(tmp_path, entries))
+        assert out["count"] == 1
+        assert out["by_status"] == {"429": 1}
+        assert out["by_error"] == {"rate_limit": 1}
+        assert out["first_at"] == "2026-03-29T10:00:00+00:00"
+        assert out["last_at"] == "2026-03-29T10:00:00+00:00"
+
+    def test_groups_by_status_and_error(self, tmp_path):
+        entries = [
+            self._err(404, "model_not_found", "2026-03-29T10:00:00+00:00"),
+            self._err(404, "model_not_found", "2026-03-29T10:00:05+00:00"),
+            self._err(429, "rate_limit", "2026-03-29T10:00:09+00:00"),
+        ]
+        out = hook.extract_api_error_messages(self._write(tmp_path, entries))
+        assert out["count"] == 3
+        assert out["by_status"] == {"404": 2, "429": 1}
+        assert out["by_error"] == {"model_not_found": 2, "rate_limit": 1}
+        assert out["first_at"] == "2026-03-29T10:00:00+00:00"
+        assert out["last_at"] == "2026-03-29T10:00:09+00:00"
+
+    def test_ignores_normal_assistant_entries(self, tmp_path):
+        entries = [
+            {"type": "assistant", "timestamp": "2026-03-29T10:00:00+00:00",
+             "message": {"id": "m", "role": "assistant", "model": "claude-sonnet-4-6",
+                         "content": [{"type": "text", "text": "real"}], "usage": {}}},
+            self._err(429, "rate_limit", "2026-03-29T10:00:05+00:00"),
+        ]
+        out = hook.extract_api_error_messages(self._write(tmp_path, entries))
+        assert out["count"] == 1
+
+    def test_captures_max_retry_attempt_when_present(self, tmp_path):
+        entries = [
+            self._err(500, "overloaded", "2026-03-29T10:00:00+00:00", retryAttempt=1),
+            self._err(500, "overloaded", "2026-03-29T10:00:02+00:00", retryAttempt=3),
+        ]
+        out = hook.extract_api_error_messages(self._write(tmp_path, entries))
+        assert out["max_retry_attempt"] == 3
+
+    def test_no_retry_field_omits_max_retry(self, tmp_path):
+        entries = [self._err(429, "rate_limit", "2026-03-29T10:00:00+00:00")]
+        out = hook.extract_api_error_messages(self._write(tmp_path, entries))
+        assert "max_retry_attempt" not in out
+
+
 class TestProcessSessionApiErrors:
     def _make_transcript(self, tmp_path, entries):
         f = tmp_path / "session.jsonl"
@@ -2756,6 +2898,38 @@ class TestProcessSessionApiErrors:
 
         tags = trace_events[0]["body"]["tags"]
         assert "has-errors" not in tags
+
+    def test_api_error_messages_in_metadata_and_tag(self, tmp_path, monkeypatch):
+        state_dir = tmp_path / "state"
+        state_dir.mkdir()
+        monkeypatch.setattr(hook, "STATE_DIR", str(state_dir))
+
+        sent_batches = []
+        monkeypatch.setattr(hook, "send_to_langfuse", lambda batch: sent_batches.append(batch) or True)
+
+        entries = [
+            {"type": "user", "timestamp": "2026-03-29T10:00:00+00:00",
+             "message": {"role": "user", "content": "Hello"}},
+            {"type": "assistant", "timestamp": "2026-03-29T10:00:01+00:00",
+             "message": {"id": "msg-1", "role": "assistant", "model": "claude-sonnet-4-6",
+                         "content": [{"type": "text", "text": "Answer"}],
+                         "usage": {"input_tokens": 10, "output_tokens": 5}}},
+            {"type": "assistant", "timestamp": "2026-03-29T10:00:02+00:00",
+             "isApiErrorMessage": True, "apiErrorStatus": 429, "error": "rate_limit",
+             "message": {"id": "msg-err", "role": "assistant", "model": "<synthetic>",
+                         "content": [{"type": "text", "text": "You've hit your session limit"}],
+                         "usage": {"input_tokens": 0, "output_tokens": 0}}},
+        ]
+        path = self._make_transcript(tmp_path, entries)
+        hook.process_session("api-errmsg-session", path, "/test/project")
+
+        batch = sent_batches[0]
+        trace = [e for e in batch if e["type"] == "trace-create"][0]["body"]
+        assert trace["metadata"]["api_error_messages"]["count"] == 1
+        assert trace["metadata"]["api_error_messages"]["by_status"] == {"429": 1}
+        assert "has-api-error-messages" in trace["tags"]
+        # P1 integration: the error stub must NOT become the trace output.
+        assert trace["output"] == "Answer"
 
 
 # ---------------------------------------------------------------------------
