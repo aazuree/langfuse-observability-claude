@@ -1072,6 +1072,13 @@ def build_turns(entries: list[dict]) -> list[dict]:
 
     for entry in entries:
         etype = entry.get("type")
+        # API error / auto-retry stubs (CC 2.1.179+/2.1.181): zero-usage synthetic
+        # assistant entries whose content is error text ("You've hit your session
+        # limit", "model not found"). Skip so they don't overwrite the turn's real
+        # output / first-token time / stop_reason. Surfaced separately at trace level
+        # via extract_api_error_messages().
+        if entry.get("isApiErrorMessage"):
+            continue
         if etype in ("user", "assistant"):
             msg = entry.get("message", {})
             msg_entries.append({
@@ -1357,6 +1364,73 @@ def extract_api_errors(entries: list[dict]) -> dict:
         "first_error_at": first_error_at,
         "last_error_at": last_error_at,
     }
+
+
+def extract_api_error_messages(transcript_path: str) -> dict | None:
+    """Aggregate assistant-channel API error / auto-retry stubs.
+
+    These are `type:"assistant"` entries with `isApiErrorMessage: True` (CC 2.1.179+/
+    2.1.181 auto-retry), carrying `apiErrorStatus` (e.g. 404/429/529) and an `error`
+    string (e.g. "model_not_found", "rate_limit"). Distinct from `system/api_error`
+    entries (extract_api_errors) — a separate error channel that build_turns skips so
+    it cannot pollute turn output. `max_retry_attempt` is emitted only when any entry
+    carries a `retryAttempt`. Returns None when no such entries exist.
+    """
+    count = 0
+    by_status: dict[str, int] = {}
+    by_error: dict[str, int] = {}
+    first_at = ""
+    last_at = ""
+    max_retry = None
+
+    for entry in iter_transcript(transcript_path):
+        if not entry.get("isApiErrorMessage"):
+            continue
+        count += 1
+        status = entry.get("apiErrorStatus")
+        if status is not None:
+            by_status[str(status)] = by_status.get(str(status), 0) + 1
+        error = entry.get("error")
+        if error:
+            by_error[str(error)] = by_error.get(str(error), 0) + 1
+        ts = entry.get("timestamp", "")
+        if ts:
+            if not first_at or ts < first_at:
+                first_at = ts
+            if not last_at or ts > last_at:
+                last_at = ts
+        ra = entry.get("retryAttempt")
+        if isinstance(ra, int):
+            max_retry = ra if max_retry is None else max(max_retry, ra)
+
+    if count == 0:
+        return None
+    out = {
+        "count": count,
+        "by_status": by_status,
+        "by_error": by_error,
+        "first_at": first_at,
+        "last_at": last_at,
+    }
+    if max_retry is not None:
+        out["max_retry_attempt"] = max_retry
+    return out
+
+
+def extract_interrupts(transcript_path: str) -> dict | None:
+    """Count user-initiated interrupts (ESC mid-turn).
+
+    `type:"user"` entries carry `interruptedMessageId` (the assistant message the user
+    cut off) — a friction / misalignment signal. Returns {"count": N}, or None when the
+    session had no interrupts.
+    """
+    count = 0
+    for entry in iter_transcript(transcript_path):
+        if entry.get("type") == "user" and entry.get("interruptedMessageId"):
+            count += 1
+    if count == 0:
+        return None
+    return {"count": count}
 
 
 def extract_cwd(transcript_path: str) -> str:
@@ -1825,6 +1899,8 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
     file_history_stats = extract_file_history_stats(transcript_path)
     stop_hook_stats = extract_stop_hook_stats(transcript_path)
     worktree_state = extract_worktree_state(transcript_path)
+    api_error_messages = extract_api_error_messages(transcript_path)
+    interrupts = extract_interrupts(transcript_path)
     entries, total_lines, read_ok = parse_transcript(transcript_path, skip_lines=prev_line_offset)
 
     if not read_ok:
@@ -1974,6 +2050,8 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 "worktree": worktree_state,
                 "background_tasks": background_tasks or None,
                 "session_crons": session_crons or None,
+                "api_error_messages": api_error_messages,
+                "interrupts": interrupts,
             },
             "tags": [t for t in [
                 "claude-code",
@@ -1982,6 +2060,8 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 session_meta.get("entrypoint") or None,
                 "fast" if has_fast else None,
                 "has-errors" if has_errors else None,
+                "has-api-error-messages" if api_error_messages else None,
+                "has-interrupts" if interrupts else None,
                 "has-background-tasks" if background_tasks else None,
                 "model-missing" if has_missing_model else None,
                 f"permission:{permission_mode}" if permission_mode else None,

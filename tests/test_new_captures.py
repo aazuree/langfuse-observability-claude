@@ -144,6 +144,30 @@ class TestExtractPermissionTimeline:
         assert out["ever_bypass"] is True
 
 
+class TestExtractInterrupts:
+    def test_none_when_no_interrupts(self, tmp_path):
+        assert hook.extract_interrupts(_write([{"type": "user"}], tmp_path)) is None
+
+    def test_nonexistent_file(self):
+        assert hook.extract_interrupts("/nonexistent.jsonl") is None
+
+    def test_counts_user_interrupts(self, tmp_path):
+        entries = [
+            {"type": "user", "interruptedMessageId": "msg_01A",
+             "message": {"role": "user", "content": "stop"}},
+            {"type": "user", "message": {"role": "user", "content": "normal"}},
+            {"type": "user", "interruptedMessageId": "msg_01B",
+             "message": {"role": "user", "content": "stop again"}},
+        ]
+        out = hook.extract_interrupts(_write(entries, tmp_path))
+        assert out == {"count": 2}
+
+    def test_ignores_empty_interrupted_id(self, tmp_path):
+        entries = [{"type": "user", "interruptedMessageId": "",
+                    "message": {"role": "user", "content": "x"}}]
+        assert hook.extract_interrupts(_write(entries, tmp_path)) is None
+
+
 class TestNewCapturesWiring:
     def test_metadata_and_tags_present(self, tmp_path, monkeypatch):
         entries = [
@@ -191,3 +215,30 @@ class TestNewCapturesWiring:
         assert "compact-trigger:manual" in tags
         assert "remote-control" in tags
         assert "permission:acceptEdits" in tags
+
+    def test_interrupts_metadata_and_tag(self, tmp_path, monkeypatch):
+        entries = [
+            {"type": "user", "timestamp": "2026-06-18T00:00:00Z", "cwd": "/x/repo",
+             "message": {"role": "user", "content": "do a thing"}},
+            {"type": "assistant", "timestamp": "2026-06-18T00:00:02Z",
+             "message": {"role": "assistant", "id": "m1", "model": "claude-opus-4-8",
+                         "stop_reason": "end_turn",
+                         "content": [{"type": "text", "text": "working"}],
+                         "usage": {"input_tokens": 5, "output_tokens": 3}}},
+            {"type": "user", "timestamp": "2026-06-18T00:00:03Z",
+             "interruptedMessageId": "msg_01A",
+             "message": {"role": "user", "content": "stop"}},
+        ]
+        transcript = tmp_path / "sess.jsonl"
+        transcript.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+
+        captured = {}
+        monkeypatch.setattr(hook, "send_to_langfuse",
+                            lambda batch: captured.setdefault("batch", batch) or True)
+        monkeypatch.setattr(hook, "STATE_DIR", str(tmp_path / "state"))
+
+        hook.process_session("sess-int", str(transcript), "/x/repo")
+
+        trace = next(e for e in captured["batch"] if e["type"] == "trace-create")
+        assert trace["body"]["metadata"]["interrupts"] == {"count": 1}
+        assert "has-interrupts" in trace["body"]["tags"]
