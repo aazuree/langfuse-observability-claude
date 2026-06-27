@@ -173,17 +173,29 @@ for hook_group in settings.get('hooks', {}).get('Stop', []):
             hook['command'] = '''$HOOK_CMD'''
     # Strip any legacy eval-hook entries (feature removed)
     hook_group['hooks'] = [h for h in hooks if 'eval-hook.py' not in h.get('command', '')]
-# Register SessionStart and StopFailure hooks for session-start-hook.py
+# Strip any stale SessionStart registration of session-start-hook.py
+# (skeleton-trace creation was removed; it produced empty orphan traces).
+if 'SessionStart' in settings.get('hooks', {}):
+    for group in settings['hooks']['SessionStart']:
+        group['hooks'] = [
+            h for h in group.get('hooks', [])
+            if 'session-start-hook.py' not in h.get('command', '')
+        ]
+    settings['hooks']['SessionStart'] = [
+        g for g in settings['hooks']['SessionStart'] if g.get('hooks')
+    ]
+    if not settings['hooks']['SessionStart']:
+        del settings['hooks']['SessionStart']
+# Register StopFailure hook for session-start-hook.py
 session_hook_cmd = '''$SESSION_HOOK_CMD'''
-for event_name in ('SessionStart', 'StopFailure'):
-    event_hooks = settings.setdefault('hooks', {}).setdefault(event_name, [])
-    already = any(
-        'session-start-hook.py' in h.get('command', '')
-        for group in event_hooks
-        for h in group.get('hooks', [])
-    )
-    if not already:
-        event_hooks.append({'hooks': [{'type': 'command', 'command': session_hook_cmd}]})
+event_hooks = settings.setdefault('hooks', {}).setdefault('StopFailure', [])
+already = any(
+    'session-start-hook.py' in h.get('command', '')
+    for group in event_hooks
+    for h in group.get('hooks', [])
+)
+if not already:
+    event_hooks.append({'hooks': [{'type': 'command', 'command': session_hook_cmd}]})
 with open('$CLAUDE_SETTINGS', 'w') as f:
     json.dump(settings, f, indent=2)
     f.write('\n')
@@ -223,16 +235,6 @@ else
         ]
       }
     ],
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "$SESSION_HOOK_CMD"
-          }
-        ]
-      }
-    ],
     "StopFailure": [
       {
         "hooks": [
@@ -246,7 +248,7 @@ else
   }
 }
 SETTINGS
-    echo "       Created with Stop + SessionStart/StopFailure hooks."
+    echo "       Created with Stop + StopFailure hooks."
 fi
 
 echo ""

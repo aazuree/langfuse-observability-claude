@@ -65,13 +65,13 @@ langfuse-hook.py  ──POST──>  Langfuse API (localhost:3100)
 langfuse-observability/
 ├── docker-compose.yml     # Langfuse stack (6 services)
 ├── langfuse-hook.py       # Stop hook: transcript -> Langfuse ingestion
-├── session-start-hook.py  # SessionStart + StopFailure hooks
+├── session-start-hook.py  # StopFailure hook: tags traces with stop-failure + last API error
 ├── setup.sh               # One-command setup (secrets, docker, hook config)
 ├── .env.example           # Template (safe to commit)
 ├── .env                   # Actual secrets (gitignored)
 ├── tests/
 │   ├── test_langfuse_hook.py      # Core hook unit tests
-│   ├── test_session_hooks.py      # SessionStart + StopFailure hook tests
+│   ├── test_session_hooks.py      # StopFailure hook tests
 │   ├── test_hook_scores.py        # Hook-level score classifier tests
 │   └── test_subagent_tracking.py  # Subagent cost tracking tests
 └── README.md
