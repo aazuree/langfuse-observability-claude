@@ -5,7 +5,7 @@
 # External connections from other machines will not be able to reach these services directly.
 services:
   langfuse-worker:
-    image: docker.io/langfuse/langfuse-worker:3.174.1
+    image: docker.io/langfuse/langfuse-worker:3.200.0
     restart: always
     depends_on: &langfuse-depends-on
       postgres:
@@ -67,7 +67,7 @@ services:
       SMTP_CONNECTION_URL: ${SMTP_CONNECTION_URL:-}
 
   langfuse-web:
-    image: docker.io/langfuse/langfuse:3.174.1
+    image: docker.io/langfuse/langfuse:3.200.0
     restart: always
     depends_on: *langfuse-depends-on
     ports:
@@ -86,7 +86,7 @@ services:
       LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-}
 
   clickhouse:
-    image: docker.io/clickhouse/clickhouse-server:26.3.10.60
+    image: docker.io/clickhouse/clickhouse-server:26.6.1.1193
     restart: always
     user: "101:101"
     environment:
@@ -128,7 +128,7 @@ services:
       start_period: 1s
 
   redis:
-    image: docker.io/redis:7.4.8
+    image: docker.io/redis:8.8.0
     restart: always
     # CHANGEME: row below to secure redis password
     command: >
@@ -145,7 +145,7 @@ services:
       retries: 10
 
   postgres:
-    image: docker.io/postgres:${POSTGRES_VERSION:-17.9}
+    image: docker.io/postgres:${POSTGRES_VERSION:-18.4}
     restart: always
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
@@ -161,7 +161,9 @@ services:
     ports:
       - 127.0.0.1:5532:5432
     volumes:
-      - langfuse_postgres_data:/var/lib/postgresql/data
+      # Postgres 18+ image stores data in a major-version subdir; mount the parent
+      # (/var/lib/postgresql) not the legacy /data path. See docker-library/postgres#1259.
+      - langfuse_postgres_data:/var/lib/postgresql
 
 volumes:
   langfuse_postgres_data:

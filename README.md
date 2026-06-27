@@ -73,7 +73,8 @@ langfuse-observability/
 │   ├── test_langfuse_hook.py      # Core hook unit tests
 │   ├── test_session_hooks.py      # StopFailure hook tests
 │   ├── test_hook_scores.py        # Hook-level score classifier tests
-│   └── test_subagent_tracking.py  # Subagent cost tracking tests
+│   ├── test_subagent_tracking.py  # Subagent cost tracking tests
+│   └── test_new_captures.py       # New transcript-field capture tests
 └── README.md
 ```
 
@@ -87,7 +88,7 @@ The hook script (`langfuse-hook.py`) is invoked by Claude Code after each assist
 4. **Token deduplication** — assistant messages with the same `message.id` are streaming updates; takes the last for final usage
 5. **Timing** — uses message timestamps for latency, `turn_duration` entries for total turn time, first assistant timestamp for TTFT
 6. **Cost** — computes equivalent Anthropic API cost from token counts (configurable via `REPORT_API_EQUIVALENT_COST` flag)
-7. **Subagent tracking** — discovers subagent transcripts (from Agent tool invocations) via timestamp correlation, ingests them as nested observations, and rolls up per-subagent cost in trace metadata
+7. **Subagent tracking** — discovers subagent transcripts (from Agent tool invocations) via a 3-pass correlation (`.meta.json` `toolUseId` → `agentId` → timestamp proximity), ingests them as nested observations, and rolls up per-subagent cost in trace metadata
 
 ## Services
 
@@ -98,7 +99,7 @@ The hook script (`langfuse-hook.py`) is invoked by Claude Code after each assist
 | postgres | 5532 | localhost only |
 | clickhouse | 8223, 9100 | localhost only |
 | redis | 6479 | localhost only |
-| minio | 9190 | localhost only |
+| minio | 9190, 9191 | localhost only |
 
 ## Operations
 
@@ -161,7 +162,7 @@ This finds all transcript files, deletes any existing traces to avoid duplicates
 
 ## Subagent Cost Tracking
 
-When Claude Code spawns subagents via the Agent tool, the hook automatically discovers their transcripts at `<session>/subagents/agent-{id}.jsonl`, correlates them by timestamp, and ingests them as nested generations/spans under the parent Agent tool span.
+When Claude Code spawns subagents via the Agent tool, the hook automatically discovers their transcripts at `<session>/subagents/agent-{id}.jsonl`, correlates them (`.meta.json` `toolUseId` → `agentId` → timestamp proximity), and ingests them as nested generations/spans under the parent Agent tool span.
 
 Traces with subagents get `has-subagents` and `subagents:{count}` tags, and trace metadata includes a `subagent_costs` summary with per-agent cost breakdowns and total harness cost. Nested sub-agent dispatches (CC 2.1.172+) are followed recursively up to 5 levels and appear as nested generations/spans with per-agent lineage in `subagent_costs`.
 
@@ -192,6 +193,6 @@ Set `REPORT_API_EQUIVALENT_COST = True` in `langfuse-hook.py` (default) to repor
 - **Hook does not block Claude Code**: runs asynchronously; if Langfuse is down, errors go to `~/.claude/langfuse-hook.log`.
 - **Secret redaction**: The hook redacts common patterns but cannot catch all secrets. Avoid pasting raw credentials into Claude Code prompts.
 
-## Why Not LiteLLM Proxy?
+## Why Not a Proxy (e.g. LiteLLM)?
 
-LiteLLM was rejected due to 17 CVEs (RCE, SSRF, SQLi, API key leaks) and an active supply chain attack on PyPI (March 2026). The hooks approach keeps your Anthropic API key out of any intermediary.
+A proxy puts your Anthropic API key inside a long-running, often internet-facing service — every CVE in that service becomes a path to your key. LiteLLM made the risk concrete in 2026: multiple critical CVEs (SQL injection, command-injection RCE, an unauthenticated RCE chain at CVSS 10.0), several exploited in the wild, plus a PyPI supply chain compromise (March 2026). The hooks approach keeps your key in your own shell environment and out of any intermediary — there's no extra service to harden or patch.
