@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Claude Code SessionStart + StopFailure hooks -> Langfuse.
+"""Claude Code StopFailure hook -> Langfuse.
 
-SessionStart: Creates an early trace with source/model tags so the trace exists
-              before the first Stop hook fires. Stop hook upserts the same trace ID.
-StopFailure:  Updates the trace with a stop-failure tag and last API error metadata
-              when a turn ends due to an API error.
+StopFailure: Updates the session trace with a stop-failure tag and last API error
+             metadata when a turn ends due to an API error. The trace itself is
+             created by the Stop hook (langfuse-hook.py) from the transcript; this
+             hook only enriches it. (SessionStart skeleton-trace creation was
+             removed — it produced empty orphan traces for abandoned sessions.)
 
 Environment variables:
   LANGFUSE_PUBLIC_KEY  - Langfuse project public key
@@ -35,20 +36,6 @@ def log(msg: str) -> None:
     common_log(LOG_FILE, msg)
 
 
-def derive_model_family(model: str) -> str:
-    """Return 'opus', 'sonnet', 'haiku', or 'unknown' from a model ID string."""
-    m = model.lower()
-    if not m:
-        return "unknown"
-    if "opus" in m:
-        return "opus"
-    if "haiku" in m:
-        return "haiku"
-    if "sonnet" in m:
-        return "sonnet"
-    return "unknown"
-
-
 def extract_last_api_error(transcript_path: str) -> dict:
     """Return the last api_error entry's error fields, or empty dict."""
     last = {}
@@ -61,46 +48,6 @@ def extract_last_api_error(transcript_path: str) -> dict:
                 "timestamp": entry.get("timestamp", ""),
             }
     return last
-
-
-def build_session_start_batch(
-    session_id: str,
-    source: str,
-    model: str,
-    cwd: str,
-) -> list[dict]:
-    """Build a trace-create batch for SessionStart."""
-    now = datetime.now(timezone.utc).isoformat()
-    trace_id = f"trace-{session_id}"
-    family = derive_model_family(model)
-
-    tags = [t for t in [
-        "claude-code",
-        f"source:{source}" if source else None,
-        family if family != "unknown" else None,
-    ] if t]
-
-    repo_name = os.path.basename(cwd.rstrip("/")) if cwd else ""
-    if repo_name:
-        tags.append(repo_name)
-
-    return [{
-        "id": f"evt-session-start-{session_id}",
-        "timestamp": now,
-        "type": "trace-create",
-        "body": {
-            "id": trace_id,
-            "timestamp": now,
-            "sessionId": session_id,
-            "userId": os.environ.get("USER", "unknown"),
-            "tags": tags,
-            "metadata": {
-                "session_source": source,
-                "initial_model": model,
-                "cwd": cwd,
-            },
-        },
-    }]
 
 
 def build_stop_failure_batch(
@@ -161,16 +108,8 @@ def main() -> None:
     event_name = hook_input.get("hook_event_name", "")
     session_id = hook_input.get("session_id", "unknown")
     transcript_path = hook_input.get("transcript_path", "")
-    cwd = hook_input.get("cwd", "")
 
-    if event_name == "SessionStart":
-        source = hook_input.get("source", "")
-        model = hook_input.get("model", "")
-        batch = build_session_start_batch(session_id, source, model, cwd)
-        send_batch(batch)
-        log(f"SessionStart: source={source} model={model} session={session_id}")
-
-    elif event_name == "StopFailure":
+    if event_name == "StopFailure":
         if not transcript_path:
             log("StopFailure: no transcript_path")
             return

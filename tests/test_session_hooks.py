@@ -1,5 +1,6 @@
-"""Tests for session-start-hook.py (SessionStart + StopFailure handlers)."""
+"""Tests for session-start-hook.py (StopFailure handler)."""
 import importlib.util
+import io
 import json
 import os
 import sys
@@ -13,71 +14,6 @@ _spec = importlib.util.spec_from_file_location(
 )
 sh = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(sh)
-
-
-class TestDeriveModelFamily:
-    def test_opus(self):
-        assert sh.derive_model_family("claude-opus-4-6") == "opus"
-
-    def test_sonnet(self):
-        assert sh.derive_model_family("claude-sonnet-4-6") == "sonnet"
-
-    def test_haiku(self):
-        assert sh.derive_model_family("claude-haiku-4-5") == "haiku"
-
-    def test_unknown(self):
-        assert sh.derive_model_family("unknown-model") == "unknown"
-
-    def test_empty(self):
-        assert sh.derive_model_family("") == "unknown"
-
-
-class TestBuildSessionStartBatch:
-    def test_basic_trace_created(self):
-        batch = sh.build_session_start_batch(
-            session_id="sess-abc123",
-            source="startup",
-            model="claude-sonnet-4-6",
-            cwd="/home/user/project",
-        )
-        assert len(batch) == 1
-        evt = batch[0]
-        assert evt["type"] == "trace-create"
-        body = evt["body"]
-        assert body["id"] == "trace-sess-abc123"
-        assert body["sessionId"] == "sess-abc123"
-        assert "source:startup" in body["tags"]
-        assert "sonnet" in body["tags"]
-        assert "claude-code" in body["tags"]
-
-    def test_resume_source_tag(self):
-        batch = sh.build_session_start_batch("s1", "resume", "claude-opus-4-6", "/tmp")
-        tags = batch[0]["body"]["tags"]
-        assert "source:resume" in tags
-        assert "opus" in tags
-
-    def test_compact_source_tag(self):
-        batch = sh.build_session_start_batch("s1", "compact", "", "/tmp")
-        tags = batch[0]["body"]["tags"]
-        assert "source:compact" in tags
-
-    def test_model_empty_no_family_tag(self):
-        batch = sh.build_session_start_batch("s1", "startup", "", "/tmp")
-        tags = batch[0]["body"]["tags"]
-        model_tags = [t for t in tags if t in ("opus", "sonnet", "haiku")]
-        assert model_tags == []
-
-    def test_repo_name_from_cwd(self):
-        batch = sh.build_session_start_batch("s1", "startup", "claude-sonnet-4-6", "/home/user/myproject")
-        tags = batch[0]["body"]["tags"]
-        assert "myproject" in tags
-
-    def test_metadata_fields(self):
-        batch = sh.build_session_start_batch("s1", "resume", "claude-opus-4-6", "/tmp/proj")
-        meta = batch[0]["body"]["metadata"]
-        assert meta["session_source"] == "resume"
-        assert meta["initial_model"] == "claude-opus-4-6"
-        assert meta["cwd"] == "/tmp/proj"
 
 
 class TestBuildStopFailureBatch:
@@ -124,6 +60,36 @@ class TestBuildStopFailureBatch:
         batch = sh.build_stop_failure_batch("sess-abc", path)
         meta = batch[0]["body"]["metadata"]
         assert meta["stop_failure"]["last_error_status"] == 529
+
+
+class TestMainDispatch:
+    def _run_main(self, payload, monkeypatch):
+        monkeypatch.setattr(sh, "LANGFUSE_PUBLIC_KEY", "pk-test")
+        monkeypatch.setattr(sh, "LANGFUSE_SECRET_KEY", "sk-test")
+        monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+        sent = []
+        monkeypatch.setattr(sh, "send_batch", lambda batch: sent.append(batch))
+        sh.main()
+        return sent
+
+    def test_session_start_event_sends_nothing(self, monkeypatch):
+        sent = self._run_main(
+            {"hook_event_name": "SessionStart", "session_id": "s1",
+             "source": "startup", "model": "claude-opus-4-8", "cwd": "/tmp"},
+            monkeypatch,
+        )
+        assert sent == []
+
+    def test_stop_failure_event_sends_batch(self, monkeypatch, tmp_path):
+        p = tmp_path / "t.jsonl"
+        p.write_text("")
+        sent = self._run_main(
+            {"hook_event_name": "StopFailure", "session_id": "s1",
+             "transcript_path": str(p)},
+            monkeypatch,
+        )
+        assert len(sent) == 1
+        assert "stop-failure" in sent[0][0]["body"]["tags"]
 
 
 class TestExtractLastApiError:

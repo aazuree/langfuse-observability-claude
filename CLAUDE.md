@@ -37,14 +37,10 @@ LANGFUSE_PUBLIC_KEY=$PK LANGFUSE_SECRET_KEY=$SK python3 langfuse-hook.py --repro
 
 ```
 Claude Code CLI
-    | (SessionStart hook fires immediately on session open)
-    v
-session-start-hook.py --> POST --> Langfuse API (localhost:3100)
-                          (trace-create: source + model tags)
-
     | (Stop hook fires after each response)
     v
 langfuse-hook.py --> POST --> Langfuse API (localhost:3100)
+                          (trace-create from transcript: turns, tokens, cost)
                                   |
                     PostgreSQL, ClickHouse, Redis, MinIO
 
@@ -66,14 +62,14 @@ All services bound to `127.0.0.1` only. API key never leaves the machine.
 
 ```
 langfuse-hook.py                 # Core hook script - parses transcripts, sends to Langfuse
-session-start-hook.py            # SessionStart + StopFailure hook - creates early traces, tags failures
+session-start-hook.py            # StopFailure hook - tags traces with stop-failure + last API error
 docker-compose.yml               # Full Langfuse stack (6 services)
 setup.sh                         # One-command setup (generates .env, starts services, configures hook)
 .env.example                     # Template for environment variables
 .env                             # Generated secrets (gitignored)
 tests/
   test_langfuse_hook.py          # Core hook unit tests
-  test_session_hooks.py          # SessionStart + StopFailure hook tests
+  test_session_hooks.py          # StopFailure hook tests
   test_hook_scores.py            # Hook-level score classifier tests
   test_subagent_tracking.py      # Subagent cost tracking tests
 ```
