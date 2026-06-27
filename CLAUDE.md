@@ -54,7 +54,7 @@ All services bound to `127.0.0.1` only. API key never leaves the machine.
 ## Tech Stack
 
 - **Hook script**: Python 3.8+, stdlib only (zero external deps)
-- **Backend**: Langfuse v3 (web + worker), PostgreSQL 17, ClickHouse 24, Redis 7, MinIO
+- **Backend**: Langfuse v3 (web + worker), PostgreSQL 18, ClickHouse 26, Redis 8, MinIO
 - **Deployment**: Docker Compose (6 services)
 - **Setup**: `./setup.sh` (generates secrets, starts containers, configures hook)
 
