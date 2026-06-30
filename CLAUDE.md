@@ -105,19 +105,23 @@ uv run pytest tests/ -k "discover" -v  # Run tests matching pattern
 
 ## Cost Model
 
-Pricing is model-aware (per 1M tokens). Source: [platform.claude.com/docs/en/about-claude/pricing](https://platform.claude.com/docs/en/about-claude/pricing) (last verified 2026-06-09).
+Pricing is model-aware (per 1M tokens). Source: [platform.claude.com/docs/en/about-claude/pricing](https://platform.claude.com/docs/en/about-claude/pricing) (last verified 2026-06-30).
 
 | Model | Input | Output | Cache Read | Cache Write 5m | Cache Write 1h |
 |-------|-------|--------|------------|----------------|----------------|
 | Fable 5 | $10.00 | $50.00 | $1.00 | $12.50 | $20.00 |
 | Opus 4.8 / 4.7 / 4.6 / 4.5 | $5.00 | $25.00 | $0.50 | $6.25 | $10.00 |
 | Opus 4.1 / 4.0 (legacy) | $15.00 | $75.00 | $1.50 | $18.75 | $30.00 |
-| Sonnet (all versions) | $3.00 | $15.00 | $0.30 | $3.75 | $6.00 |
+| Sonnet 5 — intro (through 2026-08-31) | $2.00 | $10.00 | $0.20 | $2.50 | $4.00 |
+| Sonnet 5 — standard (from 2026-09-01) | $3.00 | $15.00 | $0.30 | $3.75 | $6.00 |
+| Sonnet 4.6 / 4.5 / 4 | $3.00 | $15.00 | $0.30 | $3.75 | $6.00 |
 | Haiku 4.5 | $1.00 | $5.00 | $0.10 | $1.25 | $2.00 |
 | Haiku 3.5 | $0.80 | $4.00 | $0.08 | $1.00 | $1.60 |
 | Haiku 3 (deprecated) | $0.25 | $1.25 | $0.03 | $0.30 | $0.50 |
 
-**Opus 4.7+ tokenizer note:** Opus 4.7 and later ship with a new tokenizer that may produce up to 35% more tokens for the same input text vs. prior models. Per-token rates are unchanged, but absolute session cost for equivalent workloads on 4.7/4.8 can be meaningfully higher than on 4.6.
+**Sonnet 5 intro pricing is date-aware.** `claude-sonnet-5` is billed at the introductory $2/$10 schedule for turns timestamped before `SONNET5_INTRO_END` (2026-09-01 UTC) and at standard $3/$15 from then on — selected by the turn's own `start_time`, so reprocessing a historical intro-period turn keeps billing it at intro rates (reprocess determinism). When a turn carries no parseable timestamp, Sonnet 5 falls back to the durable standard rate. All other Sonnet versions are flat $3/$15. **Flip reminder:** after 2026-08-31 the live rate is standard automatically (no code edit needed) — the constant and intro row stay for correct reprocessing of pre-cutoff turns.
+
+**New-tokenizer note:** Opus 4.7+, Fable 5, **and Sonnet 5** ship a new tokenizer that produces ~30% more tokens for the same input text vs. prior models (Sonnet 4.6 and earlier keep the old tokenizer). Per-token rates are unchanged, but absolute session cost for equivalent workloads is meaningfully higher — the extra cost comes from token *counts* (already in `usageDetails`), not the rate table.
 
 Cache write cost is split by tier when `cache_5m` / `cache_1h` are available in `usageDetails`; otherwise all cache_create is billed at the 5m rate.
 
@@ -127,7 +131,7 @@ These stack multiplicatively on the base rates above (and apply uniformly across
 
 - **Fast mode (`speed="fast"`)**: per-model premium — **6x** on Opus 4.6 / 4.7 ($30/$150), **2x** on Opus 4.8 ($10/$50). Opus 4.5 and Sonnet/Haiku are ineligible and keep base rates. Multipliers live in `FAST_MODE_MULTIPLIERS` in `langfuse-hook.py`.
 - **Fable 5**: ineligible for fast mode (no `/fast` variant) and data residency (`inference_geo` multiplier unverified) — always billed at base $10/$50. Update `calculate_turn_cost` if Anthropic publishes Fable multipliers.
-- **Data residency (`inference_geo="us"`)**: 1.1x on Opus 4.6+/Sonnet 4.6+. Other models do not support the `inference_geo` parameter; multiplier is not applied.
+- **Data residency (`inference_geo="us"`)**: 1.1x on Opus 4.6+/Sonnet 4.6+ (including Sonnet 5). Other models do not support the `inference_geo` parameter; multiplier is not applied.
 - **Fast + US-geo stack**: 6x × 1.1x = 6.6x (Opus 4.6/4.7); 2x × 1.1x = 2.2x (Opus 4.8).
 
 ### Server-side Tool Billing
@@ -159,6 +163,7 @@ endpoint; the premium is the same for US and EU.
 |-------|----------------------------------|----------------|----------------------------------------|
 | Fable 5 | $10 / $50 | not on Bedrock | — |
 | Opus 4.8 / 4.7 / 4.6 | $5 / $25 | $5 / $25 | $5.50 / $27.50 |
+| Sonnet 5 (standard) | $3 / $15 | $3 / $15 | $3.30 / $16.50 |
 | Sonnet 4.x | $3 / $15 | $3 / $15 | $3.30 / $16.50 |
 | Haiku 4.5 | $1 / $5 | $1 / $5 | $1.10 / $5.50 |
 
