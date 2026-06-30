@@ -454,6 +454,7 @@ def ingest_subagent(
             speed=turn.get("speed", ""),
             inference_geo=turn.get("inference_geo", ""),
             web_search_requests=turn.get("web_search_requests", 0),
+            turn_start_time=turn.get("start_time", ""),
         )
 
         total_cost += turn_cost
@@ -1466,6 +1467,11 @@ FAST_MODE_MULTIPLIERS = {
 # Data residency: inference_geo="us" on Opus 4.6+/Sonnet 4.6+. 1.1x all categories.
 # Source: platform.claude.com/docs/en/about-claude/pricing#data-residency-pricing
 US_GEO_MULTIPLIER = 1.1
+# Sonnet 5 introductory pricing ($2/$10) runs through 2026-08-31; standard
+# ($3/$15) applies from 2026-09-01. Date-aware so reprocessing a historical turn
+# bills at the rate that applied at that turn's timestamp (reprocess determinism).
+# Source: platform.claude.com/docs/en/about-claude/pricing (verified 2026-06-30)
+SONNET5_INTRO_END = datetime(2026, 9, 1, tzinfo=timezone.utc)
 # Web search: $10 per 1,000 server-side search requests.
 # Source: platform.claude.com/docs/en/about-claude/pricing#web-search-tool
 WEB_SEARCH_COST_PER_REQUEST = 0.01
@@ -1520,6 +1526,7 @@ def calculate_turn_cost(
     speed: str = "",
     inference_geo: str = "",
     web_search_requests: int = 0,
+    turn_start_time: str = "",
 ) -> tuple:
     """Calculate cost for a turn's token usage.
 
@@ -1529,6 +1536,9 @@ def calculate_turn_cost(
     speed: "fast" applies a per-model premium (Opus 4.6/4.7 = 6x, Opus 4.8 = 2x).
     inference_geo: "us" applies 1.1x multiplier on Opus 4.6+/Sonnet 4.6+.
     web_search_requests: server-side web search calls, billed at $10/1000.
+    turn_start_time: ISO timestamp of the turn; selects Sonnet 5 intro vs standard
+        pricing by date (see SONNET5_INTRO_END). When empty/unparseable, Sonnet 5
+        falls back to standard ($3/$15) — the durable rate.
 
     Returns: (turn_cost, input_cost, output_cost, cost_details)
     """
@@ -1576,9 +1586,20 @@ def calculate_turn_cost(
                 "Update calculate_turn_cost() and CLAUDE.md if this is a new Anthropic model.")
             return 0.0, 0.0, 0.0, {}
     elif "sonnet" in m:                              # Sonnet (all versions)
-        p_in, p_out, p_cr, p_cc5, p_cc1 = 3.0, 15.0, 0.30, 3.75, 6.00
-        if "sonnet-4-6" in m:
-            supports_inference_geo = True
+        if "sonnet-5" in m:
+            # Sonnet 5: introductory $2/$10 through 2026-08-31, standard $3/$15
+            # from 2026-09-01. Chosen by the turn's own timestamp so reprocessing
+            # a historical intro-period turn keeps billing it at intro rates.
+            ts = parse_ts(turn_start_time) if turn_start_time else None
+            if ts is not None and ts < SONNET5_INTRO_END:
+                p_in, p_out, p_cr, p_cc5, p_cc1 = 2.0, 10.0, 0.20, 2.50, 4.00
+            else:
+                p_in, p_out, p_cr, p_cc5, p_cc1 = 3.0, 15.0, 0.30, 3.75, 6.00
+            supports_inference_geo = True            # Sonnet 4.6+ accept inference_geo
+        else:
+            p_in, p_out, p_cr, p_cc5, p_cc1 = 3.0, 15.0, 0.30, 3.75, 6.00
+            if "sonnet-4-6" in m:
+                supports_inference_geo = True
     elif "fable" in m:                               # Fable 5 (top tier, $10/$50)
         # supports_fast_mode / supports_inference_geo stay False: Fable has no
         # /fast variant, and its data-residency multiplier is unverified.
@@ -1740,6 +1761,7 @@ def build_skill_attribution_summary(turns: list[dict]) -> dict | None:
             speed=t.get("speed", ""),
             inference_geo=t.get("inference_geo", ""),
             web_search_requests=t.get("web_search_requests", 0),
+            turn_start_time=t.get("start_time", ""),
         )
         b["cost_usd"] = round(b["cost_usd"] + turn_cost, 6)
 
@@ -2201,6 +2223,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
             speed=turn.get("speed", ""),
             inference_geo=turn.get("inference_geo", ""),
             web_search_requests=turn.get("web_search_requests", 0),
+            turn_start_time=start_time,
         )
         total_cost += turn_cost
 
