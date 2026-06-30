@@ -1781,6 +1781,80 @@ def build_cache_miss_summary(turns: list[dict]) -> dict | None:
     }
 
 
+def build_active_duration_summary(turns: list[dict]) -> dict | None:
+    """Roll up per-turn wall-clock from `system`/`turn_duration` entries.
+
+    Each turn's `duration_ms` is Claude Code's own authoritative turn wall-clock
+    (turn start to end, including tool execution) attached in `build_turns`. Summed
+    across turns this is *active* session time — distinct from the trace wall-clock
+    span, which also counts idle time between turns (user reading / typing). None
+    when no turn carried a duration (CC before ~2.1.19x never emitted the entry).
+    Computed over the incremental `turns` batch, matching `total_iterations`.
+    """
+    durs = [t["duration_ms"] for t in turns if t.get("duration_ms")]
+    if not durs:
+        return None
+    return {
+        "total_ms": sum(durs),
+        "turns_measured": len(durs),
+        "max_ms": max(durs),
+    }
+
+
+def extract_queue_operations(transcript_path: str) -> dict | None:
+    """Summarise prompt-queue activity from `type:"queue-operation"` entries.
+
+    While the assistant is busy a user can queue follow-up prompts; CC logs each
+    queue mutation as a `queue-operation` with `operation` in
+    {`enqueue`, `dequeue`, `popAll`, `remove`} and a `content` (the prompt text).
+    Wait time a prompt spends queued (enqueue -> dequeue|popAll) is a latency /
+    friction signal: long waits mean the user is racing ahead of the agent.
+
+    Waits are matched FIFO — each `dequeue` / `popAll`-flushed slot consumes the
+    oldest pending `enqueue`. `remove` (user cancelled a queued prompt) also pops
+    FIFO but is excluded from execution-wait stats. No id ties an op to a specific
+    queued prompt, so the FIFO pairing is an approximation. `content` is NOT stored
+    (raw prompt text = PII). None when the session queued nothing.
+    """
+    operations: dict[str, int] = {}
+    pending: list[datetime] = []   # timestamps of still-queued enqueues
+    waits: list[float] = []        # execution waits in ms (dequeue / popAll)
+    removed = 0
+    for entry in iter_transcript(transcript_path):
+        if entry.get("type") != "queue-operation":
+            continue
+        op = entry.get("operation") or "unknown"
+        operations[op] = operations.get(op, 0) + 1
+        ts = parse_ts(entry.get("timestamp", ""))
+        if op == "enqueue":
+            if ts:
+                pending.append(ts)
+        elif op == "dequeue":
+            if pending:
+                e = pending.pop(0)
+                if ts and e and ts >= e:
+                    waits.append((ts - e).total_seconds() * 1000)
+        elif op == "popAll":
+            for e in pending:
+                if ts and ts >= e:
+                    waits.append((ts - e).total_seconds() * 1000)
+            pending = []
+        elif op == "remove":
+            removed += 1
+            if pending:
+                pending.pop(0)
+    if not operations:
+        return None
+    return {
+        "operations": operations,
+        "queued": operations.get("enqueue", 0),
+        "executed": len(waits),
+        "removed": removed,
+        "total_wait_ms": round(sum(waits)),
+        "max_wait_ms": round(max(waits)) if waits else 0,
+    }
+
+
 def build_attribution_tags(summary: dict | None) -> list[str]:
     """Trace tags for skill / plugin attribution. Sorted, deduplicated; never
     includes the '_unattributed' breakdown bucket."""
@@ -1901,6 +1975,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
     worktree_state = extract_worktree_state(transcript_path)
     api_error_messages = extract_api_error_messages(transcript_path)
     interrupts = extract_interrupts(transcript_path)
+    queue_operations = extract_queue_operations(transcript_path)
     entries, total_lines, read_ok = parse_transcript(transcript_path, skip_lines=prev_line_offset)
 
     if not read_ok:
@@ -2045,6 +2120,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 "remote_control": remote_control,
                 "permission_timeline": permission_timeline,
                 "total_iterations": sum(t.get("iteration_count", 0) for t in turns),
+                "active_duration": build_active_duration_summary(turns),
                 "cache_miss": build_cache_miss_summary(turns),
                 "effort_level": effort or None,
                 "worktree": worktree_state,
@@ -2052,6 +2128,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 "session_crons": session_crons or None,
                 "api_error_messages": api_error_messages,
                 "interrupts": interrupts,
+                "queue_operations": queue_operations,
             },
             "tags": [t for t in [
                 "claude-code",
@@ -2062,6 +2139,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 "has-errors" if has_errors else None,
                 "has-api-error-messages" if api_error_messages else None,
                 "has-interrupts" if interrupts else None,
+                "has-queued-prompts" if queue_operations else None,
                 "has-background-tasks" if background_tasks else None,
                 "model-missing" if has_missing_model else None,
                 f"permission:{permission_mode}" if permission_mode else None,

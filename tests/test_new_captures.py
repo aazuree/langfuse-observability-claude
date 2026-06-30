@@ -242,3 +242,127 @@ class TestNewCapturesWiring:
         trace = next(e for e in captured["batch"] if e["type"] == "trace-create")
         assert trace["body"]["metadata"]["interrupts"] == {"count": 1}
         assert "has-interrupts" in trace["body"]["tags"]
+
+
+class TestExtractQueueOperations:
+    def test_none_when_no_queue_ops(self, tmp_path):
+        assert hook.extract_queue_operations(_write([{"type": "user"}], tmp_path)) is None
+
+    def test_nonexistent_file(self):
+        assert hook.extract_queue_operations("/nonexistent.jsonl") is None
+
+    def test_enqueue_then_dequeue_wait(self, tmp_path):
+        entries = [
+            {"type": "queue-operation", "operation": "enqueue",
+             "timestamp": "2026-06-30T10:00:00.000Z", "content": "follow up A"},
+            {"type": "queue-operation", "operation": "dequeue",
+             "timestamp": "2026-06-30T10:00:05.000Z"},
+        ]
+        out = hook.extract_queue_operations(_write(entries, tmp_path))
+        assert out["queued"] == 1
+        assert out["executed"] == 1
+        assert out["removed"] == 0
+        assert out["total_wait_ms"] == 5000
+        assert out["max_wait_ms"] == 5000
+        assert out["operations"] == {"enqueue": 1, "dequeue": 1}
+
+    def test_content_not_stored(self, tmp_path):
+        entries = [
+            {"type": "queue-operation", "operation": "enqueue",
+             "timestamp": "2026-06-30T10:00:00.000Z", "content": "SECRET prompt text"},
+            {"type": "queue-operation", "operation": "dequeue",
+             "timestamp": "2026-06-30T10:00:01.000Z"},
+        ]
+        out = hook.extract_queue_operations(_write(entries, tmp_path))
+        assert "SECRET" not in json.dumps(out)
+
+    def test_popall_flushes_all_pending(self, tmp_path):
+        entries = [
+            {"type": "queue-operation", "operation": "enqueue",
+             "timestamp": "2026-06-30T10:00:00.000Z", "content": "A"},
+            {"type": "queue-operation", "operation": "enqueue",
+             "timestamp": "2026-06-30T10:00:02.000Z", "content": "B"},
+            {"type": "queue-operation", "operation": "popAll",
+             "timestamp": "2026-06-30T10:00:06.000Z", "content": "B"},
+        ]
+        out = hook.extract_queue_operations(_write(entries, tmp_path))
+        assert out["queued"] == 2
+        assert out["executed"] == 2          # both pending flushed
+        assert out["total_wait_ms"] == 6000 + 4000
+        assert out["max_wait_ms"] == 6000
+
+    def test_remove_excluded_from_wait(self, tmp_path):
+        entries = [
+            {"type": "queue-operation", "operation": "enqueue",
+             "timestamp": "2026-06-30T10:00:00.000Z", "content": "A"},
+            {"type": "queue-operation", "operation": "remove",
+             "timestamp": "2026-06-30T10:00:03.000Z"},
+        ]
+        out = hook.extract_queue_operations(_write(entries, tmp_path))
+        assert out["queued"] == 1
+        assert out["removed"] == 1
+        assert out["executed"] == 0
+        assert out["total_wait_ms"] == 0
+
+    def test_dequeue_without_pending_is_safe(self, tmp_path):
+        entries = [
+            {"type": "queue-operation", "operation": "dequeue",
+             "timestamp": "2026-06-30T10:00:00.000Z"},
+        ]
+        out = hook.extract_queue_operations(_write(entries, tmp_path))
+        assert out["executed"] == 0
+        assert out["total_wait_ms"] == 0
+
+
+class TestBuildActiveDurationSummary:
+    def test_none_when_no_durations(self):
+        assert hook.build_active_duration_summary([]) is None
+        assert hook.build_active_duration_summary([{"usage": {}}]) is None
+
+    def test_rolls_up_measured_turns(self):
+        turns = [
+            {"duration_ms": 5000},
+            {"duration_ms": 12000},
+            {},                       # turn without a turn_duration match
+        ]
+        assert hook.build_active_duration_summary(turns) == {
+            "total_ms": 17000,
+            "turns_measured": 2,
+            "max_ms": 12000,
+        }
+
+
+class TestQueueAndDurationIntegration:
+    def test_metadata_and_tag(self, tmp_path, monkeypatch):
+        entries = [
+            {"type": "user", "timestamp": "2026-06-30T00:00:00Z", "cwd": "/x/repo",
+             "message": {"role": "user", "content": "do a thing"}},
+            {"type": "assistant", "timestamp": "2026-06-30T00:00:02Z",
+             "message": {"role": "assistant", "id": "m1", "model": "claude-opus-4-8",
+                         "stop_reason": "end_turn",
+                         "content": [{"type": "text", "text": "working"}],
+                         "usage": {"input_tokens": 5, "output_tokens": 3}}},
+            {"type": "system", "subtype": "turn_duration",
+             "timestamp": "2026-06-30T00:00:02Z", "durationMs": 2000},
+            {"type": "queue-operation", "operation": "enqueue",
+             "timestamp": "2026-06-30T00:00:01Z", "content": "next"},
+            {"type": "queue-operation", "operation": "dequeue",
+             "timestamp": "2026-06-30T00:00:03Z"},
+        ]
+        transcript = tmp_path / "sess.jsonl"
+        transcript.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+
+        captured = {}
+        monkeypatch.setattr(hook, "send_to_langfuse",
+                            lambda batch: captured.setdefault("batch", batch) or True)
+        monkeypatch.setattr(hook, "STATE_DIR", str(tmp_path / "state"))
+
+        hook.process_session("sess-q", str(transcript), "/x/repo")
+
+        trace = next(e for e in captured["batch"] if e["type"] == "trace-create")
+        meta = trace["body"]["metadata"]
+        assert meta["queue_operations"]["queued"] == 1
+        assert meta["queue_operations"]["executed"] == 1
+        assert meta["active_duration"] == {
+            "total_ms": 2000, "turns_measured": 1, "max_ms": 2000}
+        assert "has-queued-prompts" in trace["body"]["tags"]

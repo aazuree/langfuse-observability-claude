@@ -169,7 +169,7 @@ Bedrock. Canonical source: aws.amazon.com/bedrock/pricing (verified June 2026).
 
 ## Tags and Metadata
 
-> Transcript-field coverage verified against Claude Code **v2.1.181** (2026-06-18).
+> Transcript-field coverage verified against Claude Code **v2.1.197** (2026-06-30).
 > Note: `effort.level`, `agent_id`/`parent_agent_id`, and skill `invocation_trigger` are
 > OTel-span / hook-stdin fields, **not** transcript JSONL — unreachable by this hook's
 > transcript parsing. effort is captured via the `$CLAUDE_EFFORT` env var instead.
@@ -182,6 +182,15 @@ Bedrock. Canonical source: aws.amazon.com/bedrock/pricing (verified June 2026).
 > `build_turns` **skips** them so they cannot overwrite a turn's real output / timing /
 > `stop_reason`. The high-frequency `mode` and `last-prompt` entry types are internal
 > bookkeeping (current input mode, last-prompt UUID pointer) and deliberately not captured.
+>
+> New in v2.1.19x: `system/turn_duration` (per-turn wall-clock `durationMs` +
+> `messageCount`) — captured as per-turn `duration_ms` (already drove generation
+> `endTime`) and rolled up to `active_duration`; `queue-operation` (prompt-queue
+> enqueue/dequeue/popAll/remove with prompt `content`) — captured as `queue_operations`
+> wait-time analytics (content NOT stored, PII). The `agent-setting` entry
+> (`{agentSetting: "claude"}` = the FleetView selected agent persona) is observed but
+> **not captured** — always `"claude"` on first-party installs, so no signal yet; revisit
+> if non-default agents appear (would become an `agent-setting:<slug>` tag).
 
 Each trace is enriched with:
 
@@ -194,6 +203,7 @@ Each trace is enriched with:
 - `has-errors` — present if API errors occurred during the session (`system/api_error` entries)
 - `has-api-error-messages` — present when the session had assistant-channel API-error/auto-retry stubs (`isApiErrorMessage`); see `api_error_messages` metadata
 - `has-interrupts` — present when the user interrupted (ESC) at least one assistant turn (`interruptedMessageId`)
+- `has-queued-prompts` — present when the user queued at least one follow-up prompt mid-turn (`queue-operation` entries); see `queue_operations` metadata
 - `model-missing` — present when any turn had **billable tokens but no `model` field**; that turn's cost is reported as `$0` (never defaulted to a priced model) and a `[WARN]` is logged. Filter on this to find sessions with under-reported cost from upstream transcript gaps.
 - `permission:<mode>` — current permission mode (`default`, `acceptEdits`, `plan`, `bypassPermissions`)
 - `pr:<N>` — one tag per PR linked from the session (via `pr-link` transcript entries)
@@ -230,6 +240,8 @@ via Langfuse's upsert-on-id behaviour.
 - `api_errors` — error summary from `system/api_error` entries: `total_count`, `by_status` (HTTP codes), `first_error_at`, `last_error_at`
 - `api_error_messages` — **separate** assistant-channel error/retry summary from `isApiErrorMessage` entries (CC 2.1.179+/2.1.181 auto-retry): `{count, by_status (apiErrorStatus, e.g. 404/429/529), by_error (e.g. model_not_found/rate_limit), first_at, last_at}`, plus `max_retry_attempt` when any entry carries `retryAttempt`. Null when none. From `extract_api_error_messages()`. Distinct channel from `api_errors`; these stubs are skipped by `build_turns` so they don't pollute turn output.
 - `interrupts` — `{count}` of user interrupts (ESC mid-turn) from `interruptedMessageId` on `user` entries. A friction / misalignment signal. Null when none. From `extract_interrupts()`.
+- `queue_operations` — prompt-queue activity from `type:"queue-operation"` entries (prompts the user queued while the assistant was busy): `{operations: {<op>: n}, queued, executed, removed, total_wait_ms, max_wait_ms}`. `executed` = prompts pulled from the queue to run (`dequeue`/`popAll`); `removed` = queued prompts the user cancelled. Wait = time a prompt sat queued (enqueue→dequeue/popAll), matched **FIFO** (no per-prompt id → approximate); `remove` is excluded from wait stats. Prompt `content` is **not stored** (PII). Long waits = the user racing ahead of the agent (friction signal). Null when nothing was queued. From `extract_queue_operations()`.
+- `active_duration` — session rollup of per-turn wall-clock from `system/turn_duration` entries: `{total_ms, turns_measured, max_ms}`. `total_ms` is *active* time (Σ per-turn `durationMs`, each turn start→end incl. tool execution) — distinct from the trace wall-clock span, which also counts idle time between turns. Computed over the incremental turn batch (matches `total_iterations`). Null when no turn carried a duration (CC before ~2.1.19x never emitted the entry). From `build_active_duration_summary()`.
 - `custom_title` — user-set session title (when present)
 - `permission_mode` — last permission mode observed
 - `pr_links` — list of `{number, url, repository, timestamp}` from `pr-link` entries
@@ -268,6 +280,8 @@ and away summaries are extracted via `extract_custom_title()`, `extract_ai_title
 - `attribution_skill`, `attribution_plugin` — primary skill / plugin for the turn (first non-empty observed)
 - `attribution_skills_all` — list of all distinct skills observed in the turn (only emitted when more than one)
 - `iteration_count` — number of server-side iterations in the turn (length of `usage.iterations`; 0 when absent).
+- `ttft_ms` — time-to-first-token in ms (first assistant-token timestamp − turn start). Omitted when not derivable.
+- `duration_ms` — turn wall-clock in ms from the matching `system/turn_duration` entry (turn start→end, incl. tool execution). Also drives the generation `endTime`. Omitted when no `turn_duration` matched the turn (CC before ~2.1.19x). Rolled up session-wide as `active_duration`.
 - `cache_miss_reason` — dominant cache-miss reason type for the turn (e.g. `tools_changed`), from `message.diagnostics`. Omitted when the turn had no cache miss.
 - `cache_missed_tokens` — total input tokens that missed cache in the turn. Omitted when no miss.
 - `cache_miss_by_reason` — `{<type>: count}` tally of miss reasons in the turn. Omitted when no miss.
