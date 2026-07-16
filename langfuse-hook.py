@@ -1823,6 +1823,42 @@ def build_active_duration_summary(turns: list[dict]) -> dict | None:
     }
 
 
+# stop_reasons that are normal turn terminations (end_turn = done, tool_use =
+# paused to call a tool). Both are high-frequency and low-signal, so they get a
+# metadata rollup but no per-trace tag — only anomalous reasons (max_tokens =
+# truncated output, refusal, pause_turn, stop_sequence, ...) are tagged,
+# mirroring the has-errors / model-missing anomaly-flag pattern.
+NORMAL_STOP_REASONS = frozenset({"end_turn", "tool_use"})
+
+
+def build_stop_reasons_summary(turns: list[dict]) -> dict | None:
+    """Roll up per-turn terminal `stop_reason` across the incremental turn batch.
+
+    Each turn's `stop_reason` is the API's terminal reason for that turn
+    (`end_turn`, `tool_use`, `max_tokens`, `stop_sequence`, `refusal`,
+    `pause_turn`, ...), set in `build_turns` (latest non-empty per turn). Returns a
+    `{by_reason, turns_counted, last}` rollup, or None when no turn carried a
+    stop_reason. `last` is the terminal reason of the final turn that had one —
+    the session's outcome. Computed over the incremental `turns` batch, matching
+    `total_iterations` / `active_duration`.
+    """
+    by_reason = {}
+    last = None
+    for t in turns:
+        r = t.get("stop_reason")
+        if not r:
+            continue
+        by_reason[r] = by_reason.get(r, 0) + 1
+        last = r
+    if not by_reason:
+        return None
+    return {
+        "by_reason": by_reason,
+        "turns_counted": sum(by_reason.values()),
+        "last": last,
+    }
+
+
 def extract_queue_operations(transcript_path: str) -> dict | None:
     """Summarise prompt-queue activity from `type:"queue-operation"` entries.
 
@@ -2099,6 +2135,12 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
         f"compact-trigger:{t}" for t in sorted((compaction or {}).get("triggers", {}))
         if t != "unknown"
     ]
+    stop_reasons = build_stop_reasons_summary(turns)
+    stop_reason_tags = [
+        f"stop-reason:{r}"
+        for r in sorted((stop_reasons or {}).get("by_reason", {}))
+        if r not in NORMAL_STOP_REASONS
+    ]
 
     # 1. Trace
     batch.append({
@@ -2143,6 +2185,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 "permission_timeline": permission_timeline,
                 "total_iterations": sum(t.get("iteration_count", 0) for t in turns),
                 "active_duration": build_active_duration_summary(turns),
+                "stop_reasons": stop_reasons,
                 "cache_miss": build_cache_miss_summary(turns),
                 "effort_level": effort or None,
                 "worktree": worktree_state,
@@ -2173,6 +2216,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 "remote-control" if remote_control else None,
                 "permission-bypass" if (permission_timeline or {}).get("ever_bypass") else None,
                 *compact_trigger_tags,
+                *stop_reason_tags,
                 *attribution_tags,
                 *pr_tags,
             ] if t],

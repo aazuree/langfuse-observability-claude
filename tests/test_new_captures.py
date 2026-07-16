@@ -366,3 +366,69 @@ class TestQueueAndDurationIntegration:
         assert meta["active_duration"] == {
             "total_ms": 2000, "turns_measured": 1, "max_ms": 2000}
         assert "has-queued-prompts" in trace["body"]["tags"]
+
+
+class TestBuildStopReasonsSummary:
+    def test_none_when_no_stop_reasons(self):
+        assert hook.build_stop_reasons_summary([]) is None
+        assert hook.build_stop_reasons_summary([{"usage": {}}]) is None
+        assert hook.build_stop_reasons_summary([{"stop_reason": ""}]) is None
+
+    def test_rolls_up_by_reason(self):
+        turns = [
+            {"stop_reason": "end_turn"},
+            {"stop_reason": "tool_use"},
+            {"stop_reason": "end_turn"},
+            {"stop_reason": "max_tokens"},
+        ]
+        assert hook.build_stop_reasons_summary(turns) == {
+            "by_reason": {"end_turn": 2, "tool_use": 1, "max_tokens": 1},
+            "turns_counted": 4,
+            "last": "max_tokens",
+        }
+
+    def test_last_is_last_nonempty(self):
+        turns = [{"stop_reason": "max_tokens"}, {"stop_reason": ""}]
+        out = hook.build_stop_reasons_summary(turns)
+        assert out["turns_counted"] == 1
+        assert out["last"] == "max_tokens"
+
+
+class TestStopReasonIntegration:
+    def test_metadata_and_anomaly_tag(self, tmp_path, monkeypatch):
+        entries = [
+            {"type": "user", "timestamp": "2026-07-16T00:00:00Z", "cwd": "/x/repo",
+             "message": {"role": "user", "content": "first"}},
+            {"type": "assistant", "timestamp": "2026-07-16T00:00:01Z",
+             "message": {"role": "assistant", "id": "m1", "model": "claude-opus-4-8",
+                         "stop_reason": "end_turn",
+                         "content": [{"type": "text", "text": "done"}],
+                         "usage": {"input_tokens": 5, "output_tokens": 3}}},
+            {"type": "user", "timestamp": "2026-07-16T00:00:02Z",
+             "message": {"role": "user", "content": "second"}},
+            {"type": "assistant", "timestamp": "2026-07-16T00:00:03Z",
+             "message": {"role": "assistant", "id": "m2", "model": "claude-opus-4-8",
+                         "stop_reason": "max_tokens",
+                         "content": [{"type": "text", "text": "truncat"}],
+                         "usage": {"input_tokens": 5, "output_tokens": 4000}}},
+        ]
+        transcript = tmp_path / "sess.jsonl"
+        transcript.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
+
+        captured = {}
+        monkeypatch.setattr(hook, "send_to_langfuse",
+                            lambda batch: captured.setdefault("batch", batch) or True)
+        monkeypatch.setattr(hook, "STATE_DIR", str(tmp_path / "state"))
+
+        hook.process_session("sess-sr", str(transcript), "/x/repo")
+
+        trace = next(e for e in captured["batch"] if e["type"] == "trace-create")
+        meta = trace["body"]["metadata"]
+        tags = trace["body"]["tags"]
+        assert meta["stop_reasons"]["by_reason"] == {"end_turn": 1, "max_tokens": 1}
+        assert meta["stop_reasons"]["last"] == "max_tokens"
+        assert meta["stop_reasons"]["turns_counted"] == 2
+        # anomaly reason gets a filterable tag; normal end_turn / tool_use do not
+        assert "stop-reason:max_tokens" in tags
+        assert "stop-reason:end_turn" not in tags
+        assert "stop-reason:tool_use" not in tags
