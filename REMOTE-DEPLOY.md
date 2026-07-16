@@ -153,6 +153,98 @@ published port. Two things actually work:
 
 ---
 
+## Reaching it from outside your LAN (WireGuard — no public HTTP)
+
+LAN mode above exposes the dashboard to your *local* network. To reach it while
+**away from home** — so the Claude Code hook keeps logging on the road — do **not**
+port-forward `3100` to the internet. It's plain HTTP: your project secret key would
+travel in cleartext on every ingestion POST, the login UI would be brute-forceable,
+and Docker's published ports bypass the host firewall anyway (see the gotcha above).
+
+Instead, put a **WireGuard** tunnel in front and expose only WireGuard's one UDP
+port. The dashboard and ingestion endpoint stay reachable **only inside the
+encrypted tunnel**; the single thing facing the internet is a UDP port that answers
+nothing without a valid peer key — invisible to scanners.
+
+**The model — no rebind, hook address unchanged:**
+
+- Keep `langfuse-web` bound to the Pi's LAN IP (LAN mode, as above). Do **not**
+  rebind to `0.0.0.0`.
+- Add each roaming device as a WireGuard **peer**, and put the Pi's LAN IP in that
+  peer's `AllowedIPs`. Tunnelled traffic to `<pi-lan-ip>:3100` then reaches the Pi,
+  where Docker's DNAT delivers it to the container.
+- The hook keeps targeting `http://<pi-lan-ip>:3100` — direct when you're home,
+  transparently tunnel-routed when you're away. **No `settings.json` change.**
+
+**Steps** (assume a WireGuard server already on the Pi, `wg0 = <wg-subnet>`, e.g.
+`10.0.0.1/24`):
+
+1. **Add the roaming device as a peer on the Pi** (live + persisted so it survives
+   reboot):
+
+   ```bash
+   # on the Pi — <device-pubkey> from `wg genkey | wg pubkey` on the device
+   sudo wg set wg0 peer <device-pubkey> allowed-ips <wg-device-ip>/32
+   printf '\n[Peer]\nPublicKey = <device-pubkey>\nAllowedIPs = <wg-device-ip>/32\n' \
+     | sudo tee -a /etc/wireguard/wg0.conf >/dev/null
+   ```
+
+2. **Roaming-device config** (`/etc/wireguard/wg-<name>.conf`, `chmod 600` — never
+   commit or print the private key):
+
+   ```ini
+   [Interface]
+   PrivateKey = <device-privkey>
+   Address    = <wg-device-ip>/32
+
+   [Peer]
+   PublicKey           = <pi-wg-pubkey>
+   Endpoint            = <pi-public-ip-or-ddns>:51820
+   AllowedIPs          = <wg-subnet>, <pi-lan-ip>/32
+   PersistentKeepalive = 25
+   ```
+
+3. **Router: forward UDP 51820 → the Pi — that one port only.**
+
+   > ⚠️ **If the Pi also runs Pi-hole** (or any DNS / other UDP service), do **not**
+   > use an "Any(UDP)" / all-ports rule. That exposes the resolver on **UDP 53** to
+   > the internet = an **open DNS resolver** (amplification abuse, IP blacklisting).
+   > Restrict the forward to the single port `51820`. Pi-hole's `listeningMode` is
+   > *not* a substitute — `SINGLE`/interface modes don't filter by source; only the
+   > port restriction (or a source-filtering `LOCAL` mode) keeps 53 safe.
+
+4. **Bring the tunnel up and verify:**
+
+   ```bash
+   sudo wg-quick up wg-<name>
+   sudo wg show wg-<name>          # want 'latest handshake' + rx/tx > 0
+   curl -s -o /dev/null -w '%{http_code}\n' http://<pi-lan-ip>:3100   # want 200
+   ```
+
+   Run any Claude Code turn; the trace lands on the Pi.
+
+**Notes:**
+
+- **Only UDP 51820 is exposed.** WireGuard (Curve25519 / ChaCha20-Poly1305) silently
+  drops any packet not signed by a known peer key — no banner, no reflection vector.
+  The HTTP inside is wrapped in the tunnel's encryption on the wire.
+- **Dynamic public IP?** Point `Endpoint` at a DDNS hostname tracking the Pi's WAN
+  IP, or just re-edit the one line when it rotates.
+- **Always-on vs travel-only.** If your router does **NAT hairpin** (the tunnel
+  handshakes even while you're on the home LAN), `systemctl enable --now
+  wg-quick@wg-<name>` and never toggle it. Otherwise run it as a travel tool
+  (`wg-quick up` when away, `down` at home) — which also keeps the home hook fully
+  local, with no dependency on your internet uplink.
+- **Blast radius.** A peer's private key grants tunnel access; if the Pi has
+  `ip_forward=1` it can reach the whole LAN, not just the container. Use full-disk
+  encryption on roaming devices, keep key files `chmod 600`, and optionally add an
+  `iptables -I FORWARD` rule limiting `wg0`→LAN to just the Pi's IP.
+
+Reference: [wireguard.com](https://www.wireguard.com/) ·
+[Pi-hole docs](https://docs.pi-hole.net/).
+
+---
+
 ## Switching back to local mode
 
 On whichever machine you want local-only again:
