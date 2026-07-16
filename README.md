@@ -33,6 +33,11 @@ The setup script:
 **Dashboard**: http://localhost:3100
 **Login**: the credentials you entered during setup
 
+**Running it on another host (e.g. Pi-hole)?** The default binds everything to
+localhost. To run the stack on a separate box and expose the dashboard to your LAN
+only, see [REMOTE-DEPLOY.md](REMOTE-DEPLOY.md) — it's an opt-in `.env` toggle, local
+mode stays the default.
+
 ## Prerequisites
 
 - Docker and Docker Compose
@@ -178,7 +183,7 @@ Set `REPORT_API_EQUIVALENT_COST = True` in `langfuse-hook.py` (default) to repor
 
 ## Security
 
-- All ports are bound to `127.0.0.1` (localhost only) — not accessible from the network
+- All ports are bound to `127.0.0.1` (localhost only) by default — not accessible from the network. LAN exposure of the dashboard is opt-in via `LANGFUSE_WEB_BIND` (bound to the host LAN IP, HTTP, no TLS) — see [REMOTE-DEPLOY.md](REMOTE-DEPLOY.md)
 - Secrets (database passwords, API keys, encryption keys) are randomly generated per installation
 - Admin credentials are set interactively during setup — no hardcoded defaults
 - The hook script redacts common secret patterns (API keys, tokens, private keys, passwords) before sending data to Langfuse

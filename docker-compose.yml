@@ -71,7 +71,12 @@ services:
     restart: always
     depends_on: *langfuse-depends-on
     ports:
-      - 127.0.0.1:3100:3000
+      # LOCAL mode (default): dashboard bound to 127.0.0.1 — this machine only.
+      # LAN/Pi mode: set LANGFUSE_WEB_BIND=<host LAN IP> in .env to publish the
+      # dashboard + ingestion API to local-network devices. This is the ONLY
+      # service exposed beyond localhost; every other service stays 127.0.0.1.
+      # Also set NEXTAUTH_URL to http://<that-IP>:3100. See REMOTE-DEPLOY.md.
+      - ${LANGFUSE_WEB_BIND:-127.0.0.1}:3100:3000
     environment:
       <<: *langfuse-worker-env
       NEXTAUTH_SECRET: ${NEXTAUTH_SECRET:-mysecret} # CHANGEME

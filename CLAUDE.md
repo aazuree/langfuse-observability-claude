@@ -387,7 +387,7 @@ Trace (parent session)
 - Hook errors are logged but never block Claude Code (async, fire-and-forget)
 - First Langfuse login may need incognito window (stale CSRF tokens)
 - `setup.sh` backs up existing `~/.claude/settings.json` before modifying hooks
-- All ports are localhost-only by design - do not expose to network
+- All ports are localhost-only by default. LAN exposure of the dashboard is opt-in via `LANGFUSE_WEB_BIND` in `.env` (bind to host LAN IP; HTTP only, no TLS) — see `REMOTE-DEPLOY.md`. All other services stay `127.0.0.1`.
 
 ## Hook-Level Scores
 
