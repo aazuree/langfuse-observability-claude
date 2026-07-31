@@ -1091,6 +1091,60 @@ class TestCalculateTurnCost:
         _c, inp_cost, _o, _d = hook.calculate_turn_cost(usage, "claude-fable-5", speed="fast")
         assert abs(inp_cost - 10.0) < 0.001
 
+    def test_opus_5_pricing(self):
+        usage = self._usage(inp=1_000_000, out=1_000_000)
+        _c, inp_cost, out_cost, _d = hook.calculate_turn_cost(usage, "claude-opus-5")
+        assert abs(inp_cost - 5.0) < 0.001    # $5/1M input
+        assert abs(out_cost - 25.0) < 0.001   # $25/1M output
+
+    def test_opus_5_cache_tiers(self):
+        usage = self._usage(cache_read=1_000_000, cache_creation=1_000_000)
+        _c, _i, _o, details = hook.calculate_turn_cost(usage, "claude-opus-5")
+        assert abs(details["cache_read_input_tokens"] - 0.50) < 0.001       # $0.50/1M read
+        assert abs(details["cache_creation_input_tokens"] - 6.25) < 0.001   # $6.25/1M write 5m
+        _c, _i, _o, details = hook.calculate_turn_cost(
+            usage, "claude-opus-5", cache_5m=0, cache_1h=1_000_000
+        )
+        assert abs(details["cache_creation_input_tokens"] - 10.00) < 0.001  # $10.00/1M write 1h
+
+    def test_opus_5_fast_mode_is_2x(self):
+        # Fast mode on Opus 5 is $10/$50 — a 2x premium, not the 6x of Opus 4.6/4.7.
+        usage = self._usage(inp=1_000_000, out=1_000_000)
+        _c, inp_cost, out_cost, _d = hook.calculate_turn_cost(
+            usage, "claude-opus-5", speed="fast"
+        )
+        assert abs(inp_cost - 10.0) < 0.001
+        assert abs(out_cost - 50.0) < 0.001
+
+    def test_opus_5_us_geo_multiplier(self):
+        usage = self._usage(inp=1_000_000, out=1_000_000)
+        _c, inp_cost, _o, _d = hook.calculate_turn_cost(
+            usage, "claude-opus-5", inference_geo="us"
+        )
+        assert abs(inp_cost - 5.0 * 1.1) < 0.001
+
+    def test_opus_4_5_does_not_match_opus_5_branch(self):
+        # "claude-opus-4-5" must not be caught by the "opus-5" substring: it is
+        # fast-mode ineligible, so speed="fast" must leave the rate unscaled.
+        usage = self._usage(inp=1_000_000, out=1_000_000)
+        _c, inp_cost, _o, _d = hook.calculate_turn_cost(
+            usage, "claude-opus-4-5-20251101", speed="fast"
+        )
+        assert abs(inp_cost - 5.0) < 0.001
+
+    def test_mythos_pricing_matches_fable(self):
+        usage = self._usage(inp=1_000_000, out=1_000_000)
+        _c, inp_cost, out_cost, _d = hook.calculate_turn_cost(usage, "claude-mythos-5")
+        assert abs(inp_cost - 10.0) < 0.001
+        assert abs(out_cost - 50.0) < 0.001
+
+    def test_mythos_fast_mode_no_multiplier(self):
+        usage = self._usage(inp=1_000_000, out=1_000_000)
+        _c, inp_cost, _o, _d = hook.calculate_turn_cost(
+            usage, "claude-mythos-5", speed="fast"
+        )
+        assert abs(inp_cost - 10.0) < 0.001
+
     def test_no_default_model_constant(self):
         assert not hasattr(hook, "DEFAULT_MODEL"), \
             "DEFAULT_MODEL must be removed — missing models report $0, not a fabricated default"
@@ -1172,6 +1226,12 @@ class TestCalculateTurnCost:
 
     @pytest.mark.parametrize("model,expected_input,expected_output", [
         # Current models
+        ("claude-opus-5",                5.0,   25.0),
+        ("claude-opus-5-20260715",       5.0,   25.0),
+        ("anthropic.claude-opus-5",      5.0,   25.0),
+        ("us.anthropic.claude-opus-5",   5.0,   25.0),
+        ("claude-mythos-5",             10.0,   50.0),
+        ("claude-mythos-preview",       10.0,   50.0),
         ("claude-opus-4-8",              5.0,   25.0),
         ("claude-opus-4-8-20260528",     5.0,   25.0),
         ("claude-opus-4-7",              5.0,   25.0),
@@ -3385,6 +3445,59 @@ class TestAttributionThreading:
         assert turns[0]["attribution_plugin"] == ""
         assert turns[0]["attribution_skills_all"] == []
         assert turns[0]["attribution_plugins_all"] == []
+
+    @staticmethod
+    def _entries_with_effort(*efforts):
+        """One turn whose assistant messages carry the given effort levels."""
+        entries = [{
+            "type": "user",
+            "timestamp": "2026-08-01T10:00:00+00:00",
+            "message": {"role": "user", "content": "Do the thing"},
+        }]
+        for i, eff in enumerate(efforts):
+            entry = {
+                "type": "assistant",
+                "timestamp": f"2026-08-01T10:00:0{i + 1}+00:00",
+                "message": {
+                    "id": f"msg-{i}", "role": "assistant",
+                    "model": "claude-opus-5",
+                    "content": [{"type": "text", "text": "ok"}],
+                    "usage": {"input_tokens": 1, "output_tokens": 1,
+                              "cache_read_input_tokens": 0,
+                              "cache_creation_input_tokens": 0},
+                },
+            }
+            if eff is not None:
+                entry["effort"] = eff
+            entries.append(entry)
+        return entries
+
+    def test_turn_captures_effort_from_transcript(self):
+        turns = hook.build_turns(self._entries_with_effort("high"))
+        assert turns[0]["effort"] == "high"
+
+    def test_turn_effort_defaults_to_empty(self):
+        # Transcripts from CC before 2.1.220 carry no effort field.
+        turns = hook.build_turns(self._entries_with_effort(None))
+        assert turns[0]["effort"] == ""
+
+    def test_turn_effort_last_wins(self):
+        # A mid-turn /effort change should be attributed to the level the
+        # turn actually finished under.
+        turns = hook.build_turns(self._entries_with_effort("low", "max"))
+        assert turns[0]["effort"] == "max"
+
+    def test_turn_effort_ignores_later_absent_field(self):
+        turns = hook.build_turns(self._entries_with_effort("xhigh", None))
+        assert turns[0]["effort"] == "xhigh"
+
+    def test_gen_metadata_includes_effort(self):
+        turns = hook.build_turns(self._entries_with_effort("medium"))
+        assert hook.gen_metadata_attribution(turns[0])["effort"] == "medium"
+
+    def test_gen_metadata_omits_effort_when_absent(self):
+        turns = hook.build_turns(self._entries_with_effort(None))
+        assert "effort" not in hook.gen_metadata_attribution(turns[0])
 
     def test_turn_attribution_first_wins_and_all_collected(self):
         # Single turn, two assistant messages from different skills
