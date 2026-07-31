@@ -67,8 +67,11 @@ docker-compose.yml               # Full Langfuse stack (6 services)
 setup.sh                         # One-command setup (generates .env, starts services, configures hook)
 .env.example                     # Template for environment variables
 .env                             # Generated secrets (gitignored)
+tools/
+  check_pricing_drift.py         # Compares hardcoded pricing against a public feed (manual/CI, never run by the hook)
 tests/
   test_langfuse_hook.py          # Core hook unit tests
+  test_pricing_drift.py          # Pricing drift-checker tests (offline, synthetic feeds)
   test_session_hooks.py          # StopFailure hook tests
   test_hook_scores.py            # Hook-level score classifier tests
   test_subagent_tracking.py      # Subagent cost tracking tests
@@ -105,12 +108,12 @@ uv run pytest tests/ -k "discover" -v  # Run tests matching pattern
 
 ## Cost Model
 
-Pricing is model-aware (per 1M tokens). Source: [platform.claude.com/docs/en/about-claude/pricing](https://platform.claude.com/docs/en/about-claude/pricing) (last verified 2026-06-30).
+Pricing is model-aware (per 1M tokens). Source: [platform.claude.com/docs/en/about-claude/pricing](https://platform.claude.com/docs/en/about-claude/pricing) (last verified 2026-08-01).
 
 | Model | Input | Output | Cache Read | Cache Write 5m | Cache Write 1h |
 |-------|-------|--------|------------|----------------|----------------|
-| Fable 5 | $10.00 | $50.00 | $1.00 | $12.50 | $20.00 |
-| Opus 4.8 / 4.7 / 4.6 / 4.5 | $5.00 | $25.00 | $0.50 | $6.25 | $10.00 |
+| Fable 5 / Mythos 5 | $10.00 | $50.00 | $1.00 | $12.50 | $20.00 |
+| Opus 5 / 4.8 / 4.7 / 4.6 / 4.5 | $5.00 | $25.00 | $0.50 | $6.25 | $10.00 |
 | Opus 4.1 / 4.0 (legacy) | $15.00 | $75.00 | $1.50 | $18.75 | $30.00 |
 | Sonnet 5 — intro (through 2026-08-31) | $2.00 | $10.00 | $0.20 | $2.50 | $4.00 |
 | Sonnet 5 — standard (from 2026-09-01) | $3.00 | $15.00 | $0.30 | $3.75 | $6.00 |
@@ -121,6 +124,13 @@ Pricing is model-aware (per 1M tokens). Source: [platform.claude.com/docs/en/abo
 
 **Sonnet 5 intro pricing is date-aware.** `claude-sonnet-5` is billed at the introductory $2/$10 schedule for turns timestamped before `SONNET5_INTRO_END` (2026-09-01 UTC) and at standard $3/$15 from then on — selected by the turn's own `start_time`, so reprocessing a historical intro-period turn keeps billing it at intro rates (reprocess determinism). When a turn carries no parseable timestamp, Sonnet 5 falls back to the durable standard rate. All other Sonnet versions are flat $3/$15. **Flip reminder:** after 2026-08-31 the live rate is standard automatically (no code edit needed) — the constant and intro row stay for correct reprocessing of pre-cutoff turns.
 
+**Opus 5** (`claude-opus-5`) bills at the same $5/$25 schedule as Opus 4.8 — a drop-in
+upgrade on price. It is a **separate rate-limit bucket** from the combined Opus 4.x pool,
+which matters for capacity planning but not for cost. **Mythos 5** (`claude-mythos-5`,
+Project Glasswing) is Fable 5's sibling: identical pricing and API surface, different ID —
+`calculate_turn_cost` matches `mythos` alongside `fable` so the invitation-only
+`claude-mythos-preview` resolves too.
+
 **New-tokenizer note:** Opus 4.7+, Fable 5, **and Sonnet 5** ship a new tokenizer that produces ~30% more tokens for the same input text vs. prior models (Sonnet 4.6 and earlier keep the old tokenizer). Per-token rates are unchanged, but absolute session cost for equivalent workloads is meaningfully higher — the extra cost comes from token *counts* (already in `usageDetails`), not the rate table.
 
 Cache write cost is split by tier when `cache_5m` / `cache_1h` are available in `usageDetails`; otherwise all cache_create is billed at the 5m rate.
@@ -129,10 +139,11 @@ Cache write cost is split by tier when `cache_5m` / `cache_1h` are available in 
 
 These stack multiplicatively on the base rates above (and apply uniformly across input, output, cache read, and cache write tiers):
 
-- **Fast mode (`speed="fast"`)**: per-model premium — **6x** on Opus 4.6 / 4.7 ($30/$150), **2x** on Opus 4.8 ($10/$50). Opus 4.5 and Sonnet/Haiku are ineligible and keep base rates. Multipliers live in `FAST_MODE_MULTIPLIERS` in `langfuse-hook.py`.
-- **Fable 5**: ineligible for fast mode (no `/fast` variant) and data residency (`inference_geo` multiplier unverified) — always billed at base $10/$50. Update `calculate_turn_cost` if Anthropic publishes Fable multipliers.
-- **Data residency (`inference_geo="us"`)**: 1.1x on Opus 4.6+/Sonnet 4.6+ (including Sonnet 5). Other models do not support the `inference_geo` parameter; multiplier is not applied.
-- **Fast + US-geo stack**: 6x × 1.1x = 6.6x (Opus 4.6/4.7); 2x × 1.1x = 2.2x (Opus 4.8).
+- **Fast mode (`speed="fast"`)**: per-model premium — **2x** on Opus 5 and Opus 4.8 ($10/$50), **6x** on Opus 4.6 / 4.7 ($30/$150). Opus 4.5 and Sonnet/Haiku are ineligible and keep base rates. Multipliers live in `FAST_MODE_MULTIPLIERS` in `langfuse-hook.py`.
+  - Fast mode is now offered on **Opus 5 / 4.8 only** — `speed="fast"` on Opus 4.7 returns an API error, and the Opus 4.6 `-fast` model ID was retired (requests silently fall back to standard). The 4.6/4.7 entries stay in the table on purpose: turns recorded while fast mode was live on those generations *were* billed at 6x, and reprocessing must keep billing them that way.
+- **Fable 5 / Mythos 5**: ineligible for fast mode (no `/fast` variant) and data residency (`inference_geo` multiplier unverified) — always billed at base $10/$50. Update `calculate_turn_cost` if Anthropic publishes multipliers for them.
+- **Data residency (`inference_geo="us"`)**: 1.1x on Opus 4.6+ (including Opus 5) / Sonnet 4.6+ (including Sonnet 5). Other models do not support the `inference_geo` parameter; multiplier is not applied.
+- **Fast + US-geo stack**: 2x × 1.1x = 2.2x (Opus 5 / 4.8); 6x × 1.1x = 6.6x (Opus 4.6/4.7).
 
 ### Server-side Tool Billing
 
@@ -143,6 +154,37 @@ These stack multiplicatively on the base rates above (and apply uniformly across
 Set `REPORT_API_EQUIVALENT_COST = False` in `langfuse-hook.py` to report $0.
 
 **Keeping prices up to date:** Pricing is hardcoded in `calculate_turn_cost()` (`langfuse-hook.py`). When Anthropic releases new models or changes prices, update that function and the table above. Unknown models return $0 and emit a `[WARN]` in `langfuse-hook.log` — that's the signal to update. We send explicit costs rather than relying on Langfuse's built-in model table because Langfuse's table lags new model releases by days/weeks.
+
+Two signals catch pricing staleness, and they fail differently:
+
+| Signal | Catches | Misses |
+|--------|---------|--------|
+| `[WARN] unrecognised … model` in the hook log | A **new** model ID (cost shows as $0 — loud) | A **rate change** on a model already in the table |
+| `tools/check_pricing_drift.py` | Rate changes **and** new models | Multipliers, intro-window boundaries, server-tool rates |
+
+```bash
+python3 tools/check_pricing_drift.py            # exit 1 on drift
+python3 tools/check_pricing_drift.py --json     # machine-readable
+python3 tools/check_pricing_drift.py --feed /path/to/local.json
+```
+
+The script probes `calculate_turn_cost()` itself (so it cannot drift from the code it
+validates) across all five billed axes — input, output, cache read, cache write 5m,
+cache write 1h — and diffs them against LiteLLM's community price map. Models absent from
+the feed (e.g. Mythos 5) report `SKIP`, not a failure.
+
+**The feed is a tripwire, not a source of truth.** It is community-maintained and can
+itself be wrong or stale. A `DRIFT` result means *go read
+platform.claude.com/docs/en/about-claude/pricing and decide* — never paste feed numbers
+into `calculate_turn_cost()` unverified.
+
+**Why the hook does not fetch prices at runtime:** the hook is deliberately offline
+(stdlib only, fire-and-forget, no network on the Stop path). Live lookups would add
+latency to every turn, make cost depend on a third party's uptime, and silently re-bill
+historical turns whenever an upstream entry changed — and a wrong feed entry would produce
+confidently wrong costs, where today an unknown model produces an obvious `$0` plus a
+`[WARN]`. Date-aware pricing (`SONNET5_INTRO_END`) needs the rate that applied *at the
+turn's timestamp*; a live feed only ever carries today's rate.
 
 ### AWS Bedrock Pricing (reference)
 
@@ -162,6 +204,7 @@ endpoint; the premium is the same for US and EU.
 | Model | First-party API ($/1M in / out) | Bedrock global | Bedrock US/EU geo (`us.`/`eu.`, +10%) |
 |-------|----------------------------------|----------------|----------------------------------------|
 | Fable 5 | $10 / $50 | not on Bedrock | — |
+| Opus 5 | $5 / $25 | $5 / $25 | $5.50 / $27.50 |
 | Opus 4.8 / 4.7 / 4.6 | $5 / $25 | $5 / $25 | $5.50 / $27.50 |
 | Sonnet 5 (standard) | $3 / $15 | $3 / $15 | $3.30 / $16.50 |
 | Sonnet 4.x | $3 / $15 | $3 / $15 | $3.30 / $16.50 |
@@ -171,13 +214,30 @@ endpoint; the premium is the same for US and EU.
 transcripts do not expose the Bedrock endpoint type, so the matcher cannot tell a
 global call from a geo call and bills both at base. Fable 5 is not yet available on
 Bedrock. Canonical source: aws.amazon.com/bedrock/pricing (verified June 2026).
+Opus 5 ships on Bedrock as `anthropic.claude-opus-5` (plus `us.`/`eu.`/`au.`/`jp.`
+geo prefixes); the substring matcher already bills all of them at the base rate.
 
 ## Tags and Metadata
 
-> Transcript-field coverage verified against Claude Code **v2.1.197** (2026-06-30).
-> Note: `effort.level`, `agent_id`/`parent_agent_id`, and skill `invocation_trigger` are
-> OTel-span / hook-stdin fields, **not** transcript JSONL — unreachable by this hook's
-> transcript parsing. effort is captured via the `$CLAUDE_EFFORT` env var instead.
+> Transcript-field coverage verified against Claude Code **v2.1.220** (2026-08-01).
+> Note: `agent_id`/`parent_agent_id` and skill `invocation_trigger` are OTel-span /
+> hook-stdin fields, **not** transcript JSONL — unreachable by this hook's transcript
+> parsing.
+>
+> New in v2.1.220: **`effort` is now a per-assistant-entry transcript field** (previously
+> reachable only via the `$CLAUDE_EFFORT` env var, session-level and live-fires-only).
+> Captured per-generation as `effort` metadata and rolled up to the session
+> `effort_level` / `effort:<level>` tag. Transcript wins over the env var — it is per-turn
+> and survives `--reprocess`; the env fallback still covers pre-2.1.220 transcripts.
+> Within a turn the **last** non-empty value wins, so a mid-turn `/effort` change is
+> attributed to the level the turn finished under.
+>
+> Also observed in v2.1.211+: the random 3-word `slug` returned as a field on
+> `assistant`/`user` entries (see Trace Name precedence — deliberately not used for
+> naming), and `file-history-delta` entries alongside `file-history-snapshot`.
+> Not captured: `promptSource` (`typed`/`queued`/`suggestion_accepted`/`system`) and
+> `origin` (`{kind: human|task-notification}`) on user entries — a plausible future
+> "who drove this turn" signal, but no current dashboard need.
 >
 > New in v2.1.169–v2.1.181: assistant-channel API-error/auto-retry stubs
 > (`isApiErrorMessage`), user interrupts (`interruptedMessageId`), and the
@@ -214,7 +274,7 @@ Each trace is enriched with:
 - `pr:<N>` — one tag per PR linked from the session (via `pr-link` transcript entries)
 - `agent-name:{slug}` — present when `type: "agent-name"` entry exists (e.g., `agent-name:langfuse-usagedetails-fix`)
 - `session-kind:{bg|fg}` — background job vs interactive foreground session (from `sessionKind` field on transcript entries; defaults to `fg` when absent on older transcripts)
-- `effort:<level>` — active effort level at Stop-fire time (`low`/`medium`/`high`/`max`), from `$CLAUDE_EFFORT`. Live fires only (absent on reprocessed sessions)
+- `effort:<level>` — effort level for the session (`low`/`medium`/`high`/`xhigh`/`max`). Sourced from the per-turn transcript `effort` field (CC 2.1.220+, last turn that carried one) and therefore present on reprocessed sessions too; falls back to `$CLAUDE_EFFORT` at Stop-fire time on older transcripts (live fires only)
 - `skill:<slug>` — one per distinct `attributionSkill` observed in the session (e.g., `skill:superpowers:brainstorming`)
 - `plugin:<name>` — one per distinct `attributionPlugin` observed (e.g., `plugin:superpowers`)
 - `compacted` — present when the session was context-compacted (mirrors `compaction_occurred`)
@@ -235,7 +295,11 @@ Each trace is enriched with:
 6. `"Claude Code Session"` hardcoded fallback
 
 The auto-generated 3-word slug (e.g. `goofy-frolicking-dove`) was removed from
-JSONL transcripts in Claude Code v2.1.112. The `agent-name` entry (~30% into a session)
+JSONL transcripts in Claude Code v2.1.112 and **returned in ~v2.1.211** — no longer as its
+own entry type, but as a `slug` field on `assistant`/`user` entries. It is deliberately
+**not** used for trace naming: it is a random handle (`sharded-shimmying-hummingbird`),
+whereas `agentName` is descriptive of the actual task (`context window optimization`).
+The `agent-name` entry (~30% into a session)
 provides a stable, descriptive slug once the model identifies the task. Early hook fires
 use the first prompt; once `agent-name` appears, subsequent fires update the trace name
 via Langfuse's upsert-on-id behaviour.
@@ -264,7 +328,7 @@ via Langfuse's upsert-on-id behaviour.
 - `compaction_occurred` — `true`/`false`; whether the session was context-compacted (from `type: "summary"` or a `system`/`compact*` subtype entry). Demoted from a score to metadata.
 - `total_iterations` — sum of per-turn `iteration_count` across the session (server-side agentic-loop iterations from `usage.iterations`).
 - `cache_miss` — session rollup of cache misses from `message.diagnostics.cache_miss_reason`: `{total_missed_tokens, by_reason: {<type>: count}, turns_with_miss}`. Explains *why* `cache_hit_rate` is low and how many input tokens were re-sent (e.g. `tools_changed`). Null when no turn missed cache.
-- `effort_level` — active effort level (`low`/`medium`/`high`/`max`) read from `$CLAUDE_EFFORT` at Stop-fire time. Session-level, last-observed. Live fires only; null on reprocessed sessions.
+- `effort_level` — session effort level (`low`/`medium`/`high`/`xhigh`/`max`), last-observed. Primary source is the per-turn transcript `effort` field (CC 2.1.220+), so this survives `--reprocess`; on older transcripts it falls back to `$CLAUDE_EFFORT` read at Stop-fire time (live fires only, null on reprocess). See per-generation `effort` for the per-turn value.
 - `compaction` — rollup of `system/compact_boundary` events: `{count, triggers: {<trigger>: n}, total_tokens_reclaimed (Σ preTokens−postTokens), total_pre_tokens, total_post_tokens, total_duration_ms, events: [{trigger, pre_tokens, post_tokens, tokens_reclaimed, duration_ms, timestamp}]}`. Surfaces context-window pressure and the token/time cost of compaction. Legacy `type:"summary"` entries (pre-`compactMetadata`) count with `trigger:"legacy"` and no token fields. Unknown triggers pass through verbatim. Null when never compacted. The bare `compaction_occurred` bool (via `detect_compaction`) is retained alongside for back-compat. From `extract_compaction()`.
 - `remote_control` — `{bridge_session_id, url}` from `bridge-session` + `system/bridge_status` entries (the Remote Control / phone-web bridge). Either field may be absent independently; `url` correlates with the claude.ai session. **No timestamps** on these entries. Null when the session was never bridged. From `extract_bridge()`.
 - `permission_timeline` — `{modes_used (sorted distinct), sequence (file-order, consecutive dups collapsed), transition_count, ever_bypass, ever_accept_edits}` from `permission-mode` entries. Complements the last-observed `permission_mode`/`permission:<mode>` tag with the full transition history. **No timestamps** on these entries → sequence is order-only, not timed. Null when no `permission-mode` entries. From `extract_permission_timeline()`.
@@ -286,6 +350,7 @@ and away summaries are extracted via `extract_custom_title()`, `extract_ai_title
 - `web_search_requests`, `web_fetch_requests` — server-side tool use counts
 - `attribution_skill`, `attribution_plugin` — primary skill / plugin for the turn (first non-empty observed)
 - `attribution_skills_all` — list of all distinct skills observed in the turn (only emitted when more than one)
+- `effort` — effort level for this turn (`low`/`medium`/`high`/`xhigh`/`max`), from the per-assistant-entry transcript field (CC 2.1.220+). Last non-empty value in the turn wins. Omitted on older transcripts. Pair with `usageDetails` to compare token spend across effort levels.
 - `iteration_count` — number of server-side iterations in the turn (length of `usage.iterations`; 0 when absent).
 - `ttft_ms` — time-to-first-token in ms (first assistant-token timestamp − turn start). Omitted when not derivable.
 - `duration_ms` — turn wall-clock in ms from the matching `system/turn_duration` entry (turn start→end, incl. tool execution). Also drives the generation `endTime`. Omitted when no `turn_duration` matched the turn (CC before ~2.1.19x). Rolled up session-wide as `active_duration`.

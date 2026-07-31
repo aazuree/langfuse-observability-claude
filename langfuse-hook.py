@@ -1095,6 +1095,10 @@ def build_turns(entries: list[dict]) -> list[dict]:
                 "diagnostics": msg.get("diagnostics", {}) if etype == "assistant" else {},
                 "attribution_skill": entry.get("attributionSkill", "") if etype == "assistant" else "",
                 "attribution_plugin": entry.get("attributionPlugin", "") if etype == "assistant" else "",
+                # Per-turn effort level, new as a transcript field in CC 2.1.220.
+                # Previously only reachable via $CLAUDE_EFFORT on live fires; this
+                # source also survives --reprocess.
+                "effort": entry.get("effort", "") if etype == "assistant" else "",
             })
         elif etype == "system" and entry.get("subtype") == "turn_duration":
             turn_durations.append(entry)
@@ -1160,6 +1164,7 @@ def build_turns(entries: list[dict]) -> list[dict]:
                     "attribution_plugin": "",
                     "attribution_skills_all": set(),
                     "attribution_plugins_all": set(),
+                    "effort": "",
                 }
             elif current_turn:
                 current_turn["messages"].append(me)
@@ -1191,6 +1196,11 @@ def build_turns(entries: list[dict]) -> list[dict]:
                 if not current_turn["attribution_plugin"]:
                     current_turn["attribution_plugin"] = pl
                 current_turn["attribution_plugins_all"].add(pl)
+
+            # Last non-empty effort wins — a mid-turn /effort change should be
+            # attributed to the level the turn actually finished under.
+            if me.get("effort"):
+                current_turn["effort"] = me["effort"]
 
             current_turn["end_time"] = me["timestamp"]
             current_turn["api_call_ids"].add(mid)
@@ -1456,13 +1466,20 @@ def extract_cwd(transcript_path: str) -> str:
 
 
 # Fast mode (research preview). Premium over base rates, per Opus generation:
-# Opus 4.6/4.7 = 6x ($30/$150); Opus 4.8 = 2x ($10/$50). Multiplier applies
-# uniformly to input, output, cache read, and both cache-write tiers.
-# Source: platform.claude.com/docs/en/about-claude/pricing#fast-mode-pricing (verified 2026-06-01)
+# Opus 4.6/4.7 = 6x ($30/$150); Opus 4.8 and Opus 5 = 2x ($10/$50). Multiplier
+# applies uniformly to input, output, cache read, and both cache-write tiers.
+#
+# Fast mode is now offered on Opus 5 / Opus 4.8 only — `speed="fast"` on Opus 4.7
+# returns an API error, and the Opus 4.6 `-fast` model ID was retired (silently
+# falls back to standard). The 4.6/4.7 entries are retained deliberately: turns
+# recorded while fast mode was live on those generations were billed at 6x, and
+# reprocessing must keep billing them that way (reprocess determinism).
+# Source: platform.claude.com/docs/en/about-claude/pricing#fast-mode-pricing (verified 2026-08-01)
 FAST_MODE_MULTIPLIERS = {
     "opus-4-6": 6.0,
     "opus-4-7": 6.0,
     "opus-4-8": 2.0,
+    "opus-5": 2.0,
 }
 # Data residency: inference_geo="us" on Opus 4.6+/Sonnet 4.6+. 1.1x all categories.
 # Source: platform.claude.com/docs/en/about-claude/pricing#data-residency-pricing
@@ -1573,9 +1590,12 @@ def calculate_turn_cost(
         # Substring matching previously over-billed any future "opus-4-9+"
         # release at the legacy $15/$75 rate; whitelist forces the unknown-
         # model WARN log to surface so the table can be updated explicitly.
-        if any(x in m for x in ("opus-4-5", "opus-4-6", "opus-4-7", "opus-4-8")):
+        # "opus-5" is matched separately from the 4.x family so a dated ID
+        # (claude-opus-5-2026...) resolves, while "claude-opus-4-5" — which
+        # does not contain the contiguous substring "opus-5" — cannot collide.
+        if any(x in m for x in ("opus-4-5", "opus-4-6", "opus-4-7", "opus-4-8", "opus-5")):
             p_in, p_out, p_cr, p_cc5, p_cc1 = 5.0, 25.0, 0.50, 6.25, 10.0
-            if any(x in m for x in ("opus-4-6", "opus-4-7", "opus-4-8")):
+            if any(x in m for x in ("opus-4-6", "opus-4-7", "opus-4-8", "opus-5")):
                 supports_inference_geo = True
                 supports_fast_mode = True
         elif any(x in m for x in ("opus-4-1", "opus-4-20", "3-opus")):
@@ -1600,9 +1620,11 @@ def calculate_turn_cost(
             p_in, p_out, p_cr, p_cc5, p_cc1 = 3.0, 15.0, 0.30, 3.75, 6.00
             if "sonnet-4-6" in m:
                 supports_inference_geo = True
-    elif "fable" in m:                               # Fable 5 (top tier, $10/$50)
-        # supports_fast_mode / supports_inference_geo stay False: Fable has no
-        # /fast variant, and its data-residency multiplier is unverified.
+    elif "fable" in m or "mythos" in m:              # Fable 5 / Mythos 5 (top tier, $10/$50)
+        # Mythos 5 (and its predecessor claude-mythos-preview) is the Project
+        # Glasswing sibling of Fable 5 — identical pricing and API surface.
+        # supports_fast_mode / supports_inference_geo stay False: neither has a
+        # /fast variant, and their data-residency multiplier is unverified.
         p_in, p_out, p_cr, p_cc5, p_cc1 = 10.00, 50.00, 1.00, 12.50, 20.00
     else:
         log(f"[WARN] calculate_turn_cost: unrecognised model '{model}' — cost reported as $0. "
@@ -1992,6 +2014,8 @@ def gen_metadata_attribution(turn: dict) -> dict:
         out["attribution_plugin"] = pl
     if len(all_skills) > 1:
         out["attribution_skills_all"] = list(all_skills)
+    if turn.get("effort"):
+        out["effort"] = turn["effort"]
     return out
 
 
@@ -2011,10 +2035,13 @@ def gen_metadata_cache_miss(turn: dict) -> dict:
 
 def process_session(session_id: str, transcript_path: str, cwd: str, last_assistant_message: str = "", live: bool = True, background_tasks: list = None, session_crons: list = None) -> None:
     """Core processing logic for a single session transcript."""
-    # effort comes from the live hook process environment ($CLAUDE_EFFORT,
-    # v2.1.133+). It is NOT in the transcript, so it cannot be recovered on
-    # reprocess; omit it then so Langfuse's upsert preserves any prior value.
-    effort = os.environ.get("CLAUDE_EFFORT", "").strip() if live else ""
+    # Session-level effort fallback from the live hook environment
+    # ($CLAUDE_EFFORT, v2.1.133+). Not recoverable on reprocess, so it is
+    # omitted then and Langfuse's upsert preserves any prior value.
+    # CC 2.1.220+ also writes a per-turn `effort` field into the transcript;
+    # where present that is preferred below (it is per-turn, and it survives
+    # --reprocess). This env fallback still covers older transcripts.
+    effort_env = os.environ.get("CLAUDE_EFFORT", "").strip() if live else ""
     prev_line_offset, prev_turn_count = load_state(session_id)
     custom_title = extract_custom_title(transcript_path)
     permission_mode = extract_permission_mode(transcript_path)
@@ -2069,6 +2096,15 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
 
     # Check if any turn used fast inference
     has_fast = any(t.get("speed") == "fast" for t in turns)
+
+    # Session-level effort: last turn in this batch that carried one (CC 2.1.220+
+    # transcript field), else the live $CLAUDE_EFFORT fallback. Transcript wins
+    # because it is per-turn and survives --reprocess, whereas the env var
+    # reflects only the level active at Stop-fire time on a live fire.
+    effort = next(
+        (t["effort"] for t in reversed(turns) if t.get("effort")),
+        effort_env,
+    )
 
     # Collect unique model families used across all turns
     model_families = set()
