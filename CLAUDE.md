@@ -23,11 +23,28 @@ docker compose down -v
 # View hook logs
 tail -f ~/.claude/langfuse-hook.log
 
-# Re-ingest all sessions
+# Re-ingest all sessions (LOCAL stack — reads keys from this checkout's .env)
 PK=$(grep '^LANGFUSE_INIT_PROJECT_PUBLIC_KEY=' .env | cut -d= -f2)
 SK=$(grep '^LANGFUSE_INIT_PROJECT_SECRET_KEY=' .env | cut -d= -f2)
 LANGFUSE_PUBLIC_KEY=$PK LANGFUSE_SECRET_KEY=$SK python3 langfuse-hook.py --reprocess
+
+# Re-ingest all sessions (REMOTE stack, e.g. Pi — copy host+keys from the Stop hook
+# command in ~/.claude/settings.json; the local .env does NOT hold the remote keys)
+LANGFUSE_HOST=http://<remote-ip>:3100 \
+  LANGFUSE_PUBLIC_KEY=pk-lf-... LANGFUSE_SECRET_KEY=sk-lf-... \
+  python3 langfuse-hook.py --reprocess
 ```
+
+> **Reprocessing against a remote stack:** `--reprocess` takes its target from
+> `LANGFUSE_HOST` (default `http://localhost:3100`) and its credentials from the
+> environment — it never reads `.env`. Omitting `LANGFUSE_HOST` on a remote deployment
+> sends everything to localhost and fails with `Connection refused` for every session
+> (state is not advanced, so nothing is lost — but nothing is updated either). The
+> remote instance also has its **own** project keys: the `.env` in this checkout belongs
+> to the local stack and will not authenticate against the remote one. Always source
+> both host and keys from the `Stop` hook command in `~/.claude/settings.json`.
+> Run it from the **main checkout**, not a worktree — `.env` is gitignored and absent
+> from worktrees.
 
 - **Dashboard**: http://localhost:3100
 - **Hook log**: `~/.claude/langfuse-hook.log` (auto-rotates at 10 MB)
