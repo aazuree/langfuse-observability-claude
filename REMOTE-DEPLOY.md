@@ -261,6 +261,28 @@ it defaults back to `http://localhost:3100`.
 
 ---
 
+## Langfuse v4 (running since 2026-08-26)
+
+The stack runs **Langfuse v4** with `LANGFUSE_MIGRATION_V4_WRITE_MODE=legacy`.
+
+v4 moves to an observations-first data model (`events_full` / `events_core`)
+that replaces the v3 `traces` / `observations` tables, but the migration is
+staged and reversible: in `legacy` mode v4 keeps writing the v3 tables and
+keeps the legacy batch ingestion endpoints serving. Historic traces stay
+browsable as virtual root spans, and the ClickHouse schema migrations apply
+automatically on first start.
+
+> ⚠️ **Do not set `events_only`.** That is the v4 cutover, and it replaces the
+> legacy batch ingestion endpoints with OpenTelemetry-based ingestion.
+> `langfuse-hook.py` POSTs to `/api/public/ingestion` over plain stdlib HTTP,
+> so the cutover breaks ingestion outright until the hook is ported to OTel.
+> `dual` is safe (it writes both), but adds roughly a 15-minute UI delay for
+> non-SDK producers like ours, which cannot propagate attributes client-side.
+
+Infrastructure already satisfies the v4 floors — ClickHouse 25.12 minimum
+(26.4 recommended), PostgreSQL 15 minimum, Redis 7.0 minimum. Back up both
+PostgreSQL **and** ClickHouse before any further migration step.
+
 ## Known limitations
 
 - **No TLS.** Traffic (including the project secret key on ingestion POSTs) is

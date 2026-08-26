@@ -5,7 +5,7 @@
 # External connections from other machines will not be able to reach these services directly.
 services:
   langfuse-worker:
-    image: docker.io/langfuse/langfuse-worker:3.200.0
+    image: docker.io/langfuse/langfuse-worker:4.21.0
     restart: always
     depends_on: &langfuse-depends-on
       postgres:
@@ -19,6 +19,11 @@ services:
     ports:
       - 127.0.0.1:3130:3030
     environment: &langfuse-worker-env
+      # v4 keeps writing the v3 tables and keeps the legacy batch ingestion
+      # endpoints alive. The hook POSTs to /api/public/ingestion, which only
+      # goes away at the events_only cutover — do not change this to
+      # events_only without migrating the hook to OTel ingestion first.
+      LANGFUSE_MIGRATION_V4_WRITE_MODE: ${LANGFUSE_MIGRATION_V4_WRITE_MODE:-legacy}
       NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:3100}
       DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/postgres} # CHANGEME
       SALT: ${SALT:-mysalt} # CHANGEME
@@ -67,7 +72,7 @@ services:
       SMTP_CONNECTION_URL: ${SMTP_CONNECTION_URL:-}
 
   langfuse-web:
-    image: docker.io/langfuse/langfuse:3.200.0
+    image: docker.io/langfuse/langfuse:4.21.0
     restart: always
     depends_on: *langfuse-depends-on
     ports:
@@ -112,7 +117,7 @@ services:
       start_period: 1s
 
   minio:
-    image: cgr.dev/chainguard/minio
+    image: cgr.dev/chainguard/minio@sha256:8230f06574280781ea6ad45e27962db60175b18e4a43dd54c19012feb5438174
     restart: always
     entrypoint: sh
     # create the 'langfuse' bucket before starting the service
@@ -133,7 +138,7 @@ services:
       start_period: 1s
 
   redis:
-    image: docker.io/redis:8.8.0
+    image: docker.io/redis:8.8.2
     restart: always
     # CHANGEME: row below to secure redis password
     command: >
@@ -150,7 +155,7 @@ services:
       retries: 10
 
   postgres:
-    image: docker.io/postgres:${POSTGRES_VERSION:-18.4}
+    image: docker.io/postgres:${POSTGRES_VERSION:-18.6}
     restart: always
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
