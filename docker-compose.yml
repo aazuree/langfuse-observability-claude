@@ -24,6 +24,12 @@ services:
       # goes away at the events_only cutover — do not change this to
       # events_only without migrating the hook to OTel ingestion first.
       LANGFUSE_MIGRATION_V4_WRITE_MODE: ${LANGFUSE_MIGRATION_V4_WRITE_MODE:-legacy}
+      # These three must accompany legacy mode. Their v4 defaults (direct /
+      # true / true) assume the new events tables are being written, which
+      # legacy does not do — `direct` makes the worker refuse to boot outright.
+      LANGFUSE_MIGRATION_V4_NATIVE_OTEL_BEHAVIOUR: ${LANGFUSE_MIGRATION_V4_NATIVE_OTEL_BEHAVIOUR:-dual_write}
+      LANGFUSE_MIGRATION_V4_ALLOW_PREVIEW_OPT_IN: ${LANGFUSE_MIGRATION_V4_ALLOW_PREVIEW_OPT_IN:-false}
+      LANGFUSE_BACKGROUND_MIGRATION_V4_ENABLE_HISTORIC_BACKFILL: ${LANGFUSE_BACKGROUND_MIGRATION_V4_ENABLE_HISTORIC_BACKFILL:-false}
       NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:3100}
       DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/postgres} # CHANGEME
       SALT: ${SALT:-mysalt} # CHANGEME

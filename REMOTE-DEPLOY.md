@@ -279,6 +279,15 @@ automatically on first start.
 > `dual` is safe (it writes both), but adds roughly a 15-minute UI delay for
 > non-SDK producers like ours, which cannot propagate attributes client-side.
 
+`legacy` is not a single switch. Three companion variables must be set with
+it, because their v4 defaults assume the new events tables are being written:
+
+| variable | v4 default | needs to be | why |
+|---|---|---|---|
+| `LANGFUSE_MIGRATION_V4_NATIVE_OTEL_BEHAVIOUR` | `direct` | `dual_write` | `direct` targets `events_full`, unread in legacy — **the worker refuses to boot** |
+| `LANGFUSE_MIGRATION_V4_ALLOW_PREVIEW_OPT_IN` | `true` | `false` | gates v4 read paths that would query unwritten tables |
+| `LANGFUSE_BACKGROUND_MIGRATION_V4_ENABLE_HISTORIC_BACKFILL` | `true` | `false` | the backfill runs exactly once; it must not run before dual-write is active |
+
 Infrastructure already satisfies the v4 floors — ClickHouse 25.12 minimum
 (26.4 recommended), PostgreSQL 15 minimum, Redis 7.0 minimum. Back up both
 PostgreSQL **and** ClickHouse before any further migration step.
