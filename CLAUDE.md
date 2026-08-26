@@ -88,7 +88,12 @@ tools/
   check_pricing_drift.py         # Compares hardcoded pricing against a public feed (manual/CI, never run by the hook)
 tests/
   test_langfuse_hook.py          # Core hook unit tests
+  conftest.py                    # Redirects LANGFUSE_HOOK_LOG so tests never touch the real log
   test_pricing_drift.py          # Pricing drift-checker tests (offline, synthetic feeds)
+  test_thinking_tokens.py        # output_tokens_details.thinking_tokens capture + rollup
+  test_prompt_provenance.py      # origin.kind / promptSource / turnCompanion capture
+  test_file_history_delta.py     # file-history-delta rollup (edits, distinct files, versions)
+  test_log_isolation.py          # LOG_FILE env override + production-log isolation
   test_session_hooks.py          # StopFailure hook tests
   test_hook_scores.py            # Hook-level score classifier tests
   test_subagent_tracking.py      # Subagent cost tracking tests
@@ -108,6 +113,7 @@ uv run pytest tests/ -k "discover" -v  # Run tests matching pattern
 
 - **No external Python dependencies** - stdlib only (urllib, json, base64, uuid, pathlib)
 - Constants at top of `langfuse-hook.py`: `MAX_TEXT=10000`, `MAX_TOOL_IO=5000`. Log rotation threshold: `MAX_LOG_BYTES=10MB` in `langfuse_common.py`
+- `LOG_FILE` honours the `LANGFUSE_HOOK_LOG` env var (both hooks), defaulting to `~/.claude/langfuse-hook.log`. `tests/conftest.py` sets it to a temp dir — **without that, a `pytest` run appends fixture sessions to the production log and its tail can no longer be trusted for live diagnosis.** Because `LOG_FILE` is evaluated at import time, the override must be set before the hook module is imported.
 - Secret redaction via `SECRET_PATTERNS` regex list before any data leaves the machine
 - Session IDs sanitized via `sanitize_id()` to prevent path traversal
 - Incremental processing: state files track processed line offsets per session
@@ -151,6 +157,8 @@ Project Glasswing) is Fable 5's sibling: identical pricing and API surface, diff
 **New-tokenizer note:** Opus 4.7+, Fable 5, **and Sonnet 5** ship a new tokenizer that produces ~30% more tokens for the same input text vs. prior models (Sonnet 4.6 and earlier keep the old tokenizer). Per-token rates are unchanged, but absolute session cost for equivalent workloads is meaningfully higher — the extra cost comes from token *counts* (already in `usageDetails`), not the rate table.
 
 Cache write cost is split by tier when `cache_5m` / `cache_1h` are available in `usageDetails`; otherwise all cache_create is billed at the 5m rate.
+
+**Extended-thinking tokens are NOT a separate billing category.** `usage.output_tokens_details.thinking_tokens` is a breakdown *inside* `output_tokens`, billed at the plain output rate. It is reported as the `output_thinking` line in `usageDetails` and rolled up in trace metadata `thinking` (`{total_thinking_tokens, total_output_tokens, share_of_output, turns_with_thinking, max_thinking_tokens}`) purely for analytics — never added to a cost total, and `calculate_turn_cost` does not take it as an input. It answers "what is the effort level actually buying", which the `effort_level` tag alone cannot. Note the token *count* is present even though CC has stripped thinking *text* from transcripts since v2.1.112.
 
 ### Pricing Multipliers
 

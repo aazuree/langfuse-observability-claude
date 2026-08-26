@@ -859,7 +859,13 @@ class TestExtractFileHistoryStats:
         f = tmp_path / "t.jsonl"
         f.write_text(json.dumps({"type": "user"}) + "\n")
         result = hook.extract_file_history_stats(str(f))
-        assert result == {"snapshot_count": 0, "tracked_files_count": 0}
+        assert result == {
+            "snapshot_count": 0,
+            "tracked_files_count": 0,
+            "delta_count": 0,
+            "edited_files_count": 0,
+            "max_backup_version": 0,
+        }
 
     def test_counts_snapshots(self, tmp_path):
         f = tmp_path / "t.jsonl"
@@ -898,7 +904,13 @@ class TestExtractFileHistoryStats:
 
     def test_nonexistent_file(self):
         result = hook.extract_file_history_stats("/nonexistent.jsonl")
-        assert result == {"snapshot_count": 0, "tracked_files_count": 0}
+        assert result == {
+            "snapshot_count": 0,
+            "tracked_files_count": 0,
+            "delta_count": 0,
+            "edited_files_count": 0,
+            "max_backup_version": 0,
+        }
 
 
 # ---------------------------------------------------------------------------

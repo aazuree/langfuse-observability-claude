@@ -29,7 +29,9 @@ LANGFUSE_PUBLIC_KEY = os.environ.get("LANGFUSE_PUBLIC_KEY", "")
 LANGFUSE_SECRET_KEY = os.environ.get("LANGFUSE_SECRET_KEY", "")
 INGESTION_URL = f"{LANGFUSE_HOST}/api/public/ingestion"
 
-LOG_FILE = os.path.expanduser("~/.claude/langfuse-hook.log")
+LOG_FILE = os.environ.get("LANGFUSE_HOOK_LOG") or os.path.expanduser(
+    "~/.claude/langfuse-hook.log"
+)
 
 
 def log(msg: str) -> None:
