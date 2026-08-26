@@ -50,6 +50,34 @@ LANGFUSE_HOST=http://<remote-ip>:3100 \
 - **Hook log**: `~/.claude/langfuse-hook.log` (auto-rotates at 10 MB)
 - **State files**: `~/.claude/langfuse-state/<session_id>.offset` (parent), `<session_id>.subagents.json` (subagents)
 
+### Reading the ingestion result
+
+The ingestion endpoint answers **`207 Multi-Status`**: the HTTP status only says
+the request was accepted, and the body reports each event's fate:
+
+```json
+{"successes": [{"id": "...", "status": 201}], "errors": [{"id": "...", "status": 400, "message": "..."}]}
+```
+
+`classify_ingestion_errors()` (in `langfuse_common.py`, shared by both hooks)
+splits those per-event failures into two kinds, because they need opposite
+handling:
+
+| kind | statuses | `send_to_langfuse` returns | effect |
+|---|---|---|---|
+| transient | 5xx, 429, 408, network, unparseable body | `False` | offset held back, retried next fire |
+| permanent | 400/401/403/404/422, unreadable error entry | `True` + `[ERROR]` log | events dropped, offset advances |
+
+Advancing on a permanent rejection is deliberate. Retrying a validation error
+can never succeed, and holding the offset back would wedge the session: every
+later fire would resend an ever-growing window that can never drain. Losing
+those events loudly beats ingesting nothing forever. Grep the log for
+`[ERROR] Langfuse rejected` to find them.
+
+> This is also the failure shape of the Langfuse v4 `events_only` cutover, where
+> the endpoint keeps returning 207 while rejecting every event type except
+> `score-create`. See REMOTE-DEPLOY.md.
+
 ## Architecture
 
 ```

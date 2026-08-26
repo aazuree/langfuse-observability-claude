@@ -28,7 +28,13 @@ from urllib.request import Request, urlopen
 
 # Ensure langfuse_common can be imported from the same directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from langfuse_common import iter_transcript, log as common_log, make_auth_header, redact_secrets
+from langfuse_common import (
+    classify_ingestion_errors,
+    iter_transcript,
+    log as common_log,
+    make_auth_header,
+    redact_secrets,
+)
 
 LANGFUSE_HOST = os.environ.get("LANGFUSE_HOST", "http://localhost:3100")
 LANGFUSE_PUBLIC_KEY = os.environ.get("LANGFUSE_PUBLIC_KEY", "")
@@ -80,9 +86,17 @@ def send_to_langfuse(batch: list[dict]) -> bool:
         batch: List of event dicts to send
 
     Returns:
-        True if all batches sent successfully, False if any failed
+        True when the caller may advance the transcript line offset — either
+        everything was accepted, or what failed can never succeed on a retry.
+        False when the send should be retried on the next fire.
+
+    Permanent rejections return True *and* log an [ERROR]: those events are
+    lost, but holding the offset back would wedge the session, resending an
+    ever-growing window that can never drain. Losing them loudly beats
+    ingesting nothing forever.
     """
-    success = True
+    transient = 0
+    permanent = 0
     for i in range(0, len(batch), 50):
         chunk = batch[i : i + 50]
         payload = json.dumps({"batch": chunk}).encode()
@@ -98,11 +112,31 @@ def send_to_langfuse(batch: list[dict]) -> bool:
         try:
             with urlopen(req, timeout=15) as resp:
                 body = resp.read().decode()
-                log(f"Langfuse response ({resp.status}): {body[:200]}")
+                t, p, details = classify_ingestion_errors(body)
+                transient += t
+                permanent += p
+                if t or p:
+                    # Never truncate these: `errors` trails `successes` in the
+                    # body, so a prefix-only log hid exactly this.
+                    log(
+                        f"[ERROR] Langfuse rejected {t + p} of {len(chunk)} event(s) "
+                        f"({resp.status}; {t} retryable, {p} permanent): "
+                        + " | ".join(details[:10])
+                    )
+                else:
+                    log(f"Langfuse accepted {len(chunk)} events ({resp.status})")
         except (URLError, TimeoutError, OSError) as e:
             log(f"Failed to send to Langfuse: {e}")
-            success = False
-    return success
+            transient += 1
+
+    if transient:
+        return False
+    if permanent:
+        log(
+            f"[ERROR] {permanent} event(s) permanently rejected and dropped; "
+            "advancing offset anyway so the session does not stall"
+        )
+    return True
 
 
 def load_state(session_id: str) -> tuple[int, int]:
