@@ -781,6 +781,58 @@ def extract_attachments(transcript_path: str) -> dict:
     return {"count": total, "by_type": by_type}
 
 
+def content_has_tool_result(content) -> bool:
+    """True when a `user` message is a tool result rather than a prompt."""
+    if not isinstance(content, list):
+        return False
+    return any(
+        isinstance(block, dict) and block.get("type") == "tool_result"
+        for block in content
+    )
+
+
+def content_text(content) -> str:
+    """Flatten message content to text, for classification only."""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return ""
+    return " ".join(
+        block.get("text", "")
+        for block in content
+        if isinstance(block, dict) and block.get("type") == "text"
+    )
+
+
+def classify_untagged_prompt(entry: dict, content) -> tuple[str | None, str]:
+    """Classify a `user` entry that carries no origin.kind / promptSource.
+
+    Returns (kind, source). `kind` is an origin bucket ("human",
+    "agent-dispatch"), or "meta" / "interrupted" for entries that are not
+    prompts, or None for entries to drop entirely.
+
+    The markers are checked before `isMeta` because they are unambiguous: a
+    slash-command entry is a real human prompt whatever else is set on it.
+    """
+    text = content_text(content)
+    if "[Request interrupted by user" in text:
+        return "interrupted", ""
+    if "<local-command-stdout>" in text:
+        return None, ""
+    if "<command-name>" in text:
+        return "human", "slash_command"
+    if entry.get("isMeta"):
+        return "meta", ""
+    if entry.get("isSidechain") and not entry.get("parentUuid"):
+        # The root entry of a sidechain transcript is the task prompt the
+        # parent wrote to dispatch the subagent — machine-authored, so it must
+        # not land in human_prompts.
+        return "agent-dispatch", "dispatch"
+    if not text.strip():
+        return None, ""
+    return "human", "untagged"
+
+
 def extract_prompt_provenance(transcript_path: str) -> dict:
     """Classify `user` entries by who or what authored them (CC 2.1.2xx).
 
@@ -793,25 +845,53 @@ def extract_prompt_provenance(transcript_path: str) -> dict:
 
     Without this, machine-authored entries inflate the user-turn count.
 
+    Those fields are only on a minority of entries, so untagged ones are
+    classified from their shape instead (see classify_untagged_prompt): a
+    slash-command invocation is a human prompt, a sidechain root is a subagent
+    dispatch, and injected/interrupt/local-command entries are not prompts at
+    all. Without that fallback `human_prompts` undercounts badly — a census of
+    159 transcripts found 75 untagged slash-command prompts against 114 tagged
+    human ones.
+
     Prompt text is never captured: a "peer" origin carries the subagent's whole
     report in `body`, same PII reasoning that keeps `content` out of the
-    queue-operation rollup. Returns {} when no entry carries any of these fields.
+    queue-operation rollup. Untagged entries are inspected only for the markers
+    above; nothing is stored. Returns {} for a session with no prompt entries.
     """
     by_origin: dict[str, int] = {}
     by_source: dict[str, int] = {}
     by_peer_agent: dict[str, int] = {}
     companion_messages = 0
     prompt_entries = 0
+    meta_entries = 0
+    interruptions = 0
 
     for entry in iter_transcript(transcript_path):
         if entry.get("type") != "user":
             continue
         if entry.get("turnCompanion") is True:
             companion_messages += 1
+        content = (entry.get("message") or {}).get("content")
+        if content_has_tool_result(content):
+            continue
         origin = entry.get("origin")
         source = entry.get("promptSource")
+
         if not isinstance(origin, dict) and not source:
+            kind, source = classify_untagged_prompt(entry, content)
+            if kind == "meta":
+                meta_entries += 1
+                continue
+            if kind == "interrupted":
+                interruptions += 1
+                continue
+            if kind is None:
+                continue  # local-command output or an empty entry: not a prompt
+            prompt_entries += 1
+            by_origin[kind] = by_origin.get(kind, 0) + 1
+            by_source[source] = by_source.get(source, 0) + 1
             continue
+
         prompt_entries += 1
         if isinstance(origin, dict):
             kind = origin.get("kind")
@@ -824,7 +904,8 @@ def extract_prompt_provenance(transcript_path: str) -> dict:
         if source:
             by_source[source] = by_source.get(source, 0) + 1
 
-    if not prompt_entries and not companion_messages:
+    if not prompt_entries and not companion_messages and not meta_entries \
+            and not interruptions:
         return {}
     return {
         "prompt_entries": prompt_entries,
@@ -833,7 +914,36 @@ def extract_prompt_provenance(transcript_path: str) -> dict:
         "by_source": by_source,
         "by_peer_agent": by_peer_agent,
         "companion_messages": companion_messages,
+        "meta_entries": meta_entries,
+        "interruptions": interruptions,
     }
+
+
+def extract_tool_denials(transcript_path: str) -> dict:
+    """Count tool calls that were refused, grouped by `toolDenialKind`.
+
+    Kinds seen in practice: "user-rejected" (the human declined the call),
+    "automode-blocked" (the auto-mode classifier refused it) and
+    "automode-unavailable" (the classifier timed out, so safety could not be
+    determined). The first is a signal about the work; the other two are a
+    signal about the harness — worth telling apart from each other and from a
+    tool that genuinely broke.
+
+    Returns {} when the session had no denials.
+    """
+    by_kind: dict[str, int] = {}
+
+    for entry in iter_transcript(transcript_path):
+        if entry.get("type") != "user":
+            continue
+        kind = entry.get("toolDenialKind")
+        if not kind:
+            continue
+        by_kind[kind] = by_kind.get(kind, 0) + 1
+
+    if not by_kind:
+        return {}
+    return {"denial_count": sum(by_kind.values()), "by_kind": by_kind}
 
 
 def extract_file_history_stats(transcript_path: str) -> dict:
@@ -1109,7 +1219,7 @@ def extract_tool_uses(content) -> list[dict]:
 
 
 
-def extract_tool_results(content) -> dict[str, str]:
+def extract_tool_results(content, denial_kind: str = "") -> dict[str, str]:
     if not isinstance(content, list):
         return {}
     results = {}
@@ -1131,7 +1241,10 @@ def extract_tool_results(content) -> dict[str, str]:
         else:
             result_text = str(result_content)
         if block.get("is_error", False):
-            result_text = f"[ERROR] {result_text}"
+            # A denied call never ran: mark it apart from a call that ran and
+            # failed, so tool_error_rate can exclude it.
+            prefix = f"[DENIED:{denial_kind}]" if denial_kind else "[ERROR]"
+            result_text = f"{prefix} {result_text}"
         results[tool_use_id] = result_text
     return results
 
@@ -1187,6 +1300,10 @@ def build_turns(entries: list[dict]) -> list[dict]:
                 # Previously only reachable via $CLAUDE_EFFORT on live fires; this
                 # source also survives --reprocess.
                 "effort": entry.get("effort", "") if etype == "assistant" else "",
+                # A refused tool call, not a failed one (CC 2.1.2xx). Both arrive
+                # with is_error:true, so this is what keeps a denial out of
+                # tool_error_rate.
+                "denial_kind": entry.get("toolDenialKind", "") if etype == "user" else "",
             })
         elif etype == "system" and entry.get("subtype") == "turn_duration":
             turn_durations.append(entry)
@@ -1197,7 +1314,7 @@ def build_turns(entries: list[dict]) -> list[dict]:
     tool_result_timestamps = {}
     for me in msg_entries:
         if me["role"] == "user":
-            results = extract_tool_results(me["content"])
+            results = extract_tool_results(me["content"], me.get("denial_kind", ""))
             tool_results.update(results)
             for tool_use_id in results:
                 tool_result_timestamps[tool_use_id] = me["timestamp"]
@@ -1798,23 +1915,51 @@ def compute_cache_hit_rate(turns: list[dict]) -> float | None:
 
 
 def calculate_tool_error_rate(turns: list[dict]) -> float | None:
-    """Fraction of tool calls whose output is an [ERROR].
+    """Fraction of *executed* tool calls whose output is an [ERROR].
 
-    Returns None when there are no tool calls at all (omit the score, same
+    Returns None when there are no executed tool calls (omit the score, same
     pattern as compute_cache_hit_rate) so an error-free session stays distinct
     from a session that ran no tools. The "[ERROR]" prefix is applied upstream
     in extract_tool_results.
+
+    Denied calls are excluded from both numerator and denominator: this score
+    measures execution health, and a call the user rejected or the auto-mode
+    classifier blocked never reached the tool. They arrive with is_error:true
+    like any failure, so counting them would read a permission event as a
+    broken command. See calculate_tool_denial_rate for the other axis.
     """
     total = 0
     errors = 0
     for t in turns:
         for tc in t.get("tool_calls", []):
+            output = str(tc.get("output", ""))
+            if output.startswith("[DENIED:"):
+                continue
             total += 1
-            if str(tc.get("output", "")).startswith("[ERROR]"):
+            if output.startswith("[ERROR]"):
                 errors += 1
     if total == 0:
         return None
     return round(errors / total, 4)
+
+
+def calculate_tool_denial_rate(turns: list[dict]) -> float | None:
+    """Fraction of attempted tool calls that were refused.
+
+    Denominator is every call the assistant attempted, denied ones included —
+    unlike tool_error_rate, which asks how the executed calls fared. Returns
+    None when no tool calls were attempted at all.
+    """
+    total = 0
+    denied = 0
+    for t in turns:
+        for tc in t.get("tool_calls", []):
+            total += 1
+            if str(tc.get("output", "")).startswith("[DENIED:"):
+                denied += 1
+    if total == 0:
+        return None
+    return round(denied / total, 4)
 
 
 def detect_compaction(transcript_path: str) -> bool:
@@ -2092,21 +2237,25 @@ def build_hook_score_events(
 ) -> list[dict]:
     """Build score-create events for the ingestion batch.
 
-    Emits up to two NUMERIC scores: cache_hit_rate and tool_error_rate. Each is
-    omitted when its classifier returns None (no cache activity / no tool calls)
-    so "absent" stays distinct from a genuine 0.0. Unused params are kept for
-    caller compatibility.
+    Emits up to three NUMERIC scores: cache_hit_rate, tool_error_rate and
+    tool_denial_rate. Each is omitted when its classifier returns None (no cache
+    activity / no executed calls / no attempted calls) so "absent" stays
+    distinct from a genuine 0.0. Unused params are kept for caller
+    compatibility.
     """
     now = datetime.now(timezone.utc).isoformat()
 
     cache_hit = compute_cache_hit_rate(turns)
     tool_err = calculate_tool_error_rate(turns)
+    tool_denial = calculate_tool_denial_rate(turns)
 
     scores = []
     if cache_hit is not None:
         scores.append({"name": "cache_hit_rate", "dataType": "NUMERIC", "value": cache_hit})
     if tool_err is not None:
         scores.append({"name": "tool_error_rate", "dataType": "NUMERIC", "value": tool_err})
+    if tool_denial is not None:
+        scores.append({"name": "tool_denial_rate", "dataType": "NUMERIC", "value": tool_denial})
 
     events = []
     for score in scores:
@@ -2188,6 +2337,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
     local_commands = extract_local_commands(transcript_path)
     file_history_stats = extract_file_history_stats(transcript_path)
     prompt_provenance = extract_prompt_provenance(transcript_path)
+    tool_denials = extract_tool_denials(transcript_path)
     stop_hook_stats = extract_stop_hook_stats(transcript_path)
     worktree_state = extract_worktree_state(transcript_path)
     api_error_messages = extract_api_error_messages(transcript_path)
@@ -2344,6 +2494,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 "session_kind": session_kind or None,
                 "attachments": attachments or None,
                 "prompt_provenance": prompt_provenance or None,
+                "tool_denials": tool_denials or None,
                 "local_commands": local_commands or None,
                 "file_snapshots": file_history_stats if file_history_stats["snapshot_count"] > 0 else None,
                 "stop_hook": stop_hook_stats if stop_hook_stats["total_hook_fires"] > 0 else None,

@@ -82,10 +82,13 @@ class TestExtractPromptProvenance:
 
     def test_tool_result_entries_without_origin_are_ignored(self, tmp_path):
         """The vast majority of `user` entries are tool results with no origin."""
+        tool_result = _user_entry(message={"role": "user", "content": [{
+            "type": "tool_result", "tool_use_id": "toolu_1", "content": "ok",
+        }]})
         path = _write(tmp_path, [
             _user_entry(origin={"kind": "human"}),
-            _user_entry(),
-            _user_entry(),
+            tool_result,
+            tool_result,
         ])
 
         result = hook.extract_prompt_provenance(path)
@@ -109,10 +112,27 @@ class TestExtractPromptProvenance:
         assert result["by_peer_agent"] == {"general-purpose": 1}
         assert "SECRET REPORT CONTENTS" not in json.dumps(result)
 
-    def test_returns_empty_dict_when_no_provenance_fields(self, tmp_path):
-        path = _write(tmp_path, [_user_entry(), _user_entry()])
+    def test_returns_empty_dict_when_nothing_is_a_prompt(self, tmp_path):
+        """Only tool results: no prompts to classify, tagged or untagged."""
+        tool_result = _user_entry(message={"role": "user", "content": [{
+            "type": "tool_result", "tool_use_id": "toolu_1", "content": "ok",
+        }]})
+        path = _write(tmp_path, [tool_result, tool_result])
 
         assert hook.extract_prompt_provenance(path) == {}
+
+    def test_untagged_prompts_are_classified_not_dropped(self, tmp_path):
+        """Entries with no origin/promptSource fall back to shape-based rules.
+
+        See test_prompt_provenance_fallback.py for the full rule set; this
+        pins the interaction with the tagged path.
+        """
+        path = _write(tmp_path, [_user_entry(), _user_entry()])
+
+        result = hook.extract_prompt_provenance(path)
+
+        assert result["human_prompts"] == 2
+        assert result["by_source"] == {"untagged": 2}
 
     def test_assistant_entries_are_ignored(self, tmp_path):
         path = _write(tmp_path, [
@@ -132,7 +152,10 @@ class TestExtractPromptProvenance:
 
         result = hook.extract_prompt_provenance(path)
 
-        assert result["by_origin"] == {"human": 1}
+        # The malformed one falls through to the untagged fallback rather than
+        # raising: it is still a `user` entry carrying prompt text.
+        assert result["by_origin"] == {"human": 2}
+        assert result["by_source"] == {"untagged": 1}
 
     def test_missing_file_returns_empty(self, tmp_path):
         assert hook.extract_prompt_provenance(str(tmp_path / "nope.jsonl")) == {}

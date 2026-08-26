@@ -11,7 +11,8 @@ Self-hosted Langfuse that captures every Claude Code interaction via the `Stop` 
 | Subagent invocations (Agent tool) | Nested generations + spans |
 | Token usage (input/output/cache read/cache write) | Generation usage |
 | Extended-thinking tokens (share of output) | Generation usage + trace metadata |
-| Prompt provenance (human / task-notification / peer subagent) | Trace metadata |
+| Prompt provenance (human / task-notification / peer subagent / agent-dispatch) | Trace metadata |
+| Tool denials (user-rejected / automode-blocked / automode-unavailable) | Trace metadata + score |
 | File edits (count, distinct files, backup depth) | Trace metadata |
 | Latency (per turn, per tool call) | startTime/endTime |
 | Time to first token | completionStartTime |
