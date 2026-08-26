@@ -114,3 +114,50 @@ class TestExtractLastApiError:
 
     def test_missing_file(self):
         assert sh.extract_last_api_error("/nonexistent/path.jsonl") == {}
+
+
+class TestSendBatchReportsRejections:
+    """The StopFailure hook POSTs to the same 207 endpoint as the main hook.
+
+    It advances no state, so a rejection here costs one stop-failure tag rather
+    than a window of turns — but logging a 100-char prefix of the body hid
+    rejections just the same, and `errors` trails `successes` in that body.
+    """
+
+    def _resp(self, body, status=207):
+        class MockResp:
+            def __init__(self):
+                self.status = status
+
+            def read(self):
+                return body.encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+        return MockResp()
+
+    def test_rejected_events_are_logged_as_an_error(self, monkeypatch):
+        body = json.dumps({"successes": [],
+                           "errors": [{"id": "evt-x", "status": 400, "message": "bad event"}]})
+        monkeypatch.setattr(sh, "urlopen", lambda req, timeout=10: self._resp(body))
+        logged = []
+        monkeypatch.setattr(sh, "log", lambda m: logged.append(m))
+
+        sh.send_batch([{"id": "evt-x"}])
+
+        assert any("[ERROR]" in m for m in logged)
+        assert any("evt-x" in m for m in logged)
+
+    def test_accepted_events_do_not_log_an_error(self, monkeypatch):
+        body = json.dumps({"successes": [{"id": "evt-x", "status": 201}], "errors": []})
+        monkeypatch.setattr(sh, "urlopen", lambda req, timeout=10: self._resp(body))
+        logged = []
+        monkeypatch.setattr(sh, "log", lambda m: logged.append(m))
+
+        sh.send_batch([{"id": "evt-x"}])
+
+        assert not any("[ERROR]" in m for m in logged)

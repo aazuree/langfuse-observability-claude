@@ -22,7 +22,12 @@ from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from langfuse_common import iter_transcript, log as common_log, make_auth_header
+from langfuse_common import (
+    classify_ingestion_errors,
+    iter_transcript,
+    log as common_log,
+    make_auth_header,
+)
 
 LANGFUSE_HOST = os.environ.get("LANGFUSE_HOST", "http://localhost:3100")
 LANGFUSE_PUBLIC_KEY = os.environ.get("LANGFUSE_PUBLIC_KEY", "")
@@ -91,7 +96,16 @@ def send_batch(batch: list[dict]) -> None:
     )
     try:
         with urlopen(req, timeout=10) as resp:
-            log(f"Langfuse response ({resp.status}): {resp.read().decode()[:100]}")
+            body = resp.read().decode()
+            transient, permanent, details = classify_ingestion_errors(body)
+            if transient or permanent:
+                # 207 means the request was accepted, not that the events were.
+                log(
+                    f"[ERROR] Langfuse rejected {transient + permanent} of {len(batch)} "
+                    f"event(s) ({resp.status}): " + " | ".join(details[:10])
+                )
+            else:
+                log(f"Langfuse accepted {len(batch)} events ({resp.status})")
     except URLError as e:
         log(f"Failed to send to Langfuse: {e}")
 
