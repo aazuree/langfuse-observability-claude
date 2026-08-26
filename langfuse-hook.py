@@ -35,7 +35,11 @@ LANGFUSE_PUBLIC_KEY = os.environ.get("LANGFUSE_PUBLIC_KEY", "")
 LANGFUSE_SECRET_KEY = os.environ.get("LANGFUSE_SECRET_KEY", "")
 INGESTION_URL = f"{LANGFUSE_HOST}/api/public/ingestion"
 
-LOG_FILE = os.path.expanduser("~/.claude/langfuse-hook.log")
+# LANGFUSE_HOOK_LOG lets the test suite redirect the log; without it a pytest run
+# writes fixture sessions into the production log and makes the tail useless.
+LOG_FILE = os.environ.get("LANGFUSE_HOOK_LOG") or os.path.expanduser(
+    "~/.claude/langfuse-hook.log"
+)
 STATE_DIR = os.path.expanduser("~/.claude/langfuse-state")
 PROJECTS_DIR = os.path.expanduser("~/.claude/projects")
 
@@ -471,6 +475,9 @@ def ingest_subagent(
             "cache_create": usage["cache_creation"],
             "cache_5m": turn.get("cache_ephemeral_5m", 0),
             "cache_1h": turn.get("cache_ephemeral_1h", 0),
+            # Subset of `output` (billed at the output rate), reported
+            # alongside it the same way cache_5m/cache_1h break down cache_create.
+            "output_thinking": turn.get("thinking_tokens", 0),
         }
 
         sa_metadata = {
@@ -774,23 +781,104 @@ def extract_attachments(transcript_path: str) -> dict:
     return {"count": total, "by_type": by_type}
 
 
+def extract_prompt_provenance(transcript_path: str) -> dict:
+    """Classify `user` entries by who or what authored them (CC 2.1.2xx).
+
+    Most `user` entries are tool results and carry none of these fields. The
+    ones that do are actual prompt submissions, tagged with:
+      - `origin.kind`: "human" | "task-notification" (a background task
+        reporting back) | "peer" (a subagent's report injected into the parent)
+      - `promptSource`: "typed" | "sdk" | "queued" | "suggestion_accepted"
+      - `turnCompanion: true`: a system-reminder companion message, not a prompt
+
+    Without this, machine-authored entries inflate the user-turn count.
+
+    Prompt text is never captured: a "peer" origin carries the subagent's whole
+    report in `body`, same PII reasoning that keeps `content` out of the
+    queue-operation rollup. Returns {} when no entry carries any of these fields.
+    """
+    by_origin: dict[str, int] = {}
+    by_source: dict[str, int] = {}
+    by_peer_agent: dict[str, int] = {}
+    companion_messages = 0
+    prompt_entries = 0
+
+    for entry in iter_transcript(transcript_path):
+        if entry.get("type") != "user":
+            continue
+        if entry.get("turnCompanion") is True:
+            companion_messages += 1
+        origin = entry.get("origin")
+        source = entry.get("promptSource")
+        if not isinstance(origin, dict) and not source:
+            continue
+        prompt_entries += 1
+        if isinstance(origin, dict):
+            kind = origin.get("kind")
+            if kind:
+                by_origin[kind] = by_origin.get(kind, 0) + 1
+            if kind == "peer":
+                # `from` is the agent *type* (e.g. "general-purpose"), not content.
+                sender = origin.get("from") or "unknown"
+                by_peer_agent[sender] = by_peer_agent.get(sender, 0) + 1
+        if source:
+            by_source[source] = by_source.get(source, 0) + 1
+
+    if not prompt_entries and not companion_messages:
+        return {}
+    return {
+        "prompt_entries": prompt_entries,
+        "human_prompts": by_origin.get("human", 0),
+        "by_origin": by_origin,
+        "by_source": by_source,
+        "by_peer_agent": by_peer_agent,
+        "companion_messages": companion_messages,
+    }
+
+
 def extract_file_history_stats(transcript_path: str) -> dict:
     """Aggregate stats from file-history-snapshot entries.
 
     Returns snapshot_count (total entries) and tracked_files_count
     (unique file paths across all trackedFileBackups dicts).
+
+    Also rolls up the sibling `file-history-delta` entries (CC 2.1.2xx), the
+    per-edit records: delta_count (edits made), edited_files_count (distinct
+    files touched) and max_backup_version (how many times the most-revised file
+    was rewritten). Snapshots are the periodic full picture; deltas are what
+    actually changed this session.
+
     File paths themselves are not captured to avoid leaking sensitive names.
     """
     snapshot_count = 0
+    delta_count = 0
+    max_backup_version = 0
     all_paths: set[str] = set()
+    edited_paths: set[str] = set()
     for entry in iter_transcript(transcript_path):
-        if entry.get("type") != "file-history-snapshot":
-            continue
-        snapshot_count += 1
-        backups = entry.get("snapshot", {}).get("trackedFileBackups", {})
-        if isinstance(backups, dict):
-            all_paths.update(backups.keys())
-    return {"snapshot_count": snapshot_count, "tracked_files_count": len(all_paths)}
+        etype = entry.get("type")
+        if etype == "file-history-snapshot":
+            snapshot_count += 1
+            backups = entry.get("snapshot", {}).get("trackedFileBackups", {})
+            if isinstance(backups, dict):
+                all_paths.update(backups.keys())
+        elif etype == "file-history-delta":
+            delta_count += 1
+            tracking_path = entry.get("trackingPath")
+            if tracking_path:
+                edited_paths.add(tracking_path)
+            backup = entry.get("backup")
+            if isinstance(backup, dict):
+                version = backup.get("version") or 0
+                if isinstance(version, int) and version > max_backup_version:
+                    max_backup_version = version
+    return {
+        "snapshot_count": snapshot_count,
+        "tracked_files_count": len(all_paths),
+        "delta_count": delta_count,
+        "edited_files_count": len(edited_paths),
+        "max_backup_version": max_backup_version,
+    }
 
 
 def extract_stop_hook_stats(transcript_path: str) -> dict:
@@ -1115,8 +1203,10 @@ def build_turns(entries: list[dict]) -> list[dict]:
                 tool_result_timestamps[tool_use_id] = me["timestamp"]
 
     # Deduplicate assistant messages: multiple entries share same message_id (streaming).
-    # For usage, take the LAST entry per message_id (has final accumulated tokens).
-    # The first entry with a message_id gives us the first-token time.
+    # For usage, take the FIRST entry per message_id: since v2.1.97 every entry
+    # sharing a message_id carries identical usage, so first == last and taking
+    # one of them is what keeps a streamed message from being counted twice.
+    # The first entry with a message_id also gives us the first-token time.
     msg_id_first_ts = {}  # message_id -> first timestamp seen
     msg_id_final_usage = {}  # message_id -> final usage dict
     msg_id_diagnostics = {}  # message_id -> diagnostics dict
@@ -1243,6 +1333,7 @@ def build_turns(entries: list[dict]) -> list[dict]:
         cache_ephemeral_5m = 0
         cache_ephemeral_1h = 0
         iteration_count = 0
+        thinking_tokens = 0
         cm_missed_tokens = 0
         cm_by_reason = {}
         for mid in turn["api_call_ids"]:
@@ -1270,6 +1361,11 @@ def build_turns(entries: list[dict]) -> list[dict]:
             cache_ephemeral_5m += cc.get("ephemeral_5m_input_tokens", 0)
             cache_ephemeral_1h += cc.get("ephemeral_1h_input_tokens", 0)
             iteration_count += len(u.get("iterations", []) or [])
+            # Extended-thinking token count. A breakdown *inside* output_tokens
+            # (billed at the output rate), so it is never added to usage totals.
+            otd = u.get("output_tokens_details")
+            if isinstance(otd, dict):
+                thinking_tokens += otd.get("thinking_tokens", 0) or 0
             cmr = msg_id_diagnostics.get(mid, {}).get("cache_miss_reason")
             if isinstance(cmr, dict):
                 cm_missed_tokens += cmr.get("cache_missed_input_tokens", 0) or 0
@@ -1288,6 +1384,7 @@ def build_turns(entries: list[dict]) -> list[dict]:
         turn["inference_geo"] = inference_geo
         turn["web_search_requests"] = web_search_requests
         turn["web_fetch_requests"] = web_fetch_requests
+        turn["thinking_tokens"] = thinking_tokens
         turn["cache_ephemeral_5m"] = cache_ephemeral_5m
         turn["cache_ephemeral_1h"] = cache_ephemeral_1h
         turn["iteration_count"] = iteration_count
@@ -1845,6 +1942,40 @@ def build_active_duration_summary(turns: list[dict]) -> dict | None:
     }
 
 
+def build_thinking_summary(turns: list[dict]) -> dict | None:
+    """Roll up extended-thinking token usage across the incremental turn batch.
+
+    `thinking_tokens` comes from `usage.output_tokens_details.thinking_tokens`
+    (CC 2.1.2xx). It is a breakdown *inside* `output_tokens`, billed at the
+    output rate, so this changes no cost — it exists to show what an effort
+    level actually buys. Note the token *count* survives even though CC has
+    stripped thinking *text* from the transcript since v2.1.112.
+
+    Returns `{total_thinking_tokens, total_output_tokens, share_of_output,
+    turns_with_thinking, max_thinking_tokens}`, or None when no turn in the batch
+    did any thinking (so untouched traces carry no empty metadata key).
+    `share_of_output` is None when output is 0. Computed over the incremental
+    `turns` batch, matching `total_iterations` / `active_duration`.
+    """
+    total_thinking = sum(t.get("thinking_tokens", 0) or 0 for t in turns)
+    if not total_thinking:
+        return None
+    total_output = sum((t.get("usage") or {}).get("output", 0) for t in turns)
+    return {
+        "total_thinking_tokens": total_thinking,
+        "total_output_tokens": total_output,
+        "share_of_output": (
+            round(total_thinking / total_output, 4) if total_output else None
+        ),
+        "turns_with_thinking": sum(
+            1 for t in turns if (t.get("thinking_tokens", 0) or 0) > 0
+        ),
+        "max_thinking_tokens": max(
+            (t.get("thinking_tokens", 0) or 0) for t in turns
+        ),
+    }
+
+
 # stop_reasons that are normal turn terminations (end_turn = done, tool_use =
 # paused to call a tool). Both are high-frequency and low-signal, so they get a
 # metadata rollup but no per-trace tag — only anomalous reasons (max_tokens =
@@ -2056,6 +2187,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
     attachments = extract_attachments(transcript_path)
     local_commands = extract_local_commands(transcript_path)
     file_history_stats = extract_file_history_stats(transcript_path)
+    prompt_provenance = extract_prompt_provenance(transcript_path)
     stop_hook_stats = extract_stop_hook_stats(transcript_path)
     worktree_state = extract_worktree_state(transcript_path)
     api_error_messages = extract_api_error_messages(transcript_path)
@@ -2211,6 +2343,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 "ai_title": ai_title or None,
                 "session_kind": session_kind or None,
                 "attachments": attachments or None,
+                "prompt_provenance": prompt_provenance or None,
                 "local_commands": local_commands or None,
                 "file_snapshots": file_history_stats if file_history_stats["snapshot_count"] > 0 else None,
                 "stop_hook": stop_hook_stats if stop_hook_stats["total_hook_fires"] > 0 else None,
@@ -2223,6 +2356,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 "active_duration": build_active_duration_summary(turns),
                 "stop_reasons": stop_reasons,
                 "cache_miss": build_cache_miss_summary(turns),
+                "thinking": build_thinking_summary(turns),
                 "effort_level": effort or None,
                 "worktree": worktree_state,
                 "background_tasks": background_tasks or None,
@@ -2315,6 +2449,9 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
             "cache_create": usage["cache_creation"],
             "cache_5m": turn.get("cache_ephemeral_5m", 0),
             "cache_1h": turn.get("cache_ephemeral_1h", 0),
+            # Subset of `output` (billed at the output rate), reported
+            # alongside it the same way cache_5m/cache_1h break down cache_create.
+            "output_thinking": turn.get("thinking_tokens", 0),
         }
 
         gen_body = {

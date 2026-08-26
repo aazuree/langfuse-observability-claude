@@ -10,6 +10,9 @@ Self-hosted Langfuse that captures every Claude Code interaction via the `Stop` 
 | Tool calls (Bash, Read, Edit, Write, Grep...) | Span (with input + output) |
 | Subagent invocations (Agent tool) | Nested generations + spans |
 | Token usage (input/output/cache read/cache write) | Generation usage |
+| Extended-thinking tokens (share of output) | Generation usage + trace metadata |
+| Prompt provenance (human / task-notification / peer subagent) | Trace metadata |
+| File edits (count, distinct files, backup depth) | Trace metadata |
 | Latency (per turn, per tool call) | startTime/endTime |
 | Time to first token | completionStartTime |
 | Cost estimate (Anthropic API equivalent rates) | costDetails |
@@ -176,6 +179,9 @@ Traces with subagents get `has-subagents` and `subagents:{count}` tags, and trac
 ```bash
 uv run pytest tests/ -v
 ```
+
+`tests/conftest.py` redirects `LANGFUSE_HOOK_LOG` to a temp directory, so a test
+run never appends fixture sessions to `~/.claude/langfuse-hook.log`.
 
 ## Cost Estimation
 
