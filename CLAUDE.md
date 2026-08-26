@@ -92,6 +92,8 @@ tests/
   test_pricing_drift.py          # Pricing drift-checker tests (offline, synthetic feeds)
   test_thinking_tokens.py        # output_tokens_details.thinking_tokens capture + rollup
   test_prompt_provenance.py      # origin.kind / promptSource / turnCompanion capture
+  test_prompt_provenance_fallback.py  # shape-based classification of untagged prompt entries
+  test_tool_denials.py           # toolDenialKind capture; denials kept out of tool_error_rate
   test_file_history_delta.py     # file-history-delta rollup (edits, distinct files, versions)
   test_log_isolation.py          # LOG_FILE env override + production-log isolation
   test_session_hooks.py          # StopFailure hook tests
@@ -260,9 +262,17 @@ geo prefixes); the substring matcher already bills all of them at the base rate.
 > Also observed in v2.1.211+: the random 3-word `slug` returned as a field on
 > `assistant`/`user` entries (see Trace Name precedence — deliberately not used for
 > naming), and `file-history-delta` entries alongside `file-history-snapshot`.
-> Not captured: `promptSource` (`typed`/`queued`/`suggestion_accepted`/`system`) and
-> `origin` (`{kind: human|task-notification}`) on user entries — a plausible future
-> "who drove this turn" signal, but no current dashboard need.
+> `promptSource` (`typed`/`queued`/`suggestion_accepted`/`sdk`/`system`) and `origin`
+> (`{kind: human|task-notification|peer}`) on user entries are captured as
+> `prompt_provenance`. Both are present on only a minority of prompt entries — 159 of
+> 599 across a 159-transcript census — so untagged ones are classified by shape
+> instead (`classify_untagged_prompt`): a `<command-name>` entry is a human prompt
+> via `slash_command` (75 of them, the largest untagged group), a sidechain root
+> (`isSidechain` with no `parentUuid`) is an `agent-dispatch` — the task prompt the
+> parent wrote for a subagent — and `isMeta` / `[Request interrupted by user]` /
+> `<local-command-stdout>` entries are counted separately as `meta_entries` and
+> `interruptions` rather than as prompts. Text is read only to match those markers,
+> never stored.
 >
 > New in v2.1.169–v2.1.181: assistant-channel API-error/auto-retry stubs
 > (`isApiErrorMessage`), user interrupts (`interruptedMessageId`), and the
@@ -486,12 +496,14 @@ Two heuristic scores are attached to every trace during ingestion:
 | Score | Type | Values | Source |
 |-------|------|--------|--------|
 | `cache_hit_rate` | Numeric | 0.0-1.0 | cache_read / (cache_read + cache_creation) |
-| `tool_error_rate` | Numeric | 0.0-1.0 | tool calls with `[ERROR]` output / total tool calls |
+| `tool_error_rate` | Numeric | 0.0-1.0 | executed calls with `[ERROR]` output / executed calls |
+| `tool_denial_rate` | Numeric | 0.0-1.0 | denied calls / all attempted calls |
 
-Both are deterministic (no LLM calls) and run on every Stop hook invocation.
+All three are deterministic (no LLM calls) and run on every Stop hook invocation.
 Scores use deterministic UUIDs so re-ingestion (`--reprocess`) updates rather
 than duplicates. Each score is omitted entirely when its denominator is zero
-(no cache activity / no tool calls), keeping "absent" distinct from a genuine 0.0.
+(no cache activity / no executed calls / no attempted calls), keeping "absent"
+distinct from a genuine 0.0.
 
 ### Classifier Details
 
@@ -499,6 +511,21 @@ than duplicates. Each score is omitted entirely when its denominator is zero
 0.0 = cache-miss session (only writes), 1.0 = fully warm. Omitted when there is
 no cache activity at all (filter by `cache_hit_rate IS NULL` to find cold sessions).
 
-**`tool_error_rate`** — Fraction of tool calls whose result was an error
-(`[ERROR]` prefix, applied in `extract_tool_results`). High values flag flaky
-sessions where tools repeatedly failed. Omitted when the session made no tool calls.
+**`tool_error_rate`** — Fraction of *executed* tool calls whose result was an
+error (`[ERROR]` prefix, applied in `extract_tool_results`). High values flag
+flaky sessions where tools repeatedly failed. Omitted when the session executed
+no tool calls.
+
+Denied calls are excluded from both numerator and denominator. Claude Code marks
+a refused call `is_error: true` exactly like a failed one, so without the
+`toolDenialKind` split a permission event reads as a broken command — in a
+census of 180 local sessions this inflated the score in 19 of them, one from a
+true 8.3% to 21.4%.
+
+**`tool_denial_rate`** — Fraction of *attempted* tool calls that were refused,
+so the denominator includes the denied ones. `extract_tool_denials` puts the
+breakdown in trace metadata as `tool_denials: {denial_count, by_kind}`. The
+kinds separate a judgement about the work from a property of the harness:
+`user-rejected` (the human declined), `automode-blocked` (the auto-mode
+classifier refused) and `automode-unavailable` (the classifier timed out).
+Omitted when the session attempted no tool calls.

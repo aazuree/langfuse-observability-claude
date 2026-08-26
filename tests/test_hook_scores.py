@@ -100,7 +100,7 @@ def test_build_hook_score_events_both_scores():
         total_cost=0.50,
     )
     by_name = {e["body"]["name"]: e for e in events}
-    assert set(by_name) == {"cache_hit_rate", "tool_error_rate"}
+    assert set(by_name) == {"cache_hit_rate", "tool_error_rate", "tool_denial_rate"}
 
     chr = by_name["cache_hit_rate"]
     assert chr["type"] == "score-create"
@@ -111,6 +111,12 @@ def test_build_hook_score_events_both_scores():
     ter = by_name["tool_error_rate"]
     assert ter["body"]["dataType"] == "NUMERIC"
     assert ter["body"]["value"] == 0.5  # 1 error / 2 calls
+
+    # Calls ran and none were denied: a genuine 0.0, distinct from the score
+    # being absent because nothing was attempted.
+    tdr = by_name["tool_denial_rate"]
+    assert tdr["body"]["dataType"] == "NUMERIC"
+    assert tdr["body"]["value"] == 0.0
 
 
 def test_build_hook_score_events_deterministic_ids():
