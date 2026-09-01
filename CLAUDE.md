@@ -274,7 +274,10 @@ geo prefixes); the substring matcher already bills all of them at the base rate.
 
 ## Tags and Metadata
 
-> Transcript-field coverage verified against Claude Code **v2.1.220** (2026-08-01).
+> Transcript-field coverage verified against Claude Code **v2.1.252** (2026-09-01). Changelog
+> v2.1.221–v2.1.252 reviewed for new transcript-JSONL fields — nothing found (changes were
+> hook-event additions (`PreModelSwitch`/`PostModelSwitch`), worktree/UI/TUI fixes, not new
+> transcript entry types).
 > Note: `agent_id`/`parent_agent_id` and skill `invocation_trigger` are OTel-span /
 > hook-stdin fields, **not** transcript JSONL — unreachable by this hook's transcript
 > parsing.
