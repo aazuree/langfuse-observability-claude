@@ -21,9 +21,8 @@ _spec.loader.exec_module(drift)
 hook = drift.load_hook()
 
 MTOK = 1_000_000
-# Before SONNET5_INTRO_END, so Sonnet 5 probes resolve to intro pricing.
+# Either side of the cancelled 2026-09-01 Sonnet 5 price step-up.
 INTRO_TS = "2026-07-15T00:00:00+00:00"
-# After SONNET5_INTRO_END, so Sonnet 5 probes resolve to standard pricing.
 STANDARD_TS = "2026-09-15T00:00:00+00:00"
 
 
@@ -53,16 +52,13 @@ class TestProbeRates:
             "cache_write_5m": 12.5, "cache_write_1h": 20.0,
         })
 
-    def test_probe_is_date_aware_for_sonnet_5(self):
-        """The probe must resolve the rate live on the given date, so the
-        comparison against a feed (which only publishes today's rate) is
-        apples-to-apples across the intro-pricing boundary."""
-        intro = drift.probe_rates(hook, "claude-sonnet-5", INTRO_TS)
-        standard = drift.probe_rates(hook, "claude-sonnet-5", STANDARD_TS)
-        assert intro["input"] == pytest.approx(2.0)
-        assert intro["output"] == pytest.approx(10.0)
-        assert standard["input"] == pytest.approx(3.0)
-        assert standard["output"] == pytest.approx(15.0)
+    def test_probe_sonnet_5_flat_across_dates(self):
+        """Sonnet 5 kept its $2/$10 launch rate past 2026-09-01, so the probe
+        resolves the same rate either side of the old cutoff."""
+        before = drift.probe_rates(hook, "claude-sonnet-5", INTRO_TS)
+        after = drift.probe_rates(hook, "claude-sonnet-5", STANDARD_TS)
+        assert before["input"] == after["input"] == pytest.approx(2.0)
+        assert before["output"] == after["output"] == pytest.approx(10.0)
 
     def test_probe_reports_zero_for_unknown_model(self, monkeypatch):
         monkeypatch.setattr(hook, "log", lambda msg: None)

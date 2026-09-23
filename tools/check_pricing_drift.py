@@ -17,7 +17,7 @@ update the table and CLAUDE.md by hand.
 What it does NOT cover (still manual):
   * Fast-mode multipliers (`FAST_MODE_MULTIPLIERS`)
   * Data-residency multiplier (`US_GEO_MULTIPLIER` / `inference_geo`)
-  * Date-aware introductory pricing windows (e.g. `SONNET5_INTRO_END`) — the
+  * Date-aware introductory pricing windows (none active today) — the
     feed only ever carries *today's* live rate, which is exactly what this
     script compares against.
   * Server-side tool billing (web search per-request cost)
@@ -50,6 +50,7 @@ FEED_TIMEOUT_S = 30
 
 # Model IDs to verify, in the order they should be reported.
 MODELS = [
+    "claude-opus-5-5",
     "claude-opus-5",
     "claude-opus-4-8",
     "claude-opus-4-7",

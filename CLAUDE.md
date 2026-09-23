@@ -161,21 +161,23 @@ uv run pytest tests/ -k "discover" -v  # Run tests matching pattern
 
 ## Cost Model
 
-Pricing is model-aware (per 1M tokens). Source: [platform.claude.com/docs/en/about-claude/pricing](https://platform.claude.com/docs/en/about-claude/pricing) (last verified 2026-08-01).
+Pricing is model-aware (per 1M tokens). Source: [platform.claude.com/docs/en/about-claude/pricing](https://platform.claude.com/docs/en/about-claude/pricing) (last verified 2026-09-23).
 
 | Model | Input | Output | Cache Read | Cache Write 5m | Cache Write 1h |
 |-------|-------|--------|------------|----------------|----------------|
 | Fable 5 / Mythos 5 | $10.00 | $50.00 | $1.00 | $12.50 | $20.00 |
+| Opus 5.5 | $4.00 | $20.00 | $0.20 | $5.00 | $8.00 |
 | Opus 5 / 4.8 / 4.7 / 4.6 / 4.5 | $5.00 | $25.00 | $0.50 | $6.25 | $10.00 |
 | Opus 4.1 / 4.0 (legacy) | $15.00 | $75.00 | $1.50 | $18.75 | $30.00 |
-| Sonnet 5 — intro (through 2026-08-31) | $2.00 | $10.00 | $0.20 | $2.50 | $4.00 |
-| Sonnet 5 — standard (from 2026-09-01) | $3.00 | $15.00 | $0.30 | $3.75 | $6.00 |
+| Sonnet 5 | $2.00 | $10.00 | $0.20 | $2.50 | $4.00 |
 | Sonnet 4.6 / 4.5 / 4 | $3.00 | $15.00 | $0.30 | $3.75 | $6.00 |
 | Haiku 4.5 | $1.00 | $5.00 | $0.10 | $1.25 | $2.00 |
 | Haiku 3.5 | $0.80 | $4.00 | $0.08 | $1.00 | $1.60 |
 | Haiku 3 (deprecated) | $0.25 | $1.25 | $0.03 | $0.30 | $0.50 |
 
-**Sonnet 5 intro pricing is date-aware.** `claude-sonnet-5` is billed at the introductory $2/$10 schedule for turns timestamped before `SONNET5_INTRO_END` (2026-09-01 UTC) and at standard $3/$15 from then on — selected by the turn's own `start_time`, so reprocessing a historical intro-period turn keeps billing it at intro rates (reprocess determinism). When a turn carries no parseable timestamp, Sonnet 5 falls back to the durable standard rate. All other Sonnet versions are flat $3/$15. **Flip reminder:** after 2026-08-31 the live rate is standard automatically (no code edit needed) — the constant and intro row stay for correct reprocessing of pre-cutoff turns.
+**Sonnet 5 is flat $2/$10.** It launched at $2/$10 billed as "introductory through 2026-08-31", with a step-up to $3/$15 on 2026-09-01. Anthropic cancelled the step-up and made $2/$10 the standard price (pricing page, verified 2026-09-23). The date switch (`SONNET5_INTRO_END`) was removed; `calculate_turn_cost` keeps its `turn_start_time` parameter for any future date-aware pricing window. All other Sonnet versions are flat $3/$15.
+
+**Fable 5.1 / Mythos 5.1** cache reads are $0.25 (0.025x input), not the $1.00 of Fable 5 / Mythos 5. Other rates are identical.
 
 **Opus 5** (`claude-opus-5`) bills at the same $5/$25 schedule as Opus 4.8 — a drop-in
 upgrade on price. It is a **separate rate-limit bucket** from the combined Opus 4.x pool,
@@ -183,6 +185,14 @@ which matters for capacity planning but not for cost. **Mythos 5** (`claude-myth
 Project Glasswing) is Fable 5's sibling: identical pricing and API surface, different ID —
 `calculate_turn_cost` matches `mythos` alongside `fable` so the invitation-only
 `claude-mythos-preview` resolves too.
+
+**Opus 5.5** (`claude-opus-5-5`) is **cheaper** than Opus 5: $4/$20, cache read $0.20. The
+cache reads are **0.05x** input (not 0.1x); cache writes $5 / $8. Same tokenizer as Opus 5, so token counts are comparable. Its
+**default effort is `medium`** (Opus 5: `high`), which is why `cost_by_model` splits by effort.
+Opus IDs resolve through `_opus_family()`, which parses `opus-<major>[-<minor>]` and treats an
+8-digit group as a date snapshot. It replaced substring matching: `"opus-5" in m` also
+matched `claude-opus-5-5` and billed it at $5/$25. An unknown minor (e.g. `claude-opus-5-6`)
+now hits the `[WARN]` + `$0` path instead of inheriting its predecessor's rate.
 
 **New-tokenizer note:** Opus 4.7+, Fable 5, **and Sonnet 5** ship a new tokenizer that produces ~30% more tokens for the same input text vs. prior models (Sonnet 4.6 and earlier keep the old tokenizer). Per-token rates are unchanged, but absolute session cost for equivalent workloads is meaningfully higher — the extra cost comes from token *counts* (already in `usageDetails`), not the rate table.
 
@@ -194,11 +204,11 @@ Cache write cost is split by tier when `cache_5m` / `cache_1h` are available in 
 
 These stack multiplicatively on the base rates above (and apply uniformly across input, output, cache read, and cache write tiers):
 
-- **Fast mode (`speed="fast"`)**: per-model premium — **2x** on Opus 5 and Opus 4.8 ($10/$50), **6x** on Opus 4.6 / 4.7 ($30/$150). Opus 4.5 and Sonnet/Haiku are ineligible and keep base rates. Multipliers live in `FAST_MODE_MULTIPLIERS` in `langfuse-hook.py`.
-  - Fast mode is now offered on **Opus 5 / 4.8 only** — `speed="fast"` on Opus 4.7 returns an API error, and the Opus 4.6 `-fast` model ID was retired (requests silently fall back to standard). The 4.6/4.7 entries stay in the table on purpose: turns recorded while fast mode was live on those generations *were* billed at 6x, and reprocessing must keep billing them that way.
+- **Fast mode (`speed="fast"`)**: per-model premium — **2x** on Opus 5.5 ($8/$40), Opus 5 and Opus 4.8 ($10/$50), **6x** on Opus 4.6 / 4.7 ($30/$150). Opus 4.5 and Sonnet/Haiku are ineligible and keep base rates. Multipliers live in `FAST_MODE_MULTIPLIERS` in `langfuse-hook.py`.
+  - Fast mode is now offered on **Opus 5.5 / 5 / 4.8 only** — `speed="fast"` on Opus 4.7 returns an API error, and the Opus 4.6 `-fast` model ID was retired (requests silently fall back to standard). The 4.6/4.7 entries stay in the table on purpose: turns recorded while fast mode was live on those generations *were* billed at 6x, and reprocessing must keep billing them that way.
 - **Fable 5 / Mythos 5**: ineligible for fast mode (no `/fast` variant) and data residency (`inference_geo` multiplier unverified) — always billed at base $10/$50. Update `calculate_turn_cost` if Anthropic publishes multipliers for them.
-- **Data residency (`inference_geo="us"`)**: 1.1x on Opus 4.6+ (including Opus 5) / Sonnet 4.6+ (including Sonnet 5). Other models do not support the `inference_geo` parameter; multiplier is not applied.
-- **Fast + US-geo stack**: 2x × 1.1x = 2.2x (Opus 5 / 4.8); 6x × 1.1x = 6.6x (Opus 4.6/4.7).
+- **Data residency (`inference_geo="us"`)**: 1.1x on Opus 4.6+ (including Opus 5 and 5.5) / Sonnet 4.6+ (including Sonnet 5). Other models do not support the `inference_geo` parameter; multiplier is not applied.
+- **Fast + US-geo stack**: 2x × 1.1x = 2.2x (Opus 5.5 / 5 / 4.8); 6x × 1.1x = 6.6x (Opus 4.6/4.7).
 
 ### Server-side Tool Billing
 
@@ -238,8 +248,8 @@ into `calculate_turn_cost()` unverified.
 latency to every turn, make cost depend on a third party's uptime, and silently re-bill
 historical turns whenever an upstream entry changed — and a wrong feed entry would produce
 confidently wrong costs, where today an unknown model produces an obvious `$0` plus a
-`[WARN]`. Date-aware pricing (`SONNET5_INTRO_END`) needs the rate that applied *at the
-turn's timestamp*; a live feed only ever carries today's rate.
+`[WARN]`. Any date-aware pricing window needs the rate that applied *at the turn's
+timestamp*; a live feed only ever carries today's rate.
 
 ### AWS Bedrock Pricing (reference)
 
@@ -259,9 +269,10 @@ endpoint; the premium is the same for US and EU.
 | Model | First-party API ($/1M in / out) | Bedrock global | Bedrock US/EU geo (`us.`/`eu.`, +10%) |
 |-------|----------------------------------|----------------|----------------------------------------|
 | Fable 5 | $10 / $50 | not on Bedrock | — |
+| Opus 5.5 | $4 / $20 | unverified | unverified |
 | Opus 5 | $5 / $25 | $5 / $25 | $5.50 / $27.50 |
 | Opus 4.8 / 4.7 / 4.6 | $5 / $25 | $5 / $25 | $5.50 / $27.50 |
-| Sonnet 5 (standard) | $3 / $15 | $3 / $15 | $3.30 / $16.50 |
+| Sonnet 5 | $2 / $10 | unverified | unverified |
 | Sonnet 4.x | $3 / $15 | $3 / $15 | $3.30 / $16.50 |
 | Haiku 4.5 | $1 / $5 | $1 / $5 | $1.10 / $5.50 |
 
@@ -270,7 +281,9 @@ transcripts do not expose the Bedrock endpoint type, so the matcher cannot tell 
 global call from a geo call and bills both at base. Fable 5 is not yet available on
 Bedrock. Canonical source: aws.amazon.com/bedrock/pricing (verified June 2026).
 Opus 5 ships on Bedrock as `anthropic.claude-opus-5` (plus `us.`/`eu.`/`au.`/`jp.`
-geo prefixes); the substring matcher already bills all of them at the base rate.
+geo prefixes); `_opus_family()` bills all of them (and `anthropic.claude-opus-5-5`) at
+the first-party base rate. The Bedrock rates for Opus 5.5 and Sonnet 5 have not been
+checked against aws.amazon.com/bedrock/pricing.
 
 ## Tags and Metadata
 
@@ -329,6 +342,8 @@ Each trace is enriched with:
 - `claude-code` — always present
 - repo/project name — derived from `cwd` (e.g., `langfuse-observability`)
 - model family — `opus`, `sonnet`, or `haiku`
+- `model:<id>` — one per distinct exact model ID in the batch (e.g. `model:claude-opus-5-5`), so Opus 5 and Opus 5.5 sessions can be filtered apart
+- `refusal:<category>` — one per distinct `stop_details.category` on refused turns (`cyber`, `bio`, `reasoning_extraction`, ...; null category → `uncategorized`). Opus 5.5 added `bio` and `reasoning_extraction` classifiers
 - entrypoint — `cli` or other launch method
 - `fast` — present if any turn used `/fast` mode
 - `has-errors` — present if API errors occurred during the session (`system/api_error` entries)
@@ -377,7 +392,9 @@ via Langfuse's upsert-on-id behaviour.
 - `api_error_messages` — **separate** assistant-channel error/retry summary from `isApiErrorMessage` entries (CC 2.1.179+/2.1.181 auto-retry): `{count, by_status (apiErrorStatus, e.g. 404/429/529), by_error (e.g. model_not_found/rate_limit), first_at, last_at}`, plus `max_retry_attempt` when any entry carries `retryAttempt`. Null when none. From `extract_api_error_messages()`. Distinct channel from `api_errors`; these stubs are skipped by `build_turns` so they don't pollute turn output.
 - `interrupts` — `{count}` of user interrupts (ESC mid-turn) from `interruptedMessageId` on `user` entries. A friction / misalignment signal. Null when none. From `extract_interrupts()`.
 - `queue_operations` — prompt-queue activity from `type:"queue-operation"` entries (prompts the user queued while the assistant was busy): `{operations: {<op>: n}, queued, executed, removed, total_wait_ms, max_wait_ms}`. `executed` = prompts pulled from the queue to run (`dequeue`/`popAll`); `removed` = queued prompts the user cancelled. Wait = time a prompt sat queued (enqueue→dequeue/popAll), matched **FIFO** (no per-prompt id → approximate); `remove` is excluded from wait stats. Prompt `content` is **not stored** (PII). Long waits = the user racing ahead of the agent (friction signal). Null when nothing was queued. From `extract_queue_operations()`.
-- `stop_reasons` — rollup of per-turn terminal `stop_reason` (the API's reason each turn ended): `{by_reason: {<reason>: count}, turns_counted, last}`. `last` = the terminal reason of the session's final turn that carried one (the outcome). Computed over the incremental turn batch (matches `total_iterations`/`active_duration`). Null when no turn carried a stop_reason. Anomalous reasons also surface as `stop-reason:<reason>` tags. From `build_stop_reasons_summary()`.
+- `stop_reasons` — rollup of per-turn terminal `stop_reason` (the API's reason each turn ended): `{by_reason: {<reason>: count}, turns_counted, last}`. `last` = the terminal reason of the session's final turn that carried one (the outcome). Computed over the incremental turn batch (matches `total_iterations`/`active_duration`). Null when no turn carried a stop_reason. Anomalous reasons also surface as `stop-reason:<reason>` tags. When any turn was refused, adds `refusal_categories: {<category>: count}` from the API's `stop_details.category` (null → `uncategorized`), also tagged `refusal:<category>`. From `build_stop_reasons_summary()`.
+- `cost_by_model` — per exact model ID: `{turns, input_tokens, output_tokens, cache_read_tokens, cache_create_tokens, cost_usd, by_effort: {<effort|unset>: {turns, cost_usd}}}`. Turns with no model go to `_missing`. Computed over the incremental turn batch. From `build_model_cost_breakdown()`.
+- `opus_5_5_savings` — Opus 5.5 turns re-priced at Opus 5 rates: `{turns, actual_cost_usd, opus_5_equivalent_cost_usd, saved_usd}`. An estimate: same token counts assumed (same tokenizer, but a different model and default effort would not spend exactly the same). Null without Opus 5.5 turns. From `build_opus_5_5_savings()`.
 - `active_duration` — session rollup of per-turn wall-clock from `system/turn_duration` entries: `{total_ms, turns_measured, max_ms}`. `total_ms` is *active* time (Σ per-turn `durationMs`, each turn start→end incl. tool execution) — distinct from the trace wall-clock span, which also counts idle time between turns. Computed over the incremental turn batch (matches `total_iterations`). Null when no turn carried a duration (CC before ~2.1.19x never emitted the entry). From `build_active_duration_summary()`.
 - `custom_title` — user-set session title (when present)
 - `permission_mode` — last permission mode observed
@@ -417,6 +434,7 @@ and away summaries are extracted via `extract_custom_title()`, `extract_ai_title
 - `attribution_skill`, `attribution_plugin` — primary skill / plugin for the turn (first non-empty observed)
 - `attribution_skills_all` — list of all distinct skills observed in the turn (only emitted when more than one)
 - `effort` — effort level for this turn (`low`/`medium`/`high`/`xhigh`/`max`), from the per-assistant-entry transcript field (CC 2.1.220+). Last non-empty value in the turn wins. Omitted on older transcripts. Pair with `usageDetails` to compare token spend across effort levels.
+- `refusal_category` — present only when the turn's terminal `stop_reason` is `refusal`: the `stop_details.category` (or `uncategorized`).
 - `iteration_count` — number of server-side iterations in the turn (length of `usage.iterations`; 0 when absent).
 - `ttft_ms` — time-to-first-token in ms (first assistant-token timestamp − turn start). Omitted when not derivable.
 - `duration_ms` — turn wall-clock in ms from the matching `system/turn_duration` entry (turn start→end, incl. tool execution). Also drives the generation `endTime`. Omitted when no `turn_duration` matched the turn (CC before ~2.1.19x). Rolled up session-wide as `active_duration`.
