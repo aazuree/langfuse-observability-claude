@@ -1327,6 +1327,10 @@ def build_turns(entries: list[dict]) -> list[dict]:
                 "usage": msg.get("usage", {}),
                 "request_id": entry.get("requestId", ""),
                 "stop_reason": msg.get("stop_reason", ""),
+                # Populated by the API only when stop_reason == "refusal":
+                # {type, category, explanation}. category is an open set
+                # (cyber, bio, reasoning_extraction, ...) or null.
+                "stop_details": msg.get("stop_details") if etype == "assistant" else None,
                 "diagnostics": msg.get("diagnostics", {}) if etype == "assistant" else {},
                 "attribution_skill": entry.get("attributionSkill", "") if etype == "assistant" else "",
                 "attribution_plugin": entry.get("attributionPlugin", "") if etype == "assistant" else "",
@@ -1401,6 +1405,7 @@ def build_turns(entries: list[dict]) -> list[dict]:
                     "api_call_ids": set(),
                     "messages": [me],
                     "stop_reason": "",
+                    "refusal_category": None,
                     "attribution_skill": "",
                     "attribution_plugin": "",
                     "attribution_skills_all": set(),
@@ -1426,6 +1431,13 @@ def build_turns(entries: list[dict]) -> list[dict]:
             # turn carries the terminal reason: end_turn, tool_use, etc.)
             if me.get("stop_reason"):
                 current_turn["stop_reason"] = me["stop_reason"]
+                # Tracks the terminal reason: a refusal later superseded in
+                # the same turn must not leave its category behind.
+                sd = me.get("stop_details")
+                current_turn["refusal_category"] = (
+                    (sd.get("category") if isinstance(sd, dict) else None)
+                    if me["stop_reason"] == "refusal" else None
+                )
 
             sk = me.get("attribution_skill", "")
             pl = me.get("attribution_plugin", "")
@@ -1714,29 +1726,29 @@ def extract_cwd(transcript_path: str) -> str:
 
 
 # Fast mode (research preview). Premium over base rates, per Opus generation:
-# Opus 4.6/4.7 = 6x ($30/$150); Opus 4.8 and Opus 5 = 2x ($10/$50). Multiplier
+# Opus 4.6/4.7 = 6x ($30/$150); Opus 4.8 and Opus 5 = 2x ($10/$50); Opus 5.5 =
+# 2x ($8/$40). Multiplier
 # applies uniformly to input, output, cache read, and both cache-write tiers.
 #
-# Fast mode is now offered on Opus 5 / Opus 4.8 only — `speed="fast"` on Opus 4.7
+# Fast mode is now offered on Opus 5.5 / Opus 5 / Opus 4.8 only — `speed="fast"` on Opus 4.7
 # returns an API error, and the Opus 4.6 `-fast` model ID was retired (silently
 # falls back to standard). The 4.6/4.7 entries are retained deliberately: turns
 # recorded while fast mode was live on those generations were billed at 6x, and
 # reprocessing must keep billing them that way (reprocess determinism).
 # Source: platform.claude.com/docs/en/about-claude/pricing#fast-mode-pricing (verified 2026-08-01)
+#
+# Keys are the family keys returned by _opus_family(), not substrings: a
+# substring lookup let "opus-5" claim claude-opus-5-5.
 FAST_MODE_MULTIPLIERS = {
     "opus-4-6": 6.0,
     "opus-4-7": 6.0,
     "opus-4-8": 2.0,
     "opus-5": 2.0,
+    "opus-5-5": 2.0,   # $8/$40
 }
 # Data residency: inference_geo="us" on Opus 4.6+/Sonnet 4.6+. 1.1x all categories.
 # Source: platform.claude.com/docs/en/about-claude/pricing#data-residency-pricing
 US_GEO_MULTIPLIER = 1.1
-# Sonnet 5 introductory pricing ($2/$10) runs through 2026-08-31; standard
-# ($3/$15) applies from 2026-09-01. Date-aware so reprocessing a historical turn
-# bills at the rate that applied at that turn's timestamp (reprocess determinism).
-# Source: platform.claude.com/docs/en/about-claude/pricing (verified 2026-06-30)
-SONNET5_INTRO_END = datetime(2026, 9, 1, tzinfo=timezone.utc)
 # Web search: $10 per 1,000 server-side search requests.
 # Source: platform.claude.com/docs/en/about-claude/pricing#web-search-tool
 WEB_SEARCH_COST_PER_REQUEST = 0.01
@@ -1783,6 +1795,27 @@ def _has_billable_tokens(usage: dict) -> bool:
     return any(usage.get(k, 0) for k in ("input", "output", "cache_read", "cache_creation"))
 
 
+# claude-opus-<major>[-<minor>][-<YYYYMMDD>], optionally prefixed (Bedrock
+# "anthropic." / "us.anthropic."). The minor is 1-2 digits; an 8-digit group
+# is a date snapshot, not a version, so claude-opus-5-20260401 is Opus 5.
+_OPUS_ID_RE = re.compile(r"opus-(\d+)(?:-(\d{1,2}))?(?![0-9])")
+
+
+def _opus_family(model: str) -> str:
+    """Pricing family key for an Opus model ID ("opus-5-5", "opus-5",
+    "opus-4-8", ...), or "" when the ID has no parseable Opus version.
+
+    Legacy IDs with the version before the name (claude-3-opus-*) and the dated
+    Opus 4.0 ID (claude-opus-4-20250514) return "opus-<major>" and are handled
+    by the legacy branch of calculate_turn_cost().
+    """
+    match = _OPUS_ID_RE.search(model.lower())
+    if not match:
+        return ""
+    major, minor = match.groups()
+    return f"opus-{major}-{minor}" if minor else f"opus-{major}"
+
+
 def calculate_turn_cost(
     usage: dict,
     model: str,
@@ -1798,12 +1831,13 @@ def calculate_turn_cost(
     cache_5m / cache_1h: per-tier cache creation token counts (from usageDetails).
     When provided, costs are split by tier; otherwise all cache_creation billed at 5m rate.
 
-    speed: "fast" applies a per-model premium (Opus 4.6/4.7 = 6x, Opus 4.8 = 2x).
+    speed: "fast" applies a per-model premium (Opus 4.6/4.7 = 6x; 4.8, 5, 5.5 = 2x).
     inference_geo: "us" applies 1.1x multiplier on Opus 4.6+/Sonnet 4.6+.
     web_search_requests: server-side web search calls, billed at $10/1000.
-    turn_start_time: ISO timestamp of the turn; selects Sonnet 5 intro vs standard
-        pricing by date (see SONNET5_INTRO_END). When empty/unparseable, Sonnet 5
-        falls back to standard ($3/$15) — the durable rate.
+    turn_start_time: ISO timestamp of the turn, for date-aware pricing windows so
+        reprocessing bills a historical turn at the rate live at the time. No
+        window is active today: Sonnet 5's $2/$10 "introductory" rate became its
+        standard rate, so the date switch it used was removed.
 
     Returns: (turn_cost, input_cost, output_cost, cost_details)
     """
@@ -1825,7 +1859,7 @@ def calculate_turn_cost(
     # When a new model releases, its name will fall through to Sonnet pricing and log a warning.
     # Update this function + CLAUDE.md Cost Model table when that happens.
     supports_inference_geo = False  # Only Opus 4.6+/Sonnet 4.6+ accept inference_geo
-    supports_fast_mode = False      # Only Opus 4.6/4.7/4.8 support /fast
+    supports_fast_mode = False      # Only Opus 4.6+ (excluding 4.5) support /fast
     if "haiku" in m:
         if "haiku-4" in m:                          # Haiku 4.5+
             p_in, p_out, p_cr, p_cc5, p_cc1 = 1.00, 5.00, 0.10, 1.25, 2.00
@@ -1834,16 +1868,21 @@ def calculate_turn_cost(
         else:                                        # Haiku 3
             p_in, p_out, p_cr, p_cc5, p_cc1 = 0.25, 1.25, 0.03, 0.30, 0.50
     elif "opus" in m:
-        # Whitelist of current Opus generations sharing the $5/$25 schedule.
-        # Substring matching previously over-billed any future "opus-4-9+"
-        # release at the legacy $15/$75 rate; whitelist forces the unknown-
-        # model WARN log to surface so the table can be updated explicitly.
-        # "opus-5" is matched separately from the 4.x family so a dated ID
-        # (claude-opus-5-2026...) resolves, while "claude-opus-4-5" — which
-        # does not contain the contiguous substring "opus-5" — cannot collide.
-        if any(x in m for x in ("opus-4-5", "opus-4-6", "opus-4-7", "opus-4-8", "opus-5")):
+        # Whitelist of current Opus generations. Substring matching previously
+        # over-billed any future "opus-4-9+" release at the legacy $15/$75 rate,
+        # and let "opus-5" swallow claude-opus-5-5 at the $5/$25 rate. An
+        # unrecognised generation hits the WARN path so the table gets updated.
+        family = _opus_family(m)
+        if family == "opus-5-5":
+            # Opus 5.5: $4/$20, cache writes $5/$8, cache read $0.20 (0.05x
+            # input, not the usual 0.1x). US data residency 1.1x (Claude 4.6+).
+            # Source: platform.claude.com/docs/en/about-claude/pricing (verified 2026-09-23)
+            p_in, p_out, p_cr, p_cc5, p_cc1 = 4.0, 20.0, 0.20, 5.00, 8.00
+            supports_inference_geo = True
+            supports_fast_mode = True
+        elif family in ("opus-4-5", "opus-4-6", "opus-4-7", "opus-4-8", "opus-5"):
             p_in, p_out, p_cr, p_cc5, p_cc1 = 5.0, 25.0, 0.50, 6.25, 10.0
-            if any(x in m for x in ("opus-4-6", "opus-4-7", "opus-4-8", "opus-5")):
+            if family != "opus-4-5":
                 supports_inference_geo = True
                 supports_fast_mode = True
         elif any(x in m for x in ("opus-4-1", "opus-4-20", "3-opus")):
@@ -1855,14 +1894,10 @@ def calculate_turn_cost(
             return 0.0, 0.0, 0.0, {}
     elif "sonnet" in m:                              # Sonnet (all versions)
         if "sonnet-5" in m:
-            # Sonnet 5: introductory $2/$10 through 2026-08-31, standard $3/$15
-            # from 2026-09-01. Chosen by the turn's own timestamp so reprocessing
-            # a historical intro-period turn keeps billing it at intro rates.
-            ts = parse_ts(turn_start_time) if turn_start_time else None
-            if ts is not None and ts < SONNET5_INTRO_END:
-                p_in, p_out, p_cr, p_cc5, p_cc1 = 2.0, 10.0, 0.20, 2.50, 4.00
-            else:
-                p_in, p_out, p_cr, p_cc5, p_cc1 = 3.0, 15.0, 0.30, 3.75, 6.00
+            # Sonnet 5: $2/$10. Launched as "introductory through 2026-08-31",
+            # then made the standard price; the $3/$15 step-up never happened.
+            # Source: platform.claude.com/docs/en/about-claude/pricing (verified 2026-09-23)
+            p_in, p_out, p_cr, p_cc5, p_cc1 = 2.0, 10.0, 0.20, 2.50, 4.00
             supports_inference_geo = True            # Sonnet 4.6+ accept inference_geo
         else:
             p_in, p_out, p_cr, p_cc5, p_cc1 = 3.0, 15.0, 0.30, 3.75, 6.00
@@ -1874,15 +1909,19 @@ def calculate_turn_cost(
         # supports_fast_mode / supports_inference_geo stay False: neither has a
         # /fast variant, and their data-residency multiplier is unverified.
         p_in, p_out, p_cr, p_cc5, p_cc1 = 10.00, 50.00, 1.00, 12.50, 20.00
+        if "fable-5-1" in m or "mythos-5-1" in m:
+            # 5.1 cache hits are 0.025x input ($0.25), not the usual 0.1x.
+            # Source: platform.claude.com/docs/en/about-claude/pricing (verified 2026-09-23)
+            p_cr = 0.25
     else:
         log(f"[WARN] calculate_turn_cost: unrecognised model '{model}' — cost reported as $0. "
             "Update calculate_turn_cost() and CLAUDE.md if this is a new Anthropic model.")
         return 0.0, 0.0, 0.0, {}
 
-    # Fast mode premium (per-model: Opus 4.6/4.7 = 6x, Opus 4.8 = 2x).
+    # Fast mode premium (per-model: Opus 4.6/4.7 = 6x; 4.8, 5, 5.5 = 2x).
     # Multipliers stack on top per spec. supports_fast_mode guarantees a key match.
     if speed == "fast" and supports_fast_mode:
-        fast_mult = next((v for k, v in FAST_MODE_MULTIPLIERS.items() if k in m), 1.0)
+        fast_mult = FAST_MODE_MULTIPLIERS.get(_opus_family(m), 1.0)
         p_in *= fast_mult
         p_out *= fast_mult
         p_cr *= fast_mult
@@ -2012,6 +2051,81 @@ def detect_compaction(transcript_path: str) -> bool:
     return False
 
 
+def _turn_cost_usd(turn: dict, model: str | None = None) -> float:
+    """Total cost of one built turn. `model` overrides the turn's own model,
+    for counterfactual pricing of the same token usage."""
+    cost, _i, _o, _cd = calculate_turn_cost(
+        turn.get("usage") or {},
+        (turn.get("model") or "") if model is None else model,
+        turn.get("cache_ephemeral_5m", 0),
+        turn.get("cache_ephemeral_1h", 0),
+        speed=turn.get("speed", ""),
+        inference_geo=turn.get("inference_geo", ""),
+        web_search_requests=turn.get("web_search_requests", 0),
+        turn_start_time=turn.get("start_time", ""),
+    )
+    return cost
+
+
+def build_model_cost_breakdown(turns: list[dict]) -> dict | None:
+    """Per-model rollup of turns, tokens and cost, split by effort level.
+
+    `model_families` tags lump every Opus together, so a mid-session switch
+    (Opus 5 -> Opus 5.5) is invisible without this. `by_effort` exists because
+    Opus 5.5 defaults to effort `medium` where Opus 5 defaults to `high`:
+    comparing the two models without it mixes a price change with an effort
+    change. Turns without an effort field land in "unset". Turns without a
+    model land in "_missing". None when there are no turns.
+    """
+    if not turns:
+        return None
+    breakdown: dict[str, dict] = {}
+    for t in turns:
+        usage = t.get("usage") or {}
+        cost = _turn_cost_usd(t)
+        b = breakdown.setdefault(t.get("model") or "_missing", {
+            "turns": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "cache_read_tokens": 0,
+            "cache_create_tokens": 0,
+            "cost_usd": 0.0,
+            "by_effort": {},
+        })
+        b["turns"] += 1
+        b["input_tokens"] += usage.get("input", 0)
+        b["output_tokens"] += usage.get("output", 0)
+        b["cache_read_tokens"] += usage.get("cache_read", 0)
+        b["cache_create_tokens"] += usage.get("cache_creation", 0)
+        b["cost_usd"] = round(b["cost_usd"] + cost, 6)
+        e = b["by_effort"].setdefault(t.get("effort") or "unset",
+                                      {"turns": 0, "cost_usd": 0.0})
+        e["turns"] += 1
+        e["cost_usd"] = round(e["cost_usd"] + cost, 6)
+    return breakdown
+
+
+def build_opus_5_5_savings(turns: list[dict]) -> dict | None:
+    """What this batch's Opus 5.5 turns cost versus the same usage on Opus 5.
+
+    Opus 5.5 shares Opus 5's tokenizer, so re-pricing identical token counts is
+    a fair rate comparison. It is still an estimate: it assumes the turn would
+    have used the same tokens on Opus 5, which a different model (and its
+    different default effort) would not exactly do. None without Opus 5.5 turns.
+    """
+    o55 = [t for t in turns if _opus_family(t.get("model") or "") == "opus-5-5"]
+    if not o55:
+        return None
+    actual = sum(_turn_cost_usd(t) for t in o55)
+    baseline = sum(_turn_cost_usd(t, model="claude-opus-5") for t in o55)
+    return {
+        "turns": len(o55),
+        "actual_cost_usd": round(actual, 6),
+        "opus_5_equivalent_cost_usd": round(baseline, 6),
+        "saved_usd": round(baseline - actual, 6),
+    }
+
+
 def build_skill_attribution_summary(turns: list[dict]) -> dict | None:
     """Aggregate skill / plugin attribution across all turns.
 
@@ -2051,17 +2165,7 @@ def build_skill_attribution_summary(turns: list[dict]) -> dict | None:
         b["output_tokens"] += usage.get("output", 0)
         b["cache_read_tokens"] += usage.get("cache_read", 0)
         b["cache_create_tokens"] += usage.get("cache_creation", 0)
-        turn_cost, _i, _o, _cd = calculate_turn_cost(
-            usage,
-            t.get("model") or "",
-            t.get("cache_ephemeral_5m", 0),
-            t.get("cache_ephemeral_1h", 0),
-            speed=t.get("speed", ""),
-            inference_geo=t.get("inference_geo", ""),
-            web_search_requests=t.get("web_search_requests", 0),
-            turn_start_time=t.get("start_time", ""),
-        )
-        b["cost_usd"] = round(b["cost_usd"] + turn_cost, 6)
+        b["cost_usd"] = round(b["cost_usd"] + _turn_cost_usd(t), 6)
 
     top_skill = ""
     if skill_turn_counts:
@@ -2170,11 +2274,13 @@ def build_stop_reasons_summary(turns: list[dict]) -> dict | None:
     (`end_turn`, `tool_use`, `max_tokens`, `stop_sequence`, `refusal`,
     `pause_turn`, ...), set in `build_turns` (latest non-empty per turn). Returns a
     `{by_reason, turns_counted, last}` rollup, or None when no turn carried a
-    stop_reason. `last` is the terminal reason of the final turn that had one —
+    stop_reason. When any turn was refused, `refusal_categories` counts the
+    `stop_details.category` values (null category -> "uncategorized"). `last` is the terminal reason of the final turn that had one —
     the session's outcome. Computed over the incremental `turns` batch, matching
     `total_iterations` / `active_duration`.
     """
     by_reason = {}
+    refusal_categories = {}
     last = None
     for t in turns:
         r = t.get("stop_reason")
@@ -2182,13 +2288,19 @@ def build_stop_reasons_summary(turns: list[dict]) -> dict | None:
             continue
         by_reason[r] = by_reason.get(r, 0) + 1
         last = r
+        if r == "refusal":
+            cat = t.get("refusal_category") or "uncategorized"
+            refusal_categories[cat] = refusal_categories.get(cat, 0) + 1
     if not by_reason:
         return None
-    return {
+    summary = {
         "by_reason": by_reason,
         "turns_counted": sum(by_reason.values()),
         "last": last,
     }
+    if refusal_categories:
+        summary["refusal_categories"] = refusal_categories
+    return summary
 
 
 def extract_queue_operations(transcript_path: str) -> dict | None:
@@ -2330,6 +2442,8 @@ def gen_metadata_attribution(turn: dict) -> dict:
         out["attribution_skills_all"] = list(all_skills)
     if turn.get("effort"):
         out["effort"] = turn["effort"]
+    if turn.get("stop_reason") == "refusal":
+        out["refusal_category"] = turn.get("refusal_category") or "uncategorized"
     return out
 
 
@@ -2493,6 +2607,12 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
         for r in sorted((stop_reasons or {}).get("by_reason", {}))
         if r not in NORMAL_STOP_REASONS
     ]
+    refusal_tags = [
+        f"refusal:{c}" for c in sorted((stop_reasons or {}).get("refusal_categories", {}))
+    ]
+    # Exact model IDs alongside the family tags, so Opus 5 and Opus 5.5
+    # sessions can be filtered apart.
+    model_tags = sorted({f"model:{t['model']}" for t in turns if t.get("model")})
 
     # 1. Trace
     batch.append({
@@ -2540,6 +2660,8 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 "total_iterations": sum(t.get("iteration_count", 0) for t in turns),
                 "active_duration": build_active_duration_summary(turns),
                 "stop_reasons": stop_reasons,
+                "cost_by_model": build_model_cost_breakdown(turns),
+                "opus_5_5_savings": build_opus_5_5_savings(turns),
                 "cache_miss": build_cache_miss_summary(turns),
                 "thinking": build_thinking_summary(turns),
                 "effort_level": effort or None,
@@ -2554,6 +2676,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 "claude-code",
                 repo_name or None,
                 *sorted(model_families),
+                *model_tags,
                 session_meta.get("entrypoint") or None,
                 "fast" if has_fast else None,
                 "has-errors" if has_errors else None,
@@ -2572,6 +2695,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 "permission-bypass" if (permission_timeline or {}).get("ever_bypass") else None,
                 *compact_trigger_tags,
                 *stop_reason_tags,
+                *refusal_tags,
                 *attribution_tags,
                 *pr_tags,
             ] if t],

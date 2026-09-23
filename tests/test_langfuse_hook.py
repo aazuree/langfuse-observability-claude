@@ -993,56 +993,49 @@ class TestCalculateTurnCost:
         assert abs(inp_cost - 3.0) < 0.001  # $3/1M input
         assert abs(out_cost - 15.0) < 0.001  # $15/1M output
 
-    # ----- Sonnet 5: date-aware intro ($2/$10 thru 2026-08-31) vs standard ($3/$15) -----
+    # ----- Sonnet 5: flat $2/$10 (the "introductory" rate became standard) -----
 
-    def test_sonnet_5_intro_pricing_before_cutoff(self):
-        usage = self._usage(inp=1_000_000, out=1_000_000)
-        cost, inp_cost, out_cost, details = hook.calculate_turn_cost(
-            usage, "claude-sonnet-5", turn_start_time="2026-07-15T10:00:00+00:00"
-        )
-        assert abs(inp_cost - 2.0) < 0.001   # intro $2/1M input
-        assert abs(out_cost - 10.0) < 0.001  # intro $10/1M output
-
-    def test_sonnet_5_standard_pricing_after_cutoff(self):
-        usage = self._usage(inp=1_000_000, out=1_000_000)
-        cost, inp_cost, out_cost, details = hook.calculate_turn_cost(
-            usage, "claude-sonnet-5", turn_start_time="2026-09-15T10:00:00+00:00"
-        )
-        assert abs(inp_cost - 3.0) < 0.001   # standard $3/1M input
-        assert abs(out_cost - 15.0) < 0.001  # standard $15/1M output
-
-    def test_sonnet_5_no_timestamp_defaults_to_standard(self):
+    def test_sonnet_5_pricing(self):
         usage = self._usage(inp=1_000_000, out=1_000_000)
         cost, inp_cost, out_cost, details = hook.calculate_turn_cost(usage, "claude-sonnet-5")
-        assert abs(inp_cost - 3.0) < 0.001
-        assert abs(out_cost - 15.0) < 0.001
+        assert abs(inp_cost - 2.0) < 0.001   # $2/1M input
+        assert abs(out_cost - 10.0) < 0.001  # $10/1M output
 
-    def test_sonnet_5_intro_cache_tiers(self):
-        # Intro cache: read $0.20, write-5m $2.50, write-1h $4.00 per 1M
+    def test_sonnet_5_no_step_up_after_sept_1(self):
+        # The scheduled 2026-09-01 increase to $3/$15 was cancelled.
+        usage = self._usage(inp=1_000_000, out=1_000_000)
+        for ts in ("2026-07-15T10:00:00+00:00", "2026-09-01T00:00:00+00:00",
+                   "2026-09-15T10:00:00+00:00"):
+            _c, inp_cost, out_cost, _d = hook.calculate_turn_cost(
+                usage, "claude-sonnet-5", turn_start_time=ts
+            )
+            assert abs(inp_cost - 2.0) < 0.001, ts
+            assert abs(out_cost - 10.0) < 0.001, ts
+
+    def test_sonnet_5_cache_tiers(self):
+        # Cache: read $0.20, write-5m $2.50, write-1h $4.00 per 1M
         usage = self._usage(cache_read=1_000_000, cache_creation=1_000_000)
         cost, _i, _o, details = hook.calculate_turn_cost(
             usage, "claude-sonnet-5", cache_5m=0, cache_1h=1_000_000,
-            turn_start_time="2026-07-15T10:00:00+00:00",
         )
         assert abs(details["cache_read_input_tokens"] - 0.20) < 0.001
         assert abs(details["cache_creation_input_tokens"] - 4.00) < 0.001
-
-    def test_sonnet_5_intro_boundary_is_exclusive_at_sept_1(self):
-        # 2026-09-01T00:00:00Z is the first standard-priced instant.
-        usage = self._usage(inp=1_000_000, out=1_000_000)
-        _c, inp_cost, _o, _d = hook.calculate_turn_cost(
-            usage, "claude-sonnet-5", turn_start_time="2026-09-01T00:00:00+00:00"
-        )
-        assert abs(inp_cost - 3.0) < 0.001   # standard, not intro
 
     def test_sonnet_5_us_geo_eligible(self):
         # Sonnet 5 is >= 4.6, so inference_geo="us" applies the 1.1x premium.
         usage = self._usage(inp=1_000_000, out=1_000_000)
         _c, inp_cost, _o, _d = hook.calculate_turn_cost(
             usage, "claude-sonnet-5", inference_geo="us",
-            turn_start_time="2026-09-15T10:00:00+00:00",
         )
-        assert abs(inp_cost - 3.0 * 1.1) < 0.001  # $3 * 1.1 (standard rate * geo)
+        assert abs(inp_cost - 2.0 * 1.1) < 0.001
+
+    def test_fable_5_1_cache_read_is_0_025x(self):
+        usage = self._usage(cache_read=1_000_000)
+        for model in ("claude-fable-5-1", "claude-mythos-5-1"):
+            _c, _i, _o, details = hook.calculate_turn_cost(usage, model)
+            assert abs(details["cache_read_input_tokens"] - 0.25) < 0.001, model
+        _c, _i, _o, details = hook.calculate_turn_cost(usage, "claude-fable-5")
+        assert abs(details["cache_read_input_tokens"] - 1.00) < 0.001
 
     def test_opus_pricing_new(self):
         # Opus 4.5 / 4.6: $5 input, $25 output
@@ -1250,8 +1243,8 @@ class TestCalculateTurnCost:
         ("claude-opus-4-7-20260415",     5.0,   25.0),
         ("claude-opus-4-6",              5.0,   25.0),
         ("claude-opus-4-5-20251101",     5.0,   25.0),
-        ("claude-sonnet-5",              3.0,   15.0),  # no timestamp → standard rate
-        ("anthropic.claude-sonnet-5",    3.0,   15.0),
+        ("claude-sonnet-5",              2.0,   10.0),
+        ("anthropic.claude-sonnet-5",    2.0,   10.0),
         ("claude-sonnet-4-6",            3.0,   15.0),
         ("claude-sonnet-4-5-20250929",   3.0,   15.0),
         ("claude-sonnet-4-20250514",     3.0,   15.0),
