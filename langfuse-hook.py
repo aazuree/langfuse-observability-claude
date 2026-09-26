@@ -3214,8 +3214,13 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
         log(f"[WARN] Send failed — {summary}; state not advanced, will retry next fire")
 
 
-def delete_trace(trace_id: str) -> None:
-    """Delete a trace and all its observations from Langfuse."""
+def delete_trace(trace_id: str) -> bool:
+    """Delete a trace and all its observations. True when it is gone.
+
+    Langfuse deletes asynchronously: the call returns before the cascade
+    finishes, which is why reprocess_all never calls this (a late cascade
+    would wipe freshly ingested observations). A 404 means already gone.
+    """
     url = f"{LANGFUSE_HOST}/api/public/traces/{trace_id}"
     req = Request(
         url,
@@ -3224,9 +3229,44 @@ def delete_trace(trace_id: str) -> None:
     )
     try:
         with urlopen(req, timeout=15):
-            pass
-    except (URLError, TimeoutError, OSError):
-        pass
+            return True
+    except HTTPError as e:
+        if e.code == 404:
+            return True
+        log(f"[ERROR] Failed to delete {trace_id}: HTTP {e.code} {e.reason}")
+    except (URLError, TimeoutError, OSError) as e:
+        log(f"[ERROR] Failed to delete {trace_id}: {e}")
+    return False
+
+
+def delete_all_traces() -> int:
+    """Delete the trace of every local session and reset its hook state.
+
+    For migrations that renumber turns (generation IDs are keyed on the turn
+    index): without this, --reprocess writes new generations beside the old
+    ones. State is reset too, so the next live fire re-sends the whole
+    session instead of only its new lines. Returns the number of failures.
+
+    Run --reprocess only after Langfuse has finished the deletes.
+    """
+    if not LANGFUSE_PUBLIC_KEY or not LANGFUSE_SECRET_KEY:
+        print("Error: LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY must be set")
+        return 1
+    transcripts = sorted((Path.home() / ".claude" / "projects").glob("*/*.jsonl"))
+    failures = 0
+    for idx, transcript in enumerate(transcripts, 1):
+        session_id = sanitize_id(transcript.stem)
+        ok = delete_trace(f"trace-{session_id}")
+        failures += not ok
+        for suffix in (".offset", ".subagents.json"):
+            state_file = Path(STATE_DIR) / f"{session_id}{suffix}"
+            if state_file.exists():
+                state_file.unlink()
+        print(f"[{idx}/{len(transcripts)}] {'deleted' if ok else 'FAILED '} trace-{session_id}")
+    print(f"\nDone: {len(transcripts) - failures} deleted, {failures} failed. "
+          "Langfuse deletes asynchronously — wait until the traces are gone "
+          "from the UI before running --reprocess.")
+    return failures
 
 
 def reprocess_all() -> None:
@@ -3282,6 +3322,8 @@ def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "--reprocess":
         reprocess_all()
         return
+    if len(sys.argv) > 1 and sys.argv[1] == "--delete-traces":
+        sys.exit(1 if delete_all_traces() else 0)
 
     try:
         hook_input = json.load(sys.stdin)

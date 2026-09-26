@@ -567,8 +567,10 @@ Trace (parent session)
 - **Turn numbering changed (2026-09-26).** Generation IDs are `uuid5(session:turn:<index>)`.
   Merging consecutive user entries into one turn shifted the index of most turns, so a
   plain `--reprocess` would add new generations beside the old ones and double-count cost.
-  Delete the existing traces first (and wait for Langfuse's async delete to finish), then
-  reprocess.
+  Migrate with `python3 langfuse-hook.py --delete-traces` (same host/key env as
+  `--reprocess`; deletes `trace-<id>` for every local transcript and resets its state),
+  wait until the traces are gone from the UI — Langfuse deletes asynchronously — then
+  `--reprocess`.
 
 - `.env` contains generated secrets - never commit it
 - Hook errors are logged but never block Claude Code (async, fire-and-forget)
