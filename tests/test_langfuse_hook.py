@@ -2343,10 +2343,10 @@ class TestProcessSession:
             for evt in batch
             if evt["type"] == "generation-create"
         ]
-        # Must be exactly Turn 1, Turn 2, Turn 3 — not Turn 1, Turn 3, Turn 5
-        assert gen_names[0].startswith("Turn 1:")
-        assert gen_names[1].startswith("Turn 2:")
-        assert gen_names[2].startswith("Turn 3:")
+        # Must be exactly Turn 1, Turn 2, Turn 3 — not Turn 1, Turn 3, Turn 5.
+        # Each fire also re-sends the previous turn (for its late
+        # turn_duration) under the same name, so compare distinct names.
+        assert sorted({n.split(":")[0] for n in gen_names}) == ["Turn 1", "Turn 2", "Turn 3"]
 
     def test_tool_spans_created(self, tmp_path, monkeypatch):
         state_dir = tmp_path / "state"

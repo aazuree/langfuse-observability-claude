@@ -153,7 +153,9 @@ uv run pytest tests/ -k "discover" -v  # Run tests matching pattern
 - Session IDs sanitized via `sanitize_id()` to prevent path traversal
 - State files are written with `atomic_write_text()` (temp file + `os.replace`), so a crash mid-write cannot truncate an offset back to 0
 - Both hooks wrap their entry point: an unexpected exception is logged as `[ERROR] … crashed` with its traceback instead of vanishing to stderr. `--reprocess` logs and skips a failing session rather than aborting the run
-- Incremental processing: state files track processed line offsets per session
+- Incremental processing: state files track the processed line offset and turn count per session. A fire with no new lines sends nothing
+- **Every trace rollup covers the whole session.** Each fire reads the transcript once, builds every turn, and computes all trace metadata, tags and scores from all of them — each fire upserts the same trace, so a rollup built from only the new lines would overwrite the session's numbers with one fire's worth. Generations are sent only from the last turn a previous fire sent onward: that turn is re-sent (same ID) because Claude Code writes its `system/turn_duration` *after* the Stop hook runs
+- Trace metadata never carries `null`: Langfuse merges metadata key by key and a null erases the value an earlier fire wrote, so absent rollups are omitted
 - Deterministic event IDs (UUID5) prevent duplicates on re-ingestion
 - Batch sends in chunks of 50 events to Langfuse ingestion API
 
@@ -397,16 +399,20 @@ use the first prompt; once `agent-name` appears, subsequent fires update the tra
 via Langfuse's upsert-on-id behaviour.
 
 **Trace Metadata** (structured key-value on trace):
+All rollups below are computed over the **whole session** on every fire. Keys
+whose value would be null are omitted rather than sent as null (a null would
+erase an earlier fire's value in Langfuse's key-by-key metadata merge).
 - `git_branch`, `cli_version`, `entrypoint`, `repo_name`, `cwd`
 - `turn_count`, `tool_calls_total`, `total_tokens`, `total_input_tokens`, `total_output_tokens`
+- `session_cost_usd` — cost of every parent (non-subagent) turn in the session; equals `subagent_costs.parent_cost` when subagents exist
 - `api_errors` — error summary from `system/api_error` entries: `total_count`, `by_status` (HTTP codes), `first_error_at`, `last_error_at`
 - `api_error_messages` — **separate** assistant-channel error/retry summary from `isApiErrorMessage` entries (CC 2.1.179+/2.1.181 auto-retry): `{count, by_status (apiErrorStatus, e.g. 404/429/529), by_error (e.g. model_not_found/rate_limit), first_at, last_at}`, plus `max_retry_attempt` when any entry carries `retryAttempt`. Null when none. From `extract_api_error_messages()`. Distinct channel from `api_errors`; these stubs are skipped by `build_turns` so they don't pollute turn output.
 - `interrupts` — `{count}` of user interrupts (ESC mid-turn) from `interruptedMessageId` on `user` entries. A friction / misalignment signal. Null when none. From `extract_interrupts()`.
 - `queue_operations` — prompt-queue activity from `type:"queue-operation"` entries (prompts the user queued while the assistant was busy): `{operations: {<op>: n}, queued, executed, removed, total_wait_ms, max_wait_ms}`. `executed` = prompts pulled from the queue to run (`dequeue`/`popAll`); `removed` = queued prompts the user cancelled. Wait = time a prompt sat queued (enqueue→dequeue/popAll), matched **FIFO** (no per-prompt id → approximate); `remove` is excluded from wait stats. Prompt `content` is **not stored** (PII). Long waits = the user racing ahead of the agent (friction signal). Null when nothing was queued. From `extract_queue_operations()`.
-- `stop_reasons` — rollup of per-turn terminal `stop_reason` (the API's reason each turn ended): `{by_reason: {<reason>: count}, turns_counted, last}`. `last` = the terminal reason of the session's final turn that carried one (the outcome). Computed over the incremental turn batch (matches `total_iterations`/`active_duration`). Null when no turn carried a stop_reason. Anomalous reasons also surface as `stop-reason:<reason>` tags. When any turn was refused, adds `refusal_categories: {<category>: count}` from the API's `stop_details.category` (null → `uncategorized`), also tagged `refusal:<category>`. From `build_stop_reasons_summary()`.
-- `cost_by_model` — per exact model ID: `{turns, input_tokens, output_tokens, cache_read_tokens, cache_create_tokens, cost_usd, by_effort: {<effort|unset>: {turns, cost_usd}}}`. Turns with no model go to `_missing`. Computed over the incremental turn batch. From `build_model_cost_breakdown()`.
+- `stop_reasons` — rollup of per-turn terminal `stop_reason` (the API's reason each turn ended): `{by_reason: {<reason>: count}, turns_counted, last}`. `last` = the terminal reason of the session's final turn that carried one (the outcome). Null when no turn carried a stop_reason. Anomalous reasons also surface as `stop-reason:<reason>` tags. When any turn was refused, adds `refusal_categories: {<category>: count}` from the API's `stop_details.category` (null → `uncategorized`), also tagged `refusal:<category>`. From `build_stop_reasons_summary()`.
+- `cost_by_model` — per exact model ID: `{turns, input_tokens, output_tokens, cache_read_tokens, cache_create_tokens, cost_usd, by_effort: {<effort|unset>: {turns, cost_usd}}}`. Turns with no model go to `_missing`. From `build_model_cost_breakdown()`.
 - `opus_5_5_savings` — Opus 5.5 turns re-priced at Opus 5 rates: `{turns, actual_cost_usd, opus_5_equivalent_cost_usd, saved_usd}`. An estimate: same token counts assumed (same tokenizer, but a different model and default effort would not spend exactly the same). Null without Opus 5.5 turns. From `build_opus_5_5_savings()`.
-- `active_duration` — session rollup of per-turn wall-clock from `system/turn_duration` entries: `{total_ms, turns_measured, max_ms}`. `total_ms` is *active* time (Σ per-turn `durationMs`, each turn start→end incl. tool execution) — distinct from the trace wall-clock span, which also counts idle time between turns. Computed over the incremental turn batch (matches `total_iterations`). Null when no turn carried a duration (CC before ~2.1.19x never emitted the entry). From `build_active_duration_summary()`.
+- `active_duration` — session rollup of per-turn wall-clock from `system/turn_duration` entries: `{total_ms, turns_measured, max_ms}`. `total_ms` is *active* time (Σ per-turn `durationMs`, each turn start→end incl. tool execution) — distinct from the trace wall-clock span, which also counts idle time between turns. Null when no turn carried a duration (CC before ~2.1.19x never emitted the entry). From `build_active_duration_summary()`.
 - `custom_title` — user-set session title (when present)
 - `permission_mode` — last permission mode observed
 - `pr_links` — list of `{number, url, repository, timestamp}` from `pr-link` entries
@@ -448,7 +454,7 @@ and away summaries are extracted via `extract_custom_title()`, `extract_ai_title
 - `refusal_category` — present only when the turn's terminal `stop_reason` is `refusal`: the `stop_details.category` (or `uncategorized`).
 - `iteration_count` — number of server-side iterations in the turn (length of `usage.iterations`; 0 when absent).
 - `ttft_ms` — time-to-first-token in ms (first assistant-token timestamp − turn start). Omitted when not derivable.
-- `duration_ms` — turn wall-clock in ms from the matching `system/turn_duration` entry (turn start→end, incl. tool execution). Also drives the generation `endTime`. Omitted when no `turn_duration` matched the turn (CC before ~2.1.19x). Rolled up session-wide as `active_duration`.
+- `duration_ms` — turn wall-clock in ms from the `system/turn_duration` entry that follows the turn in the transcript (turn start→end, incl. tool execution). Also drives the generation `endTime`. CC writes that entry after the Stop hook runs, so it arrives on the *next* fire, which re-sends the turn. Omitted when no `turn_duration` followed the turn (CC before ~2.1.19x). Rolled up session-wide as `active_duration`.
 - `cache_miss_reason` — dominant cache-miss reason type for the turn (e.g. `tools_changed`), from `message.diagnostics`. Omitted when the turn had no cache miss.
 - `cache_missed_tokens` — total input tokens that missed cache in the turn. Omitted when no miss.
 - `cache_miss_by_reason` — `{<type>: count}` tally of miss reasons in the turn. Omitted when no miss.
@@ -537,7 +543,7 @@ Trace (parent session)
 
 **Exclusions:** `aside_question` subagents are skipped (internal sidechain queries).
 
-**State:** Subagent offsets stored in `~/.claude/langfuse-state/<session_id>.subagents.json`. Both state files are saved atomically with the main `.offset` — only on successful send — so a timeout retry re-ingests subagent events rather than skipping them.
+**State:** Subagent offsets stored in `~/.claude/langfuse-state/<session_id>.subagents.json`. Both state files are saved only after a successful send — so a timeout retry re-ingests subagent events rather than skipping them. The parent's own cost is recomputed from the whole transcript each fire (`session_cost_usd`); the old `_parent` accumulator key is dropped when found.
 
 **Tags:** Traces with subagents get `has-subagents` and `subagents:{count}` tags for dashboard filtering.
 

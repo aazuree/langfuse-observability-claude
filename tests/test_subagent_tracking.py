@@ -547,12 +547,20 @@ def test_harness_cost_accumulates_across_hook_fires(tmp_path, monkeypatch):
         "run-agent must appear in agents list even in fire 2"
 
 
-def test_parent_cost_stored_in_sa_state(tmp_path, monkeypatch):
-    """After processing a session with subagents, sa_state stores _parent.total_cost."""
+def test_parent_cost_comes_from_the_whole_transcript(tmp_path, monkeypatch):
+    """parent_cost is priced from every parent turn on each fire.
+
+    It used to accumulate in sa_state["_parent"], which only started once a
+    subagent existed, so parent cost from earlier fires was lost. The key is
+    no longer written, and a stale one is dropped.
+    """
     state_dir = tmp_path / "state"
     state_dir.mkdir()
     monkeypatch.setattr(langfuse_hook, "STATE_DIR", str(state_dir))
-    monkeypatch.setattr(langfuse_hook, "send_to_langfuse", lambda batch: True)
+    sent = []
+    monkeypatch.setattr(langfuse_hook, "send_to_langfuse",
+                        lambda batch: sent.append(batch) or True)
+    langfuse_hook.save_subagent_state("parent-cost-session", {"_parent": {"total_cost": 99.0}})
 
     session_dir = tmp_path / "projects" / "test-project"
     session_dir.mkdir(parents=True)
@@ -604,8 +612,11 @@ def test_parent_cost_stored_in_sa_state(tmp_path, monkeypatch):
     )
 
     sa_state = langfuse_hook.load_subagent_state("parent-cost-session")
-    assert "_parent" in sa_state, "sa_state must contain _parent key after processing"
-    assert sa_state["_parent"]["total_cost"] > 0, "_parent.total_cost must be positive"
+    assert "_parent" not in sa_state
+    trace = next(e["body"] for e in sent[0] if e["type"] == "trace-create")
+    costs = trace["metadata"]["subagent_costs"]
+    assert costs["parent_cost"] == trace["metadata"]["session_cost_usd"] > 0
+    assert costs["parent_cost"] < 99.0
 
 
 def test_subagent_state_not_saved_on_send_failure(tmp_path, monkeypatch):

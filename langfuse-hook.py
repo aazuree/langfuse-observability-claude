@@ -81,6 +81,18 @@ def sanitize_id(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()[:32]
 
 
+def _entries(source):
+    """Transcript entries from a path, or pass an already-parsed list through.
+
+    Every extract_* function takes either. process_session parses the
+    transcript once and hands the list to all of them; tests and one-off
+    callers can still pass a path.
+    """
+    if isinstance(source, (list, tuple)):
+        return source
+    return iter_transcript(source)
+
+
 # Whole-request HTTP statuses that no retry can fix: malformed, too large, or
 # unprocessable. See send_to_langfuse.
 PERMANENT_HTTP_STATUSES = frozenset({400, 413, 422})
@@ -663,30 +675,18 @@ def ingest_subagent(
     return events, cost_summary, total_lines, new_turn_count, status
 
 
-def extract_slug(transcript_path: str) -> str:
-    """Scan the transcript for the first non-empty slug field.
+def extract_slug(transcript_path) -> str:
+    """First non-empty `slug` field (the random 3-word session handle).
 
-    Legacy: removed from Claude Code v2.1.112+ transcripts. Kept for back-compat
-    with older transcripts processed via --reprocess.
+    Removed from transcripts in Claude Code v2.1.112 and back as a field on
+    assistant/user entries from ~v2.1.211. Only used to label sessions in
+    --reprocess output; never used for trace naming.
     """
-    try:
-        with open(transcript_path) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                    slug = entry.get("slug", "")
-                    if slug:
-                        return slug
-                except json.JSONDecodeError:
-                    continue
-    except (IOError, OSError):
-        # Can't open or read the transcript file
-        pass
+    for entry in _entries(transcript_path):
+        slug = entry.get("slug", "")
+        if slug:
+            return slug
     return ""
-
 
 
 def extract_custom_title(transcript_path: str) -> str:
@@ -694,7 +694,7 @@ def extract_custom_title(transcript_path: str) -> str:
 
     Set by the user via the in-CLI title command. Absent in most sessions.
     """
-    for entry in iter_transcript(transcript_path):
+    for entry in _entries(transcript_path):
         if entry.get("type") == "custom-title":
             title = entry.get("customTitle", "")
             if title:
@@ -708,7 +708,7 @@ def extract_agent_name(transcript_path: str) -> str:
     Written mid-session (~30% through) once the model identifies the task.
     Absent in sessions that ended before Claude generated a name.
     """
-    for entry in iter_transcript(transcript_path):
+    for entry in _entries(transcript_path):
         if entry.get("type") == "agent-name":
             name = entry.get("agentName", "")
             if name:
@@ -723,7 +723,7 @@ def extract_worktree_state(transcript_path: str) -> dict | None:
     final state. None when the session never entered a worktree.
     """
     worktree = None
-    for entry in iter_transcript(transcript_path):
+    for entry in _entries(transcript_path):
         if entry.get("type") == "worktree-state":
             ws = entry.get("worktreeSession") or {}
             if ws:
@@ -762,7 +762,7 @@ def extract_ai_title(transcript_path: str) -> str:
     title is written on every subsequent turn; first non-empty wins.
     Absent in sessions that ended before a title was produced.
     """
-    for entry in iter_transcript(transcript_path):
+    for entry in _entries(transcript_path):
         if entry.get("type") == "ai-title":
             title = entry.get("aiTitle", "")
             if title:
@@ -776,7 +776,7 @@ def extract_session_kind(transcript_path: str) -> str:
     'bg' (background job) vs 'fg' (interactive foreground). Defaults to 'fg'
     when no entry carries the field (older transcripts).
     """
-    for entry in iter_transcript(transcript_path):
+    for entry in _entries(transcript_path):
         kind = entry.get("sessionKind", "")
         if kind:
             return kind
@@ -797,7 +797,7 @@ def extract_local_commands(transcript_path: str, max_entries: int = 20, max_cont
     number of entries and per-entry length to keep trace metadata small.
     """
     out = []
-    for entry in iter_transcript(transcript_path):
+    for entry in _entries(transcript_path):
         if entry.get("type") != "system" or entry.get("subtype") != "local_command":
             continue
         content = entry.get("content", "") or ""
@@ -823,7 +823,7 @@ def extract_attachments(transcript_path: str) -> dict:
     """
     by_type: dict[str, int] = {}
     total = 0
-    for entry in iter_transcript(transcript_path):
+    for entry in _entries(transcript_path):
         if entry.get("type") != "attachment":
             continue
         total += 1
@@ -920,7 +920,7 @@ def extract_prompt_provenance(transcript_path: str) -> dict:
     meta_entries = 0
     interruptions = 0
 
-    for entry in iter_transcript(transcript_path):
+    for entry in _entries(transcript_path):
         if entry.get("type") != "user":
             continue
         if entry.get("turnCompanion") is True:
@@ -987,7 +987,7 @@ def extract_tool_denials(transcript_path: str) -> dict:
     """
     by_kind: dict[str, int] = {}
 
-    for entry in iter_transcript(transcript_path):
+    for entry in _entries(transcript_path):
         if entry.get("type") != "user":
             continue
         kind = entry.get("toolDenialKind")
@@ -1019,7 +1019,7 @@ def extract_file_history_stats(transcript_path: str) -> dict:
     max_backup_version = 0
     all_paths: set[str] = set()
     edited_paths: set[str] = set()
-    for entry in iter_transcript(transcript_path):
+    for entry in _entries(transcript_path):
         etype = entry.get("type")
         if etype == "file-history-snapshot":
             snapshot_count += 1
@@ -1057,7 +1057,7 @@ def extract_stop_hook_stats(transcript_path: str) -> dict:
     total_errors = 0
     prevented_count = 0
 
-    for entry in iter_transcript(transcript_path):
+    for entry in _entries(transcript_path):
         if entry.get("type") != "system" or entry.get("subtype") != "stop_hook_summary":
             continue
         total_fires += 1
@@ -1082,7 +1082,7 @@ def extract_stop_hook_stats(transcript_path: str) -> dict:
 def extract_permission_mode(transcript_path: str) -> str:
     """Most recent permission-mode entry. The mode can change mid-session."""
     last = ""
-    for entry in iter_transcript(transcript_path):
+    for entry in _entries(transcript_path):
         if entry.get("type") == "permission-mode":
             mode = entry.get("permissionMode", "")
             if mode:
@@ -1097,7 +1097,7 @@ def extract_permission_timeline(transcript_path: str) -> dict | None:
     Consecutive duplicates are collapsed — a transition is a value change.
     """
     sequence = []
-    for entry in iter_transcript(transcript_path):
+    for entry in _entries(transcript_path):
         if entry.get("type") == "permission-mode":
             mode = entry.get("permissionMode", "")
             if mode and (not sequence or sequence[-1] != mode):
@@ -1116,7 +1116,7 @@ def extract_permission_timeline(transcript_path: str) -> dict | None:
 def extract_pr_links(transcript_path: str) -> list:
     """All pr-link entries in chronological order."""
     out = []
-    for entry in iter_transcript(transcript_path):
+    for entry in _entries(transcript_path):
         if entry.get("type") == "pr-link":
             out.append({
                 "number": entry.get("prNumber"),
@@ -1130,7 +1130,7 @@ def extract_pr_links(transcript_path: str) -> list:
 def extract_away_summaries(transcript_path: str) -> list:
     """All system/away_summary entries — content written when user steps away."""
     out = []
-    for entry in iter_transcript(transcript_path):
+    for entry in _entries(transcript_path):
         if entry.get("type") == "system" and entry.get("subtype") == "away_summary":
             content = entry.get("content")
             if content:
@@ -1153,7 +1153,7 @@ def extract_compaction(transcript_path: str) -> dict | None:
     triggers: dict[str, int] = {}
     total_pre = total_post = total_reclaimed = total_dur = 0
 
-    for entry in iter_transcript(transcript_path):
+    for entry in _entries(transcript_path):
         etype = entry.get("type", "")
         subtype = entry.get("subtype", "")
         if etype == "system" and subtype == "compact_boundary":
@@ -1203,7 +1203,7 @@ def extract_bridge(transcript_path: str) -> dict | None:
     shareable claude.ai url. Either may be absent independently. No timestamps.
     """
     out: dict = {}
-    for entry in iter_transcript(transcript_path):
+    for entry in _entries(transcript_path):
         etype = entry.get("type", "")
         if etype == "bridge-session" and "bridge_session_id" not in out:
             bsid = entry.get("bridgeSessionId")
@@ -1216,8 +1216,13 @@ def extract_bridge(transcript_path: str) -> dict | None:
     return out or None
 
 
-def parse_transcript(transcript_path: str, skip_lines: int = 0) -> tuple[list[dict], int, bool]:
+def parse_transcript(transcript_path: str, skip_lines: int = 0,
+                     warn_after: int = 0) -> tuple[list[dict], int, bool]:
     """Parse a JSONL transcript starting after `skip_lines`.
+
+    Malformed lines are skipped; only those past line `warn_after` are logged,
+    so re-reading the whole transcript on every fire does not repeat the same
+    warning each time.
 
     Returns (entries, total_lines, read_ok). read_ok=False signals an I/O
     failure (file missing, permission denied, etc.); the caller should NOT
@@ -1239,7 +1244,8 @@ def parse_transcript(transcript_path: str, skip_lines: int = 0) -> tuple[list[di
                 try:
                     entries.append(json.loads(line))
                 except json.JSONDecodeError as e:
-                    log(f"[WARN] Skipping malformed JSON at line {total} in {transcript_path}: {e}")
+                    if total > warn_after:
+                        log(f"[WARN] Skipping malformed JSON at line {total} in {transcript_path}: {e}")
                     continue
     except (IOError, OSError) as e:
         # Can't open or read the transcript file
@@ -1324,7 +1330,6 @@ def build_turns(entries: list[dict]) -> list[dict]:
       first_token_time, duration_ms, usage, model
     """
     msg_entries = []
-    turn_durations = []
 
     for entry in entries:
         etype = entry.get("type")
@@ -1364,7 +1369,9 @@ def build_turns(entries: list[dict]) -> list[dict]:
                 "denial_kind": entry.get("toolDenialKind", "") if etype == "user" else "",
             })
         elif etype == "system" and entry.get("subtype") == "turn_duration":
-            turn_durations.append(entry)
+            # Kept in file order: it belongs to the turn that just finished.
+            msg_entries.append({"role": "_turn_duration",
+                                "duration_ms": entry.get("durationMs", 0)})
 
     # Build tool_result lookup
     tool_results = {}
@@ -1434,6 +1441,18 @@ def build_turns(entries: list[dict]) -> list[dict]:
                 }
             elif current_turn:
                 current_turn["messages"].append(me)
+
+        elif role == "_turn_duration":
+            # Claude Code writes turn_duration once the turn has ended — after
+            # the Stop hook, and occasionally after the next prompt was
+            # already queued. Attach it to the latest turn that produced
+            # output and does not have a duration yet.
+            candidates = ([current_turn] if current_turn else []) + turns[::-1]
+            for t in candidates:
+                if t["api_call_ids"]:
+                    if "duration_ms" not in t and me["duration_ms"]:
+                        t["duration_ms"] = me["duration_ms"]
+                    break
 
         elif role == "assistant" and current_turn:
             content = me["content"]
@@ -1580,51 +1599,19 @@ def build_turns(entries: list[dict]) -> list[dict]:
         turn["attribution_skills_all"] = sorted(turn["attribution_skills_all"])
         turn["attribution_plugins_all"] = sorted(turn["attribution_plugins_all"])
 
-    # Match turn_duration entries to turns (by proximity of timestamps)
-    for td in turn_durations:
-        td_ts = parse_ts(td.get("timestamp", ""))
-        if not td_ts:
-            continue
-        duration_ms = td.get("durationMs", 0)
-        # Find the closest turn that ends near this turn_duration timestamp
-        best_turn = None
-        best_diff = None
-        for turn in turns:
-            turn_end = parse_ts(turn["end_time"])
-            if not turn_end:
-                continue
-            diff = abs((td_ts - turn_end).total_seconds())
-            if best_diff is None or diff < best_diff:
-                best_diff = diff
-                best_turn = turn
-        if best_turn and best_diff is not None and best_diff < 30:
-            best_turn["duration_ms"] = duration_ms
-
     return turns
 
 
-def extract_session_metadata(transcript_path: str) -> dict:
+def extract_session_metadata(transcript_path) -> dict:
     """Extract session-level metadata from the first user entry in the transcript."""
     fields = {"cwd": "", "gitBranch": "", "version": "", "entrypoint": ""}
-    try:
-        with open(transcript_path) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                    if entry.get("type") == "user":
-                        for key in fields:
-                            val = entry.get(key, "")
-                            if val:
-                                fields[key] = str(val)
-                        break
-                except json.JSONDecodeError:
-                    continue
-    except (IOError, OSError):
-        # Can't open or read the transcript file
-        pass
+    for entry in _entries(transcript_path):
+        if entry.get("type") == "user":
+            for key in fields:
+                val = entry.get(key, "")
+                if val:
+                    fields[key] = str(val)
+            break
     return fields
 
 
@@ -1674,7 +1661,7 @@ def extract_api_error_messages(transcript_path: str) -> dict | None:
     last_at = ""
     max_retry = None
 
-    for entry in iter_transcript(transcript_path):
+    for entry in _entries(transcript_path):
         if not entry.get("isApiErrorMessage"):
             continue
         count += 1
@@ -1716,7 +1703,7 @@ def extract_interrupts(transcript_path: str) -> dict | None:
     session had no interrupts.
     """
     count = 0
-    for entry in iter_transcript(transcript_path):
+    for entry in _entries(transcript_path):
         if entry.get("type") == "user" and entry.get("interruptedMessageId"):
             count += 1
     if count == 0:
@@ -1724,24 +1711,12 @@ def extract_interrupts(transcript_path: str) -> dict | None:
     return {"count": count}
 
 
-def extract_cwd(transcript_path: str) -> str:
+def extract_cwd(transcript_path) -> str:
     """Scan the transcript for the first non-empty cwd field."""
-    try:
-        with open(transcript_path) as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                    cwd = entry.get("cwd", "")
-                    if cwd:
-                        return cwd
-                except json.JSONDecodeError:
-                    continue
-    except (IOError, OSError):
-        # Can't open or read the transcript file
-        pass
+    for entry in _entries(transcript_path):
+        cwd = entry.get("cwd", "")
+        if cwd:
+            return cwd
     return ""
 
 
@@ -1890,9 +1865,20 @@ _TOP_TIER_RATES = {
 }
 
 
+# Models already warned about in this process. Every fire prices every turn of
+# the session, so an unrecognised model would otherwise log once per turn.
+_WARNED_MODELS: set = set()
+
+
+def _warn_once(key: str, msg: str) -> None:
+    if key not in _WARNED_MODELS:
+        _WARNED_MODELS.add(key)
+        log(msg)
+
+
 def _unrecognised_model(model: str) -> tuple:
-    log(f"[WARN] calculate_turn_cost: unrecognised model '{model}' — cost reported as $0. "
-        "Update calculate_turn_cost() and CLAUDE.md if this is a new Anthropic model.")
+    _warn_once(model, f"[WARN] calculate_turn_cost: unrecognised model '{model}' — cost reported as $0. "
+               "Update calculate_turn_cost() and CLAUDE.md if this is a new Anthropic model.")
     return 0.0, 0.0, 0.0, {}
 
 
@@ -1930,9 +1916,9 @@ def calculate_turn_cost(
         # dashboard shows an obvious gap. Warn only when tokens are actually
         # billable; zero-usage stub turns ($0 regardless) stay silent.
         if _has_billable_tokens(usage):
-            log("[WARN] calculate_turn_cost: turn has no model field but carries "
-                "billable tokens — cost reported as $0. Upstream transcript is missing "
-                "the assistant 'model' value; FIX the source.")
+            _warn_once("", "[WARN] calculate_turn_cost: turn has no model field but carries "
+                       "billable tokens — cost reported as $0. Upstream transcript is missing "
+                       "the assistant 'model' value; FIX the source.")
         return 0.0, 0.0, 0.0, {}
     # Pricing per 1M tokens: (input, output, cache_read, cache_write_5m, cache_write_1h)
     # Source: platform.claude.com/docs/en/about-claude/pricing (verified 2026-09-23)
@@ -2108,9 +2094,9 @@ def detect_compaction(transcript_path: str) -> bool:
     Matches: type=="summary" OR (type=="system" AND "compact" in subtype.lower()).
     Returns False when transcript_path is empty or the file does not exist.
     """
-    for entry in iter_transcript(transcript_path):
+    for entry in _entries(transcript_path):
         etype = entry.get("type", "")
-        subtype = entry.get("subtype", "")
+        subtype = entry.get("subtype") or ""
         if etype == "summary":
             return True
         if etype == "system" and "compact" in subtype.lower():
@@ -2121,6 +2107,8 @@ def detect_compaction(transcript_path: str) -> bool:
 def _turn_cost_usd(turn: dict, model: str | None = None) -> float:
     """Total cost of one built turn. `model` overrides the turn's own model,
     for counterfactual pricing of the same token usage."""
+    if model is None and "_cost" in turn:
+        return turn["_cost"][0]
     cost, _i, _o, _cd = calculate_turn_cost(
         turn.get("usage") or {},
         (turn.get("model") or "") if model is None else model,
@@ -2389,7 +2377,7 @@ def extract_queue_operations(transcript_path: str) -> dict | None:
     pending: list[datetime] = []   # timestamps of still-queued enqueues
     waits: list[float] = []        # execution waits in ms (dequeue / popAll)
     removed = 0
-    for entry in iter_transcript(transcript_path):
+    for entry in _entries(transcript_path):
         if entry.get("type") != "queue-operation":
             continue
         op = entry.get("operation") or "unknown"
@@ -2538,27 +2526,12 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
     # --reprocess). This env fallback still covers older transcripts.
     effort_env = os.environ.get("CLAUDE_EFFORT", "").strip() if live else ""
     prev_line_offset, prev_turn_count = load_state(session_id)
-    custom_title = extract_custom_title(transcript_path)
-    permission_mode = extract_permission_mode(transcript_path)
-    permission_timeline = extract_permission_timeline(transcript_path)
-    compaction = extract_compaction(transcript_path)
-    remote_control = extract_bridge(transcript_path)
-    pr_links = extract_pr_links(transcript_path)
-    away_summaries = extract_away_summaries(transcript_path)
-    agent_name = extract_agent_name(transcript_path)
-    ai_title = extract_ai_title(transcript_path)
-    session_kind = extract_session_kind(transcript_path)
-    attachments = extract_attachments(transcript_path)
-    local_commands = extract_local_commands(transcript_path)
-    file_history_stats = extract_file_history_stats(transcript_path)
-    prompt_provenance = extract_prompt_provenance(transcript_path)
-    tool_denials = extract_tool_denials(transcript_path)
-    stop_hook_stats = extract_stop_hook_stats(transcript_path)
-    worktree_state = extract_worktree_state(transcript_path)
-    api_error_messages = extract_api_error_messages(transcript_path)
-    interrupts = extract_interrupts(transcript_path)
-    queue_operations = extract_queue_operations(transcript_path)
-    entries, total_lines, read_ok = parse_transcript(transcript_path, skip_lines=prev_line_offset)
+
+    # One read per fire. Every rollup below is computed over the whole
+    # session, because each fire upserts the same trace: rollups built from
+    # only the new lines overwrote the session's numbers with one turn's worth.
+    entries, total_lines, read_ok = parse_transcript(
+        transcript_path, warn_after=prev_line_offset)
 
     if not read_ok:
         # Transient read failure (file moved, permission denied, etc.).
@@ -2568,22 +2541,62 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
         log(f"Skipping state save for {session_id} due to transcript read failure")
         return
 
-    if not entries:
+    if total_lines == prev_line_offset:
         log(f"No new entries for session {session_id} (offset {prev_line_offset}, total {total_lines})")
-        save_state(session_id, total_lines, prev_turn_count)
         return
+
+    custom_title = extract_custom_title(entries)
+    permission_mode = extract_permission_mode(entries)
+    permission_timeline = extract_permission_timeline(entries)
+    compaction = extract_compaction(entries)
+    compaction_occurred = detect_compaction(entries)
+    remote_control = extract_bridge(entries)
+    pr_links = extract_pr_links(entries)
+    away_summaries = extract_away_summaries(entries)
+    agent_name = extract_agent_name(entries)
+    ai_title = extract_ai_title(entries)
+    session_kind = extract_session_kind(entries)
+    attachments = extract_attachments(entries)
+    local_commands = extract_local_commands(entries)
+    file_history_stats = extract_file_history_stats(entries)
+    prompt_provenance = extract_prompt_provenance(entries)
+    tool_denials = extract_tool_denials(entries)
+    stop_hook_stats = extract_stop_hook_stats(entries)
+    worktree_state = extract_worktree_state(entries)
+    api_error_messages = extract_api_error_messages(entries)
+    interrupts = extract_interrupts(entries)
+    queue_operations = extract_queue_operations(entries)
 
     now = datetime.now(timezone.utc).isoformat()
     trace_id = f"trace-{session_id}"
     batch = []
 
-    session_meta = extract_session_metadata(transcript_path)
+    session_meta = extract_session_metadata(entries)
 
     turns = build_turns(entries)
     if not turns:
-        log(f"No turns found in {len(entries)} new entries")
-        save_state(session_id, total_lines, prev_turn_count)
+        log(f"No turns found in {len(entries)} entries")
+        save_state(session_id, total_lines, 0)
         return
+
+    # Generations are sent from the last turn a previous fire already sent.
+    # Re-sending it (same deterministic ID, so an upsert) is what lets the
+    # turn_duration Claude Code writes *after* the Stop hook reach its turn.
+    emit_from = max(0, min(prev_turn_count, len(turns)) - 1)
+
+    # Price each turn once; every rollup below reads this.
+    for t in turns:
+        t["_cost"] = calculate_turn_cost(
+            t["usage"],
+            t.get("model") or "",
+            t.get("cache_ephemeral_5m", 0),
+            t.get("cache_ephemeral_1h", 0),
+            speed=t.get("speed", ""),
+            inference_geo=t.get("inference_geo", ""),
+            web_search_requests=t.get("web_search_requests", 0),
+            turn_start_time=t.get("start_time", ""),
+        )
+    session_cost = sum(t["_cost"][0] for t in turns)
 
     api_errors = extract_api_errors(entries)
     has_errors = api_errors["total_count"] > 0
@@ -2628,7 +2641,6 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
     total_tool_calls = sum(len(t["tool_calls"]) for t in turns)
     skill_attribution = build_skill_attribution_summary(turns)
     attribution_tags = build_attribution_tags(skill_attribution)
-    total_cost = 0.0
     subagent_cost_summaries = []
     sa_state = load_subagent_state(session_id)
 
@@ -2721,7 +2733,8 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 "stop_hook": stop_hook_stats if stop_hook_stats["total_hook_fires"] > 0 else None,
                 "skill_attribution": skill_attribution,
                 "compaction": compaction,
-                "compaction_occurred": detect_compaction(transcript_path),
+                "compaction_occurred": compaction_occurred,
+                "session_cost_usd": round(session_cost, 6),
                 "remote_control": remote_control,
                 "permission_timeline": permission_timeline,
                 "total_iterations": sum(t.get("iteration_count", 0) for t in turns),
@@ -2757,7 +2770,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 f"session-kind:{session_kind}" if session_kind else None,
                 f"worktree:{worktree_state['name']}" if worktree_state and worktree_state.get("name") else None,
                 f"effort:{effort}" if effort else None,
-                "compacted" if detect_compaction(transcript_path) else None,
+                "compacted" if compaction_occurred else None,
                 "remote-control" if remote_control else None,
                 "permission-bypass" if (permission_timeline or {}).get("ever_bypass") else None,
                 *compact_trigger_tags,
@@ -2774,9 +2787,11 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
     sa_search_dirs = _subagent_search_dirs(transcript_path, cwd)
     sa_meta_index = build_subagent_meta_index(sa_search_dirs)
     sa_visited = set()
-    for turn_idx, turn in enumerate(turns):
-        # Deterministic IDs so re-ingestion updates rather than duplicates
-        turn_id = uuid.uuid5(uuid.NAMESPACE_URL, f"{session_id}:turn:{prev_turn_count + turn_idx}")
+    for turn_idx in range(emit_from, len(turns)):
+        turn = turns[turn_idx]
+        # Deterministic IDs keyed on the turn's index in the whole transcript,
+        # so a live fire and --reprocess produce the same ID for the same turn.
+        turn_id = uuid.uuid5(uuid.NAMESPACE_URL, f"{session_id}:turn:{turn_idx}")
         gen_id = f"gen-{turn_id}"
 
         start_time = turn["start_time"]
@@ -2803,18 +2818,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 computed_end = st + timedelta(milliseconds=duration_ms)
                 end_time = computed_end.isoformat()
 
-        # Cost: $0 for Pro subscription
-        turn_cost, input_cost, output_cost, cost_details = calculate_turn_cost(
-            usage,
-            model,
-            turn.get("cache_ephemeral_5m", 0),
-            turn.get("cache_ephemeral_1h", 0),
-            speed=turn.get("speed", ""),
-            inference_geo=turn.get("inference_geo", ""),
-            web_search_requests=turn.get("web_search_requests", 0),
-            turn_start_time=start_time,
-        )
-        total_cost += turn_cost
+        cost_details = turn["_cost"][3]
 
         usage_details = {
             "input": usage["input"],
@@ -2832,7 +2836,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
         gen_body = {
             "id": gen_id,
             "traceId": trace_id,
-            "name": f"Turn {prev_turn_count + turn_idx + 1}: {redact_secrets(truncate(turn['user_input'], 80))}",
+            "name": f"Turn {turn_idx + 1}: {redact_secrets(truncate(turn['user_input'], 80))}",
             "model": model,
             "input": redact_secrets(truncate(turn["user_input"], MAX_TEXT)) or None,
             "output": redact_secrets(truncate(turn["assistant_output"], MAX_TEXT)) or None,
@@ -2959,19 +2963,24 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 )
                 batch.extend(sa_events)
                 _prev = sa_state.get(sa_id, {})
-                sa_state[sa_id] = {
-                    "offset": sa_new_offset,
-                    "turn_count": sa_new_tc,
-                    "status": sa_status,
-                    "total_cost": round(_prev.get("total_cost", 0.0) + sa_cost["total_cost"], 6),
-                    "total_tokens": _prev.get("total_tokens", 0) + sa_cost["total_tokens"],
-                    "cost_breakdown": {
-                        k: round(_prev.get("cost_breakdown", {}).get(k, 0.0) + v, 6)
-                        for k, v in sa_cost["cost_breakdown"].items()
-                    },
-                    "description": sa_desc,
-                    "subagent_type": sa_type,
-                }
+                if not sa_events and _prev:
+                    # Re-sent turn whose subagent has nothing new: keep its
+                    # recorded status and totals rather than resetting them.
+                    sa_state[sa_id] = {**_prev, "offset": sa_new_offset}
+                else:
+                    sa_state[sa_id] = {
+                        "offset": sa_new_offset,
+                        "turn_count": sa_new_tc,
+                        "status": sa_status,
+                        "total_cost": round(_prev.get("total_cost", 0.0) + sa_cost["total_cost"], 6),
+                        "total_tokens": _prev.get("total_tokens", 0) + sa_cost["total_tokens"],
+                        "cost_breakdown": {
+                            k: round(_prev.get("cost_breakdown", {}).get(k, 0.0) + v, 6)
+                            for k, v in sa_cost["cost_breakdown"].items()
+                        },
+                        "description": sa_desc,
+                        "subagent_type": sa_type,
+                    }
 
                 # Enrich Agent tool span metadata
                 for evt in batch:
@@ -2986,18 +2995,15 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                         })
                         break
 
-    # Rebuild subagent_cost_summaries from all known agents (cumulative across fires)
-    # and store cumulative parent cost in sa_state for future fires.
-    _known_agents = {k: v for k, v in sa_state.items()
-                     if k != "_parent" and isinstance(v, dict)}
+    # Rebuild subagent_cost_summaries from all known agents (cumulative across
+    # fires). The parent's own cost is session_cost, computed over every turn;
+    # the old sa_state["_parent"] accumulator is ignored and dropped.
+    sa_state.pop("_parent", None)
+    _known_agents = {k: v for k, v in sa_state.items() if isinstance(v, dict)}
     if _known_agents:
         subagent_cost_summaries = [
             {"agent_id": aid, **state} for aid, state in _known_agents.items()
         ]
-        cumulative_parent_cost = sa_state.get("_parent", {}).get("total_cost", 0.0) + total_cost
-        sa_state["_parent"] = {"total_cost": round(cumulative_parent_cost, 6)}
-    else:
-        cumulative_parent_cost = total_cost
 
     # Add subagent cost summary to trace
     if subagent_cost_summaries:
@@ -3007,8 +3013,8 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 evt["body"]["metadata"]["subagent_costs"] = {
                     "agents": subagent_cost_summaries,
                     "total_subagent_cost": round(total_subagent_cost, 6),
-                    "parent_cost": round(cumulative_parent_cost, 6),
-                    "harness_total_cost": round(cumulative_parent_cost + total_subagent_cost, 6),
+                    "parent_cost": round(session_cost, 6),
+                    "harness_total_cost": round(session_cost + total_subagent_cost, 6),
                 }
                 evt["body"]["tags"].append("has-subagents")
                 evt["body"]["tags"].append(f"subagents:{len(subagent_cost_summaries)}")
@@ -3022,18 +3028,29 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
         session_id=session_id,
         first_user_input=first_user_input,
         turns=turns,
-        total_cost=cumulative_parent_cost,
+        total_cost=session_cost,
         transcript_path=transcript_path,
         last_assistant_message=last_assistant_message,
     )
     batch.extend(score_events)
 
-    new_turn_count = prev_turn_count + len(turns)
-    tool_span_count = sum(len(t["tool_calls"]) for t in turns)
+    # A null metadata value is not "unknown": Langfuse merges trace metadata
+    # key by key, so a null erases what an earlier fire wrote. Omit instead.
+    for evt in batch:
+        if evt["type"] == "trace-create":
+            body = evt["body"]
+            body["metadata"] = {k: v for k, v in body["metadata"].items() if v is not None}
+            evt["body"] = {k: v for k, v in body.items() if v is not None}
+            break
+
+    new_turn_count = len(turns)
+    emitted = turns[emit_from:]
+    tool_span_count = sum(len(t["tool_calls"]) for t in emitted)
     summary = (
         f"{len(batch)} events for session {session_id}: "
-        f"{len(turns)} turns, {tool_span_count} tool spans, "
-        f"{total_tokens} tokens (lines {prev_line_offset+1}-{total_lines})"
+        f"{len(emitted)} turns, {tool_span_count} tool spans, "
+        f"{sum(t['usage']['total'] for t in emitted)} tokens "
+        f"(lines {prev_line_offset+1}-{total_lines})"
     )
     if send_to_langfuse(batch):
         save_state(session_id, total_lines, new_turn_count)
