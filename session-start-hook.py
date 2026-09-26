@@ -61,7 +61,14 @@ def build_stop_failure_batch(
     session_id: str,
     transcript_path: str,
 ) -> list[dict]:
-    """Build a trace-update batch for StopFailure."""
+    """Build a trace upsert that tags the session trace for StopFailure.
+
+    Uses `trace-create`: the ingestion API has no `trace-update` type and
+    rejects it with a 400. `trace-create` upserts on `id`, and Langfuse merges
+    the partial body into the existing trace: tags are unioned and metadata is
+    merged key by key. Only id/tags/metadata are sent, so the name, input,
+    output and timestamp the Stop hook wrote are left untouched.
+    """
     now = datetime.now(timezone.utc).isoformat()
     trace_id = f"trace-{session_id}"
 
@@ -77,7 +84,7 @@ def build_stop_failure_batch(
     return [{
         "id": f"evt-stop-failure-{uuid.uuid4()}",
         "timestamp": now,
-        "type": "trace-update",
+        "type": "trace-create",
         "body": body,
     }]
 

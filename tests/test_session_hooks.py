@@ -27,10 +27,19 @@ class TestBuildStopFailureBatch:
         batch = sh.build_stop_failure_batch("sess-abc", path)
         assert len(batch) == 1
         evt = batch[0]
-        assert evt["type"] == "trace-update"
+        # The ingestion API has no `trace-update` type: Langfuse answers it
+        # with a 400 "No matching discriminator". `trace-create` is an upsert.
+        assert evt["type"] == "trace-create"
         body = evt["body"]
         assert body["id"] == "trace-sess-abc"
         assert "stop-failure" in body["tags"]
+
+    def test_upsert_leaves_stop_hook_fields_alone(self, tmp_path):
+        """A partial trace-create merges into the trace the Stop hook built;
+        any field sent here would overwrite the Stop hook's value."""
+        path = self._write_transcript([], tmp_path)
+        body = sh.build_stop_failure_batch("sess-abc", path)[0]["body"]
+        assert set(body) <= {"id", "tags", "metadata"}
 
     def test_captures_last_api_error(self, tmp_path):
         entries = [
