@@ -1817,6 +1817,66 @@ def _opus_family(model: str) -> str:
     return f"opus-{major}-{minor}" if minor else f"opus-{major}"
 
 
+def _model_family(model: str, name: str) -> str:
+    """Version key for a non-Opus family ("sonnet-4-5", "haiku-3-5", ...),
+    or "" when no version can be parsed.
+
+    Handles both naming schemes: version-after-name (claude-sonnet-4-5-20250929,
+    Bedrock us.anthropic.claude-sonnet-4-5-...) and the Claude 3 era
+    version-before-name (claude-3-5-sonnet-20241022). As in _opus_family, the
+    minor is 1-2 digits and an 8-digit group is a date snapshot.
+    """
+    m = model.lower()
+    old = re.search(rf"(\d+)-(?:(\d)-)?{name}(?![a-z])", m)
+    if old:
+        major, minor = old.groups()
+        return f"{name}-{major}-{minor}" if minor else f"{name}-{major}"
+    new = re.search(rf"{name}-(\d+)(?:-(\d{{1,2}}))?(?![0-9])", m)
+    if new:
+        major, minor = new.groups()
+        return f"{name}-{major}-{minor}" if minor else f"{name}-{major}"
+    return ""
+
+
+# Per-1M rates (input, output, cache_read, cache_write_5m, cache_write_1h) and
+# whether inference_geo="us" applies, keyed by _model_family(). Anything not
+# listed is unrecognised and reported as $0 with a [WARN] — never priced at a
+# neighbouring version's rate.
+# Source: platform.claude.com/docs/en/about-claude/pricing (verified 2026-09-23)
+_SONNET_RATES = {
+    # Sonnet 5: launched as "introductory through 2026-08-31", then made the
+    # standard price; the $3/$15 step-up never happened.
+    "sonnet-5":   ((2.00, 10.00, 0.20, 2.50, 4.00), True),
+    "sonnet-4-6": ((3.00, 15.00, 0.30, 3.75, 6.00), True),
+    "sonnet-4-5": ((3.00, 15.00, 0.30, 3.75, 6.00), False),
+    "sonnet-4":   ((3.00, 15.00, 0.30, 3.75, 6.00), False),
+    "sonnet-4-0": ((3.00, 15.00, 0.30, 3.75, 6.00), False),  # alias of sonnet-4
+    "sonnet-3-7": ((3.00, 15.00, 0.30, 3.75, 6.00), False),
+    "sonnet-3-5": ((3.00, 15.00, 0.30, 3.75, 6.00), False),
+    "sonnet-3":   ((3.00, 15.00, 0.30, 3.75, 6.00), False),
+}
+_HAIKU_RATES = {
+    "haiku-4-5": ((1.00, 5.00, 0.10, 1.25, 2.00), False),
+    "haiku-3-5": ((0.80, 4.00, 0.08, 1.00, 1.60), False),
+    "haiku-3":   ((0.25, 1.25, 0.03, 0.30, 0.50), False),
+}
+# Fable 5 / Mythos 5 (Project Glasswing sibling): identical pricing. The 5.1
+# releases cut cache reads to $0.25 (0.025x input). Neither has a /fast
+# variant, and their data-residency multiplier is unverified.
+_TOP_TIER_RATES = {
+    "fable-5":    ((10.00, 50.00, 1.00, 12.50, 20.00), False),
+    "fable-5-1":  ((10.00, 50.00, 0.25, 12.50, 20.00), False),
+    "mythos-5":   ((10.00, 50.00, 1.00, 12.50, 20.00), False),
+    "mythos-5-1": ((10.00, 50.00, 0.25, 12.50, 20.00), False),
+}
+
+
+def _unrecognised_model(model: str) -> tuple:
+    log(f"[WARN] calculate_turn_cost: unrecognised model '{model}' — cost reported as $0. "
+        "Update calculate_turn_cost() and CLAUDE.md if this is a new Anthropic model.")
+    return 0.0, 0.0, 0.0, {}
+
+
 def calculate_turn_cost(
     usage: dict,
     model: str,
@@ -1856,18 +1916,17 @@ def calculate_turn_cost(
                 "the assistant 'model' value; FIX the source.")
         return 0.0, 0.0, 0.0, {}
     # Pricing per 1M tokens: (input, output, cache_read, cache_write_5m, cache_write_1h)
-    # Source: platform.claude.com/docs/en/about-claude/pricing (verified 2026-05-13)
-    # When a new model releases, its name will fall through to Sonnet pricing and log a warning.
-    # Update this function + CLAUDE.md Cost Model table when that happens.
+    # Source: platform.claude.com/docs/en/about-claude/pricing (verified 2026-09-23)
+    # Every family is an explicit whitelist. A new model ID — including a new
+    # version of a known family — reports $0 and logs a [WARN]; update this
+    # function and the CLAUDE.md Cost Model table when that happens.
     supports_inference_geo = False  # Only Opus 4.6+/Sonnet 4.6+ accept inference_geo
     supports_fast_mode = False      # Only Opus 4.6+ (excluding 4.5) support /fast
     if "haiku" in m:
-        if "haiku-4" in m:                          # Haiku 4.5+
-            p_in, p_out, p_cr, p_cc5, p_cc1 = 1.00, 5.00, 0.10, 1.25, 2.00
-        elif "3-5" in m:                             # Haiku 3.5
-            p_in, p_out, p_cr, p_cc5, p_cc1 = 0.80, 4.00, 0.08, 1.00, 1.60
-        else:                                        # Haiku 3
-            p_in, p_out, p_cr, p_cc5, p_cc1 = 0.25, 1.25, 0.03, 0.30, 0.50
+        rates = _HAIKU_RATES.get(_model_family(m, "haiku"))
+        if rates is None:
+            return _unrecognised_model(model)
+        (p_in, p_out, p_cr, p_cc5, p_cc1), supports_inference_geo = rates
     elif "opus" in m:
         # Whitelist of current Opus generations. Substring matching previously
         # over-billed any future "opus-4-9+" release at the legacy $15/$75 rate,
@@ -1886,38 +1945,26 @@ def calculate_turn_cost(
             if family != "opus-4-5":
                 supports_inference_geo = True
                 supports_fast_mode = True
-        elif any(x in m for x in ("opus-4-1", "opus-4-20", "3-opus")):
-            # Opus 4.1, 4.0 (claude-opus-4-2025*), 3 (claude-3-opus-*) — legacy whitelist
+        elif family in ("opus-4-1", "opus-4-0") or any(x in m for x in ("opus-4-20", "3-opus")):
+            # Opus 4.1, 4.0 (claude-opus-4-2025* / claude-opus-4-0), 3 (claude-3-opus-*)
             p_in, p_out, p_cr, p_cc5, p_cc1 = 15.0, 75.0, 1.50, 18.75, 30.0
         else:
-            log(f"[WARN] calculate_turn_cost: unrecognised Opus variant '{model}' — cost reported as $0. "
-                "Update calculate_turn_cost() and CLAUDE.md if this is a new Anthropic model.")
-            return 0.0, 0.0, 0.0, {}
-    elif "sonnet" in m:                              # Sonnet (all versions)
-        if "sonnet-5" in m:
-            # Sonnet 5: $2/$10. Launched as "introductory through 2026-08-31",
-            # then made the standard price; the $3/$15 step-up never happened.
-            # Source: platform.claude.com/docs/en/about-claude/pricing (verified 2026-09-23)
-            p_in, p_out, p_cr, p_cc5, p_cc1 = 2.0, 10.0, 0.20, 2.50, 4.00
-            supports_inference_geo = True            # Sonnet 4.6+ accept inference_geo
-        else:
-            p_in, p_out, p_cr, p_cc5, p_cc1 = 3.0, 15.0, 0.30, 3.75, 6.00
-            if "sonnet-4-6" in m:
-                supports_inference_geo = True
-    elif "fable" in m or "mythos" in m:              # Fable 5 / Mythos 5 (top tier, $10/$50)
-        # Mythos 5 (and its predecessor claude-mythos-preview) is the Project
-        # Glasswing sibling of Fable 5 — identical pricing and API surface.
-        # supports_fast_mode / supports_inference_geo stay False: neither has a
-        # /fast variant, and their data-residency multiplier is unverified.
-        p_in, p_out, p_cr, p_cc5, p_cc1 = 10.00, 50.00, 1.00, 12.50, 20.00
-        if "fable-5-1" in m or "mythos-5-1" in m:
-            # 5.1 cache hits are 0.025x input ($0.25), not the usual 0.1x.
-            # Source: platform.claude.com/docs/en/about-claude/pricing (verified 2026-09-23)
-            p_cr = 0.25
+            return _unrecognised_model(model)
+    elif "sonnet" in m:
+        rates = _SONNET_RATES.get(_model_family(m, "sonnet"))
+        if rates is None:
+            return _unrecognised_model(model)
+        (p_in, p_out, p_cr, p_cc5, p_cc1), supports_inference_geo = rates
+    elif "fable" in m or "mythos" in m:
+        # claude-mythos-preview is the invitation-only Mythos 5 preview.
+        family = "mythos-5" if "mythos-preview" in m else (
+            _model_family(m, "fable") or _model_family(m, "mythos"))
+        rates = _TOP_TIER_RATES.get(family)
+        if rates is None:
+            return _unrecognised_model(model)
+        (p_in, p_out, p_cr, p_cc5, p_cc1), supports_inference_geo = rates
     else:
-        log(f"[WARN] calculate_turn_cost: unrecognised model '{model}' — cost reported as $0. "
-            "Update calculate_turn_cost() and CLAUDE.md if this is a new Anthropic model.")
-        return 0.0, 0.0, 0.0, {}
+        return _unrecognised_model(model)
 
     # Fast mode premium (per-model: Opus 4.6/4.7 = 6x; 4.8, 5, 5.5 = 2x).
     # Multipliers stack on top per spec. supports_fast_mode guarantees a key match.

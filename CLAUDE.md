@@ -193,6 +193,10 @@ Opus IDs resolve through `_opus_family()`, which parses `opus-<major>[-<minor>]`
 8-digit group as a date snapshot. It replaced substring matching: `"opus-5" in m` also
 matched `claude-opus-5-5` and billed it at $5/$25. An unknown minor (e.g. `claude-opus-5-6`)
 now hits the `[WARN]` + `$0` path instead of inheriting its predecessor's rate.
+Sonnet, Haiku, Fable and Mythos work the same way: `_model_family()` parses both the
+`claude-sonnet-4-5` and the Claude-3-era `claude-3-5-sonnet` schemes, and the result is
+looked up in `_SONNET_RATES` / `_HAIKU_RATES` / `_TOP_TIER_RATES`. `claude-sonnet-6` or
+`claude-haiku-5` therefore warn instead of silently billing at a neighbour's rate.
 
 **New-tokenizer note:** Opus 4.7+, Fable 5, **and Sonnet 5** ship a new tokenizer that produces ~30% more tokens for the same input text vs. prior models (Sonnet 4.6 and earlier keep the old tokenizer). Per-token rates are unchanged, but absolute session cost for equivalent workloads is meaningfully higher — the extra cost comes from token *counts* (already in `usageDetails`), not the rate table.
 
@@ -225,7 +229,7 @@ Two signals catch pricing staleness, and they fail differently:
 | Signal | Catches | Misses |
 |--------|---------|--------|
 | `[WARN] unrecognised … model` in the hook log | A **new** model ID (cost shows as $0 — loud) | A **rate change** on a model already in the table |
-| `tools/check_pricing_drift.py` | Rate changes **and** new models | Multipliers, intro-window boundaries, server-tool rates |
+| `tools/check_pricing_drift.py` | Rate changes on `MODELS`, **and** any current first-party (`litellm_provider: anthropic`) feed model the hook prices at $0 (reported `NEW`) | Multipliers, intro-window boundaries, server-tool rates |
 
 ```bash
 python3 tools/check_pricing_drift.py            # exit 1 on drift
@@ -255,8 +259,8 @@ timestamp*; a live feed only ever carries today's rate.
 
 Claude Code sessions routed through AWS Bedrock carry provider-prefixed model IDs
 (`anthropic.claude-*`, `us.anthropic.claude-*`, `eu.anthropic.claude-*`,
-`global.anthropic.claude-*`). The substring matcher in `calculate_turn_cost`
-already bills these at the **base** first-party rate (e.g. `anthropic.claude-opus-4-8`
+`global.anthropic.claude-*`). The family parsers in `calculate_turn_cost`
+(`_opus_family` / `_model_family`) already bill these at the **base** first-party rate (e.g. `anthropic.claude-opus-4-8`
 → $5/$25).
 
 Bedrock list price matches the first-party Anthropic API for the same model. The
