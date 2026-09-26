@@ -162,7 +162,11 @@ uv run pytest tests/ -k "discover" -v  # Run tests matching pattern
 ## Key Data Flow
 
 1. Parse JSONL transcript from `~/.claude/projects/<project>/<session>.jsonl`
-2. Group messages into user->assistant turns, extract tool calls
+2. Group messages into user->assistant turns, extract tool calls. Consecutive user
+   entries with no reply between them are **one** turn: a slash command is written as a
+   `<command-name>` entry plus an `isMeta` expansion, and a prompt with an image as the
+   text plus an `isMeta` "[Image: ...]" entry. The turn starts at the last of them, so
+   TTFT is measured from the input the reply answers
 3. Deduplicate streaming updates (last message per `message.id`)
 4. Compute usage (tokens), latency, TTFT, cost
 5. Build Langfuse events (trace -> generation -> span hierarchy)
@@ -384,7 +388,7 @@ Each trace is enriched with:
 1. `customTitle` from `type: "custom-title"` (user-set via in-CLI title command)
 2. `aiTitle` from `type: "ai-title"` (Claude-generated short title once enough session context exists)
 3. `agentName` from `type: "agent-name"` (auto-generated mid-session slug, e.g. `langfuse-usagedetails-fix`)
-4. Truncated first non-synthetic user prompt (80 chars)
+4. Truncated first non-synthetic user prompt (80 chars) — the turn's `display_prompt`: the first typed (non-`isMeta`) text that is not a `<tag>` stub or an interrupt marker
 5. `{repo_name}/{git_branch}` composite — stable fallback when prompt is empty
 6. `"Claude Code Session"` hardcoded fallback
 
@@ -559,6 +563,12 @@ Trace (parent session)
 **Tags:** Traces with subagents get `has-subagents` and `subagents:{count}` tags for dashboard filtering.
 
 ## Important Notes
+
+- **Turn numbering changed (2026-09-26).** Generation IDs are `uuid5(session:turn:<index>)`.
+  Merging consecutive user entries into one turn shifted the index of most turns, so a
+  plain `--reprocess` would add new generations beside the old ones and double-count cost.
+  Delete the existing traces first (and wait for Langfuse's async delete to finish), then
+  reprocess.
 
 - `.env` contains generated secrets - never commit it
 - Hook errors are logged but never block Claude Code (async, fire-and-forget)

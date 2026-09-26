@@ -628,7 +628,7 @@ def ingest_subagent(
                 "id": gen_id,
                 "traceId": trace_id,
                 "parentObservationId": parent_span_id,
-                "name": f"Subagent Turn {turn_idx + 1}: {redact_secrets(truncate(turn['user_input'], 80))}",
+                "name": f"Subagent Turn {turn_idx + 1}: {redact_secrets(truncate(turn['display_prompt'], 80))}",
                 "model": model,
                 "input": redact_secrets(truncate(turn["user_input"], MAX_TEXT)) or None,
                 "output": redact_secrets(truncate(turn["assistant_output"], MAX_TEXT)) or None,
@@ -1368,12 +1368,38 @@ def parse_ts(ts_str: str) -> datetime | None:
         return None
 
 
+def _is_synthetic_prompt(text: str) -> bool:
+    """Wrapper-tag stubs and interrupt markers, which are not what anyone typed."""
+    text = text.strip()
+    return bool(_SYNTHETIC_PROMPT_RE.match(text)) or text.startswith("[Request interrupted")
+
+
+def _display_prompt(parts: list) -> str:
+    """The part of a turn's input to name it by: the first typed text,
+    else the first non-stub text (e.g. a skill expansion), else whatever
+    there is. `parts` is [(text, is_meta), ...] in file order."""
+    for text, is_meta in parts:
+        if not is_meta and not _is_synthetic_prompt(text):
+            return text.strip()
+    for text, _ in parts:
+        if not _is_synthetic_prompt(text):
+            return text.strip()
+    return parts[0][0].strip() if parts else ""
+
+
 def build_turns(entries: list[dict]) -> list[dict]:
     """Group transcript entries into turns with timing and token data.
 
+    A turn is everything the user sent before the assistant replied, plus the
+    reply. Consecutive user entries with no reply between them are one turn:
+    Claude Code writes a slash command as a `<command-name>` entry plus an
+    `isMeta` expansion, and a prompt with an image as the text plus an
+    `isMeta` "[Image: ...]" entry. The turn's start_time is the *last* of
+    those entries, so TTFT is measured from the input the reply answers.
+
     Returns list of turn dicts with keys:
-      user_input, assistant_output, tool_calls, start_time, end_time,
-      first_token_time, duration_ms, usage, model
+      user_input, display_prompt, assistant_output, tool_calls, start_time,
+      end_time, first_token_time, duration_ms, usage, model
     """
     msg_entries = []
 
@@ -1413,6 +1439,7 @@ def build_turns(entries: list[dict]) -> list[dict]:
                 # with is_error:true, so this is what keeps a denial out of
                 # tool_error_rate.
                 "denial_kind": entry.get("toolDenialKind", "") if etype == "user" else "",
+                "is_meta": bool(entry.get("isMeta")) if etype == "user" else False,
             })
         elif etype == "system" and entry.get("subtype") == "turn_duration":
             # Kept in file order: it belongs to the turn that just finished.
@@ -1460,13 +1487,20 @@ def build_turns(entries: list[dict]) -> list[dict]:
 
         if role == "user":
             text = extract_text_blocks(me["content"])
-            has_tool_results = bool(extract_tool_results(me["content"]))
 
-            if text.strip() and not (has_tool_results and not text.replace(" ", "").strip()):
+            if text.strip() and current_turn and not current_turn["api_call_ids"]:
+                # No reply yet: this entry is more of the same input.
+                current_turn["user_input"] += "\n\n" + text
+                current_turn["_user_parts"].append((text, me.get("is_meta", False)))
+                current_turn["start_time"] = me["timestamp"] or current_turn["start_time"]
+                current_turn["end_time"] = current_turn["start_time"]
+                current_turn["messages"].append(me)
+            elif text.strip():
                 if current_turn:
                     turns.append(current_turn)
                 current_turn = {
                     "user_input": text,
+                    "_user_parts": [(text, me.get("is_meta", False))],
                     "assistant_output": "",
                     "tool_calls": [],
                     "_seen_tool_ids": set(),
@@ -1644,6 +1678,7 @@ def build_turns(entries: list[dict]) -> list[dict]:
         turn["api_call_ids"] = list(turn["api_call_ids"])  # make serializable
         turn["attribution_skills_all"] = sorted(turn["attribution_skills_all"])
         turn["attribution_plugins_all"] = sorted(turn["attribution_plugins_all"])
+        turn["display_prompt"] = _display_prompt(turn.pop("_user_parts"))
 
     return turns
 
@@ -2704,8 +2739,8 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
     # repo/branch when every turn is a stub.
     first_real_prompt = ""
     for t in turns:
-        ui = (t.get("user_input") or "").strip()
-        if ui and not _SYNTHETIC_PROMPT_RE.match(ui):
+        ui = (t.get("display_prompt") or "").strip()
+        if ui and not _is_synthetic_prompt(ui):
             first_real_prompt = ui
             break
 
@@ -2882,7 +2917,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
         gen_body = {
             "id": gen_id,
             "traceId": trace_id,
-            "name": f"Turn {turn_idx + 1}: {redact_secrets(truncate(turn['user_input'], 80))}",
+            "name": f"Turn {turn_idx + 1}: {redact_secrets(truncate(turn['display_prompt'], 80))}",
             "model": model,
             "input": redact_secrets(truncate(turn["user_input"], MAX_TEXT)) or None,
             "output": redact_secrets(truncate(turn["assistant_output"], MAX_TEXT)) or None,
