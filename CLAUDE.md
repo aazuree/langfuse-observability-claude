@@ -68,6 +68,11 @@ handling:
 | transient | 5xx, 429, 408, network, unparseable body | `False` | offset held back, retried next fire |
 | permanent | 400/401/403/404/422, unreadable error entry | `True` + `[ERROR]` log | events dropped, offset advances |
 
+A whole request refused with an HTTP error status (not a 207) follows the
+same split: **400 / 413 / 422** are permanent (the payload can never be
+accepted), while **401 / 403** are retried with 5xx/429, because bad keys get
+fixed by a human and dropping the events meanwhile would lose them.
+
 Advancing on a permanent rejection is deliberate. Retrying a validation error
 can never succeed, and holding the offset back would wedge the session: every
 later fire would resend an ever-growing window that can never drain. Losing
@@ -146,6 +151,8 @@ uv run pytest tests/ -k "discover" -v  # Run tests matching pattern
 - `LOG_FILE` honours the `LANGFUSE_HOOK_LOG` env var (both hooks), defaulting to `~/.claude/langfuse-hook.log`. `tests/conftest.py` sets it to a temp dir — **without that, a `pytest` run appends fixture sessions to the production log and its tail can no longer be trusted for live diagnosis.** Because `LOG_FILE` is evaluated at import time, the override must be set before the hook module is imported.
 - Secret redaction via `SECRET_PATTERNS` regex list before any data leaves the machine
 - Session IDs sanitized via `sanitize_id()` to prevent path traversal
+- State files are written with `atomic_write_text()` (temp file + `os.replace`), so a crash mid-write cannot truncate an offset back to 0
+- Both hooks wrap their entry point: an unexpected exception is logged as `[ERROR] … crashed` with its traceback instead of vanishing to stderr. `--reprocess` logs and skips a failing session rather than aborting the run
 - Incremental processing: state files track processed line offsets per session
 - Deterministic event IDs (UUID5) prevent duplicates on re-ingestion
 - Batch sends in chunks of 50 events to Langfuse ingestion API

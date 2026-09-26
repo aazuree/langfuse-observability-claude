@@ -20,15 +20,17 @@ import json
 import os
 import re
 import sys
+import traceback
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 # Ensure langfuse_common can be imported from the same directory
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from langfuse_common import (
+    atomic_write_text,
     classify_ingestion_errors,
     iter_transcript,
     log as common_log,
@@ -79,6 +81,11 @@ def sanitize_id(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()[:32]
 
 
+# Whole-request HTTP statuses that no retry can fix: malformed, too large, or
+# unprocessable. See send_to_langfuse.
+PERMANENT_HTTP_STATUSES = frozenset({400, 413, 422})
+
+
 def send_to_langfuse(batch: list[dict]) -> bool:
     """Send events to Langfuse in batches of 50.
 
@@ -125,6 +132,18 @@ def send_to_langfuse(batch: list[dict]) -> bool:
                     )
                 else:
                     log(f"Langfuse accepted {len(chunk)} events ({resp.status})")
+        except HTTPError as e:
+            # The whole request was refused. 400/413/422 mean this payload
+            # can never be accepted; retrying it would resend a growing batch
+            # on every fire. 401/403 (bad keys) and 5xx/429 can be fixed or
+            # pass, so those keep the events for the next fire.
+            if e.code in PERMANENT_HTTP_STATUSES:
+                log(f"[ERROR] Langfuse rejected the whole request of {len(chunk)} "
+                    f"event(s) (HTTP {e.code}): {e.reason}")
+                permanent += len(chunk)
+            else:
+                log(f"Failed to send to Langfuse: HTTP {e.code} {e.reason}")
+                transient += 1
         except (URLError, TimeoutError, OSError) as e:
             log(f"Failed to send to Langfuse: {e}")
             transient += 1
@@ -161,7 +180,7 @@ def load_state(session_id: str) -> tuple[int, int]:
 def save_state(session_id: str, line_offset: int, turn_count: int) -> None:
     Path(STATE_DIR).mkdir(parents=True, exist_ok=True)
     state_file = os.path.join(STATE_DIR, f"{session_id}.offset")
-    Path(state_file).write_text(json.dumps({"lines": line_offset, "turns": turn_count}))
+    atomic_write_text(state_file, json.dumps({"lines": line_offset, "turns": turn_count}))
 
 
 def load_subagent_state(session_id: str) -> dict:
@@ -179,7 +198,7 @@ def save_subagent_state(session_id: str, state: dict) -> None:
     """Save subagent processing state."""
     Path(STATE_DIR).mkdir(parents=True, exist_ok=True)
     state_file = os.path.join(STATE_DIR, f"{session_id}.subagents.json")
-    Path(state_file).write_text(json.dumps(state))
+    atomic_write_text(state_file, json.dumps(state))
 
 
 def _project_dir_from_cwd(cwd: str) -> str:
@@ -2781,7 +2800,6 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
         if duration_ms and start_time:
             st = parse_ts(start_time)
             if st:
-                from datetime import timedelta
                 computed_end = st + timedelta(milliseconds=duration_ms)
                 end_time = computed_end.isoformat()
 
@@ -3080,10 +3098,11 @@ def reprocess_all() -> None:
 
         try:
             process_session(session_id, str(transcript), cwd, live=False)
-        except (IOError, OSError, json.JSONDecodeError, ValueError) as e:
-            # Broad exception from process_session (file I/O, JSON, parsing errors)
-            print(f"  Error: {e}")
-            log(f"Reprocess error for {session_id}: {e}")
+        except Exception as e:
+            # One bad transcript must not abort every session after it.
+            print(f"  Error: {type(e).__name__}: {e}")
+            log(f"[ERROR] Reprocess failed for {session_id}: {type(e).__name__}: {e}\n"
+                + traceback.format_exc())
 
     print(f"\nDone. Reprocessed {total} session(s).")
 
@@ -3099,7 +3118,22 @@ def main() -> None:
         # Invalid JSON in stdin
         log(f"Failed to parse stdin: {e}")
         return
+    if not isinstance(hook_input, dict):
+        log(f"[ERROR] Hook stdin is not a JSON object: {type(hook_input).__name__}")
+        return
 
+    try:
+        run_stop_hook(hook_input)
+    except Exception as e:
+        # Claude Code shows hook stderr at most once; the log is where a crash
+        # has to land to be found later.
+        log(f"[ERROR] Stop hook crashed for session "
+            f"{hook_input.get('session_id', 'unknown')}: {type(e).__name__}: {e}\n"
+            + traceback.format_exc())
+
+
+def run_stop_hook(hook_input: dict) -> None:
+    """Handle one Stop event payload. Exceptions propagate to main()."""
     if not LANGFUSE_PUBLIC_KEY or not LANGFUSE_SECRET_KEY:
         log("LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY must be set")
         return

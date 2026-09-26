@@ -8,6 +8,7 @@ import base64
 import json
 import os
 import re
+import tempfile
 from datetime import datetime, timezone
 from typing import Iterator
 
@@ -39,6 +40,29 @@ def iter_transcript(transcript_path: str) -> Iterator[dict]:
                     continue
     except (IOError, OSError):
         return
+
+
+def atomic_write_text(path: str, text: str) -> None:
+    """Replace `path` with `text` so a reader sees either the old file or the
+    new one, never a truncated mix.
+
+    Writes a sibling temp file, fsyncs it, and os.replace()s it into place.
+    On any failure the temp file is removed and the original is untouched.
+    """
+    directory = os.path.dirname(path) or "."
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-", suffix=os.path.basename(path))
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def log(log_file: str, msg: str) -> None:

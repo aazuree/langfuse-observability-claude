@@ -16,6 +16,7 @@ Environment variables:
 import json
 import os
 import sys
+import traceback
 import uuid
 from datetime import datetime, timezone
 from urllib.error import URLError
@@ -113,7 +114,7 @@ def send_batch(batch: list[dict]) -> None:
                 )
             else:
                 log(f"Langfuse accepted {len(batch)} events ({resp.status})")
-    except URLError as e:
+    except (URLError, TimeoutError, OSError) as e:
         log(f"Failed to send to Langfuse: {e}")
 
 
@@ -123,7 +124,18 @@ def main() -> None:
     except json.JSONDecodeError as e:
         log(f"Failed to parse stdin: {e}")
         return
+    if not isinstance(hook_input, dict):
+        log(f"[ERROR] Hook stdin is not a JSON object: {type(hook_input).__name__}")
+        return
+    try:
+        handle_event(hook_input)
+    except Exception as e:
+        log(f"[ERROR] StopFailure hook crashed: {type(e).__name__}: {e}\n"
+            + traceback.format_exc())
 
+
+def handle_event(hook_input: dict) -> None:
+    """Dispatch one hook payload. Exceptions propagate to main()."""
     if not LANGFUSE_PUBLIC_KEY or not LANGFUSE_SECRET_KEY:
         log("LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY must be set")
         return
