@@ -48,7 +48,7 @@ LANGFUSE_HOST=http://<remote-ip>:3100 \
 
 - **Dashboard**: http://localhost:3100
 - **Hook log**: `~/.claude/langfuse-hook.log` (auto-rotates at 10 MB)
-- **State files**: `~/.claude/langfuse-state/<session_id>.offset` (parent), `<session_id>.subagents.json` (subagents)
+- **State files**: `~/.claude/langfuse-state/<session_id>.offset` (parent), `<session_id>.subagents.json` (subagents), `<session_id>.lock` (per-session `flock`: fires of one session run one at a time, waiting up to `SESSION_LOCK_TIMEOUT_S = 120`; needed once the Stop hook runs `"async": true`)
 
 ### Reading the ingestion result
 

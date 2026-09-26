@@ -15,11 +15,13 @@ Environment variables:
   LANGFUSE_HOST        - Langfuse base URL (default: http://localhost:3100)
 """
 
+import contextlib
 import hashlib
 import json
 import os
 import re
 import sys
+import time
 import traceback
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -59,6 +61,10 @@ SAFE_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 # system reminders, prompt-submit hooks). Used to skip these when picking
 # a human-readable trace name from the first user prompt.
 _SYNTHETIC_PROMPT_RE = re.compile(r"^<[a-z][a-z0-9-]*>")
+
+# How long a fire waits for another fire of the same session to finish.
+# Longer than a worst-case send (15s timeout per 50-event chunk).
+SESSION_LOCK_TIMEOUT_S = 120
 
 SUBAGENT_MATCH_WINDOW_S = 60  # Max seconds between Agent tool_use and subagent start
 MAX_SUBAGENT_DEPTH = 5  # CC 2.1.172: sub-agents can spawn sub-agents up to 5 levels
@@ -2597,8 +2603,52 @@ def gen_metadata_cache_miss(turn: dict) -> dict:
     }
 
 
+@contextlib.contextmanager
+def _session_lock(session_id: str):
+    """Hold an exclusive per-session lock; yields False if it timed out.
+
+    With the Stop hook registered as `"async": true`, a new fire can start
+    while the previous one for the same session is still sending. Without the
+    lock both read the same offset, send overlapping batches and race on the
+    state files. The lock is advisory (flock) and released when the process
+    exits, so a crashed fire cannot leave it stuck.
+    """
+    try:
+        import fcntl
+    except ImportError:  # not POSIX: run unlocked, as before
+        yield True
+        return
+    Path(STATE_DIR).mkdir(parents=True, exist_ok=True)
+    fd = os.open(os.path.join(STATE_DIR, f"{session_id}.lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        deadline = time.monotonic() + SESSION_LOCK_TIMEOUT_S
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    yield False
+                    return
+                time.sleep(0.1)
+        yield True
+    finally:
+        os.close(fd)
+
+
 def process_session(session_id: str, transcript_path: str, cwd: str, last_assistant_message: str = "", live: bool = True, background_tasks: list = None, session_crons: list = None) -> None:
-    """Core processing logic for a single session transcript."""
+    """Process one session transcript, one fire per session at a time."""
+    with _session_lock(session_id) as acquired:
+        if not acquired:
+            log(f"[WARN] Session {session_id} still locked by another fire after "
+                f"{SESSION_LOCK_TIMEOUT_S}s; skipping — the next fire picks up these lines")
+            return
+        _process_session_locked(session_id, transcript_path, cwd, last_assistant_message,
+                                live, background_tasks, session_crons)
+
+
+def _process_session_locked(session_id: str, transcript_path: str, cwd: str, last_assistant_message: str = "", live: bool = True, background_tasks: list = None, session_crons: list = None) -> None:
+    """Core processing logic for a single session transcript. Caller holds the session lock."""
     # Session-level effort fallback from the live hook environment
     # ($CLAUDE_EFFORT, v2.1.133+). Not recoverable on reprocess, so it is
     # omitted then and Langfuse's upsert preserves any prior value.
