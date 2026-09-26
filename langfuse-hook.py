@@ -462,13 +462,14 @@ def ingest_subagent(
     if not turns:
         return [], empty_cost, total_lines, prior_turn_count, "partial"
 
-    # Determine completeness from last entry
+    # Complete when the last assistant entry ended its turn. stop_reason lives
+    # inside `message`; reading it off the entry itself never matched, so
+    # every subagent used to report "partial".
     status = "partial"
     for entry in reversed(entries):
-        if entry.get("stop_reason") == "end_turn":
-            status = "complete"
-            break
-        if entry.get("type") == "assistant":
+        if entry.get("type") == "assistant" and not entry.get("isApiErrorMessage"):
+            if (entry.get("message") or {}).get("stop_reason") == "end_turn":
+                status = "complete"
             break
 
     now = datetime.now(timezone.utc).isoformat()

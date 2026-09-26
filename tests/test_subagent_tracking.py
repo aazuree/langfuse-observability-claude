@@ -227,11 +227,13 @@ def _make_full_subagent_jsonl(directory, agent_id, start_ts="2026-03-29T10:00:01
         {
             "type": "assistant",
             "timestamp": "2026-03-29T10:00:10+00:00",
-            "stop_reason": "end_turn",
+            # Real transcripts carry stop_reason inside `message`, never at
+            # the entry's top level.
             "message": {
                 "id": f"msg-{agent_id}-2",
                 "role": "assistant",
                 "model": "claude-sonnet-4-6",
+                "stop_reason": "end_turn",
                 "content": [{"type": "text", "text": "Done implementing."}],
                 "usage": {
                     "input_tokens": 200, "output_tokens": 80,
@@ -1021,8 +1023,7 @@ def _make_agent_spawning_jsonl(directory, agent_id, child_tool_use_id,
              {"type": "tool_result", "tool_use_id": child_tool_use_id,
               "content": "done"}]}},
         {"type": "assistant", "timestamp": "2026-06-10T10:00:10+00:00",
-         "stop_reason": "end_turn",
-         "message": {"id": f"m2-{agent_id}", "role": "assistant",
+         "message": {"stop_reason": "end_turn", "id": f"m2-{agent_id}", "role": "assistant",
                      "model": "claude-opus-4-8",
                      "content": [{"type": "text", "text": "child done"}],
                      "usage": {"input_tokens": 5, "output_tokens": 5,
@@ -1121,8 +1122,7 @@ def test_process_session_nested_subagents_tag_and_rollup(tmp_path, monkeypatch):
          "message": {"role": "user", "content": [
              {"type": "tool_result", "tool_use_id": "toolu_P1", "content": "done"}]}},
         {"type": "assistant", "timestamp": "2026-06-10T10:00:21+00:00",
-         "stop_reason": "end_turn",
-         "message": {"id": "mm2", "role": "assistant", "model": "claude-opus-4-8",
+         "message": {"stop_reason": "end_turn", "id": "mm2", "role": "assistant", "model": "claude-opus-4-8",
                      "content": [{"type": "text", "text": "all done"}],
                      "usage": {"input_tokens": 5, "output_tokens": 5,
                                "cache_read_input_tokens": 0,
