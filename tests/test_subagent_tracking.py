@@ -729,8 +729,8 @@ def test_project_dir_from_cwd_hidden_dirs():
 
 def test_project_dir_from_cwd_worktree_path():
     """Real worktree cwd matches observed Claude Code project dir naming."""
-    cwd = "/home/bharath/repository/git/langfuse-observability/.claude/worktrees/attribution-skill-capture"
-    expected = "-home-bharath-repository-git-langfuse-observability--claude-worktrees-attribution-skill-capture"
+    cwd = "/home/user/repo/langfuse-observability/.claude/worktrees/attribution-skill-capture"
+    expected = "-home-user-repo-langfuse-observability--claude-worktrees-attribution-skill-capture"
     assert langfuse_hook._project_dir_from_cwd(cwd) == expected
 
 

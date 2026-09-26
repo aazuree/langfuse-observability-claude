@@ -92,12 +92,14 @@ the **pk/sk from the Pi's `.env`** (Step 1) — the keys must match the Pi's pro
   "hooks": {
     "Stop": [
       { "hooks": [ { "type": "command",
-        "command": "LANGFUSE_HOST=http://192.168.1.50:3100 LANGFUSE_PUBLIC_KEY=pk-lf-... LANGFUSE_SECRET_KEY=sk-lf-... python3 /path/to/langfuse-hook.py"
+        "command": "LANGFUSE_HOST=http://192.168.1.50:3100 LANGFUSE_PUBLIC_KEY=pk-lf-... LANGFUSE_SECRET_KEY=sk-lf-... python3 /path/to/langfuse-hook.py",
+        "async": true
       } ] }
     ],
     "StopFailure": [
       { "hooks": [ { "type": "command",
-        "command": "LANGFUSE_HOST=http://192.168.1.50:3100 LANGFUSE_PUBLIC_KEY=pk-lf-... LANGFUSE_SECRET_KEY=sk-lf-... python3 /path/to/session-start-hook.py"
+        "command": "LANGFUSE_HOST=http://192.168.1.50:3100 LANGFUSE_PUBLIC_KEY=pk-lf-... LANGFUSE_SECRET_KEY=sk-lf-... python3 /path/to/session-start-hook.py",
+        "async": true
       } ] }
     ]
   }

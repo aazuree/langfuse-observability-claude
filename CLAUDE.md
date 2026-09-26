@@ -96,14 +96,14 @@ langfuse-hook.py --> POST --> Langfuse API (localhost:3100)
 
     | (StopFailure hook fires when a turn ends in API error)
     v
-session-start-hook.py --> POST --> Langfuse API (trace-update: stop-failure tag)
+session-start-hook.py --> POST --> Langfuse API (trace-create upsert: stop-failure tag)
 ```
 
 All services bound to `127.0.0.1` only. API key never leaves the machine.
 
 ## Tech Stack
 
-- **Hook script**: Python 3.8+, stdlib only (zero external deps)
+- **Hook script**: Python 3.10+ (PEP 604 annotations are evaluated at import; CI runs on 3.10), stdlib only (zero external deps)
 - **Backend**: Langfuse v4 in legacy write mode (web + worker), PostgreSQL 18, ClickHouse 26, Redis 8, MinIO
 - **Deployment**: Docker Compose (6 services)
 - **Setup**: `./setup.sh` (generates secrets, starts containers, configures hook)
@@ -119,6 +119,8 @@ setup.sh                         # One-command setup (generates .env, starts ser
 .env                             # Generated secrets (gitignored)
 tools/
   check_pricing_drift.py         # Compares hardcoded pricing against a public feed (manual/CI, never run by the hook)
+  render_env.py                  # setup.sh: fills the .env template literally (no sed), escapes $ for compose
+  configure_hooks.py             # setup.sh: registers Stop + StopFailure hooks (async) in settings.json
 tests/
   test_langfuse_hook.py          # Core hook unit tests
   conftest.py                    # Redirects LANGFUSE_HOOK_LOG so tests never touch the real log
@@ -132,6 +134,13 @@ tests/
   test_session_hooks.py          # StopFailure hook tests
   test_hook_scores.py            # Hook-level score classifier tests
   test_subagent_tracking.py      # Subagent cost tracking tests
+  test_subagent_resume.py        # Background subagents resumed after their parent turn was sent
+  test_session_rollups.py        # Trace rollups cover the whole session; no null metadata; late turn_duration
+  test_turn_merging.py           # Consecutive user entries before a reply form one turn
+  test_session_lock.py           # Per-session lock for overlapping (async) fires
+  test_robustness.py             # Atomic state writes, logged crashes, HTTP-level rejections
+  test_delete_traces.py          # --delete-traces migration helper
+  test_setup_tools.py            # tools/render_env.py and tools/configure_hooks.py
 ```
 
 ## Running Tests
@@ -167,7 +176,7 @@ uv run pytest tests/ -k "discover" -v  # Run tests matching pattern
    `<command-name>` entry plus an `isMeta` expansion, and a prompt with an image as the
    text plus an `isMeta` "[Image: ...]" entry. The turn starts at the last of them, so
    TTFT is measured from the input the reply answers
-3. Deduplicate streaming updates (last message per `message.id`)
+3. Deduplicate streaming updates (one usage per `message.id` — every streamed entry carries the same usage since v2.1.97, so the first is taken)
 4. Compute usage (tokens), latency, TTFT, cost
 5. Build Langfuse events (trace -> generation -> span hierarchy)
 6. POST batch to `/api/public/ingestion`, save state offset
@@ -573,14 +582,14 @@ Trace (parent session)
   `--reprocess`.
 
 - `.env` contains generated secrets - never commit it
-- Hook errors are logged but never block Claude Code (async, fire-and-forget)
+- Hooks never block Claude Code: `setup.sh` registers both with `"async": true`, and every error, including an unexpected crash, goes to the hook log. A hook registered without `async` runs in the foreground (measured: median 0.8s, max 23s per Stop)
 - First Langfuse login may need incognito window (stale CSRF tokens)
 - `setup.sh` backs up existing `~/.claude/settings.json` before modifying hooks
 - All ports are localhost-only by default. LAN exposure of the dashboard is opt-in via `LANGFUSE_WEB_BIND` in `.env` (bind to host LAN IP; HTTP only, no TLS) — see `REMOTE-DEPLOY.md`. All other services stay `127.0.0.1`.
 
 ## Hook-Level Scores
 
-Two heuristic scores are attached to every trace during ingestion:
+Three heuristic scores are attached to every trace during ingestion, each computed over the whole session on every fire:
 
 | Score | Type | Values | Source |
 |-------|------|--------|--------|
