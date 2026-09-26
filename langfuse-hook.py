@@ -451,6 +451,45 @@ def discover_subagents(
     return matched
 
 
+def _file_size(path: str) -> int | None:
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return None
+
+
+# sa_state bookkeeping that is not reported in trace metadata (a path would
+# also leak the local username).
+_SA_STATE_ONLY_KEYS = frozenset({"path", "size", "parent_span_id", "offset", "correlation"})
+
+
+def _subagent_record(prev: dict, events: list, cost: dict, offset: int,
+                     turn_count: int, status: str, **fields) -> dict:
+    """The sa_state entry for one subagent after an ingest_subagent call.
+
+    `cost` is the agent's whole cost (ingest_subagent re-reads the full
+    transcript), so it replaces the previous totals instead of adding to
+    them. When the call produced no events the agent had nothing new, and
+    its recorded status and totals are kept.
+
+    `path`, `size` and `parent_span_id` let a later fire resume the agent
+    without finding its Agent call again — a background agent keeps writing
+    after the parent turn that launched it has been sent.
+    """
+    if not events and prev:
+        return {**prev, **fields, "offset": offset}
+    return {
+        **prev,
+        **fields,
+        "offset": offset,
+        "turn_count": turn_count,
+        "status": status,
+        "total_cost": cost["total_cost"],
+        "total_tokens": cost["total_tokens"],
+        "cost_breakdown": cost["cost_breakdown"],
+    }
+
+
 def ingest_subagent(
     agent_id: str,
     transcript_path: str,
@@ -467,6 +506,16 @@ def ingest_subagent(
 ) -> tuple:
     """Parse a subagent transcript and build Langfuse events.
 
+    Reads the whole transcript every time, like the parent: a background
+    agent is usually mid-turn when a fire reads it, and the lines after a
+    saved offset carry no user prompt to start a turn from, so parsing only
+    the tail dropped them. Generations are sent from the last turn a previous
+    call sent (`prior_turn_count - 1`) onward, and `cost_summary` is the
+    agent's *whole* cost — callers replace their totals with it.
+
+    Returns nothing new (empty events) when the transcript has not grown
+    since `subagent_offset`.
+
     Recurses into nested Agent dispatches (CC 2.1.172+) resolved via
     meta_index, up to MAX_SUBAGENT_DEPTH levels; `visited` guards cycles.
     Nested children are recorded in sa_state with depth/parent lineage.
@@ -482,11 +531,11 @@ def ingest_subagent(
                   "turns": 0, "status": "partial",
                   "cost_breakdown": {"input": 0, "output": 0, "cache_read": 0, "cache_creation": 0}}
 
-    entries, total_lines, read_ok = parse_transcript(transcript_path, skip_lines=subagent_offset)
+    entries, total_lines, read_ok = parse_transcript(transcript_path, warn_after=subagent_offset)
     if not read_ok:
         # Preserve the prior offset on read failure so the next fire retries.
         return [], empty_cost, subagent_offset, prior_turn_count, "partial"
-    if not entries:
+    if not entries or (subagent_offset and total_lines == subagent_offset):
         return [], empty_cost, total_lines, prior_turn_count, "partial"
 
     turns = build_turns(entries)
@@ -509,8 +558,9 @@ def ingest_subagent(
     total_tokens = 0
     cost_breakdown = {"input": 0.0, "output": 0.0, "cache_read": 0.0, "cache_creation": 0.0}
 
+    emit_from = max(0, min(prior_turn_count, len(turns)) - 1)
     for turn_idx, turn in enumerate(turns):
-        gen_id = f"gen-subagent-{agent_id}-{prior_turn_count + turn_idx}"
+        gen_id = f"gen-subagent-{agent_id}-{turn_idx}"
         start_time = turn["start_time"]
         end_time = turn["end_time"]
         usage = turn["usage"]
@@ -534,6 +584,8 @@ def ingest_subagent(
             cost_breakdown["output"] += cost_details.get("output", 0)
             cost_breakdown["cache_read"] += cost_details.get("cache_read_input_tokens", 0)
             cost_breakdown["cache_creation"] += cost_details.get("cache_creation_input_tokens", 0)
+        if turn_idx < emit_from:
+            continue  # already sent; counted in the totals only
 
         usage_details = {
             "input": usage["input"], "output": usage["output"], "total": usage["total"],
@@ -589,7 +641,7 @@ def ingest_subagent(
         })
 
         for tc_idx, tc in enumerate(turn["tool_calls"]):
-            span_id = f"span-subagent-{agent_id}-{prior_turn_count + turn_idx}-{tc_idx}"
+            span_id = f"span-subagent-{agent_id}-{turn_idx}-{tc_idx}"
             tool_input = tc["input"]
             tool_input_str = json.dumps(tool_input) if not isinstance(tool_input, str) else tool_input
             tool_input_str = redact_secrets(tool_input_str)
@@ -629,6 +681,7 @@ def ingest_subagent(
                 child_id = child["agent_id"]
                 if child_id not in visited:
                     child_prev = (sa_state or {}).get(child_id, {})
+                    c_size = _file_size(child["path"])
                     c_events, c_cost, c_offset, c_tc, c_status = ingest_subagent(
                         agent_id=child_id,
                         transcript_path=child["path"],
@@ -647,23 +700,16 @@ def ingest_subagent(
                     # Nested-child cost stays out of this agent's own cost_summary;
                     # the trace-level subagent_costs rollup sums all agents flat.
                     if sa_state is not None:
-                        sa_state[child_id] = {
-                            "offset": c_offset,
-                            "turn_count": c_tc,
-                            "status": c_status,
-                            "total_cost": round(child_prev.get("total_cost", 0.0) + c_cost["total_cost"], 6),
-                            "total_tokens": child_prev.get("total_tokens", 0) + c_cost["total_tokens"],
-                            "cost_breakdown": {
-                                k: round(child_prev.get("cost_breakdown", {}).get(k, 0.0) + v, 6)
-                                for k, v in c_cost["cost_breakdown"].items()
-                            },
-                            "description": child["description"],
-                            "subagent_type": child["agent_type"],
-                            "parent_agent_id": agent_id,
-                            "depth": depth + 1,
-                        }
+                        sa_state[child_id] = _subagent_record(
+                            child_prev, c_events, c_cost, c_offset, c_tc, c_status,
+                            description=child["description"],
+                            subagent_type=child["agent_type"],
+                            path=child["path"], size=c_size,
+                            parent_span_id=span_id, correlation="meta",
+                            depth=depth + 1, parent_agent_id=agent_id,
+                        )
 
-    new_turn_count = prior_turn_count + len(turns)
+    new_turn_count = len(turns)
     cost_summary = {
         "agent_id": agent_id,
         "total_cost": round(total_cost, 6),
@@ -2947,6 +2993,7 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 sa_prev_offset = sa_state.get(sa_id, {}).get("offset", 0)
                 sa_prior_turns = sa_state.get(sa_id, {}).get("turn_count", 0)
                 sa_parent_span = f"span-{turn_id}-{sa_tc_idx}"
+                sa_size = _file_size(sa_path)
 
                 sa_events, sa_cost, sa_new_offset, sa_new_tc, sa_status = ingest_subagent(
                     agent_id=sa_id,
@@ -2962,25 +3009,13 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                     sa_state=sa_state,
                 )
                 batch.extend(sa_events)
-                _prev = sa_state.get(sa_id, {})
-                if not sa_events and _prev:
-                    # Re-sent turn whose subagent has nothing new: keep its
-                    # recorded status and totals rather than resetting them.
-                    sa_state[sa_id] = {**_prev, "offset": sa_new_offset}
-                else:
-                    sa_state[sa_id] = {
-                        "offset": sa_new_offset,
-                        "turn_count": sa_new_tc,
-                        "status": sa_status,
-                        "total_cost": round(_prev.get("total_cost", 0.0) + sa_cost["total_cost"], 6),
-                        "total_tokens": _prev.get("total_tokens", 0) + sa_cost["total_tokens"],
-                        "cost_breakdown": {
-                            k: round(_prev.get("cost_breakdown", {}).get(k, 0.0) + v, 6)
-                            for k, v in sa_cost["cost_breakdown"].items()
-                        },
-                        "description": sa_desc,
-                        "subagent_type": sa_type,
-                    }
+                sa_state[sa_id] = _subagent_record(
+                    sa_state.get(sa_id, {}), sa_events, sa_cost,
+                    sa_new_offset, sa_new_tc, sa_status,
+                    description=sa_desc, subagent_type=sa_type,
+                    path=sa_path, size=sa_size, parent_span_id=sa_parent_span,
+                    correlation=sa_corr, depth=1,
+                )
 
                 # Enrich Agent tool span metadata
                 for evt in batch:
@@ -2991,9 +3026,41 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                             "subagent_description": sa_desc,
                             "subagent_cost": sa_state[sa_id]["total_cost"],
                             "subagent_tokens": sa_state[sa_id]["total_tokens"],
-                            "subagent_status": sa_status,
+                            "subagent_status": sa_state[sa_id]["status"],
                         })
                         break
+
+    # Resume agents whose Agent call is in a turn this fire did not re-send.
+    # A background agent keeps writing after the parent turn that launched it
+    # ends; its recorded parent span lets it be picked up again here.
+    for sa_id, prev in list(sa_state.items()):
+        if sa_id in sa_visited or not isinstance(prev, dict):
+            continue
+        sa_path, sa_parent_span = prev.get("path"), prev.get("parent_span_id")
+        if not sa_path or not sa_parent_span:
+            continue  # recorded before resume support; --reprocess fills it in
+        sa_size = _file_size(sa_path)
+        if sa_size is None or sa_size == prev.get("size"):
+            continue
+        sa_events, sa_cost, sa_new_offset, sa_new_tc, sa_status = ingest_subagent(
+            agent_id=sa_id,
+            transcript_path=sa_path,
+            parent_span_id=sa_parent_span,
+            trace_id=trace_id,
+            session_id=session_id,
+            subagent_offset=prev.get("offset", 0),
+            prior_turn_count=prev.get("turn_count", 0),
+            correlation=prev.get("correlation", "meta"),
+            meta_index=sa_meta_index,
+            depth=prev.get("depth", 1),
+            visited=sa_visited,
+            sa_state=sa_state,
+        )
+        batch.extend(sa_events)
+        sa_state[sa_id] = _subagent_record(
+            prev, sa_events, sa_cost, sa_new_offset, sa_new_tc, sa_status, size=sa_size)
+        if sa_events:
+            log(f"Resumed background subagent {sa_id}: {len(sa_events)} events")
 
     # Rebuild subagent_cost_summaries from all known agents (cumulative across
     # fires). The parent's own cost is session_cost, computed over every turn;
@@ -3002,7 +3069,9 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
     _known_agents = {k: v for k, v in sa_state.items() if isinstance(v, dict)}
     if _known_agents:
         subagent_cost_summaries = [
-            {"agent_id": aid, **state} for aid, state in _known_agents.items()
+            {"agent_id": aid,
+             **{k: v for k, v in state.items() if k not in _SA_STATE_ONLY_KEYS}}
+            for aid, state in _known_agents.items()
         ]
 
     # Add subagent cost summary to trace

@@ -521,6 +521,17 @@ When Claude Code spawns subagents via the Agent tool, the hook automatically dis
 4. Ingests subagent turns as generations nested under the Agent tool span
 5. Rolls up per-subagent and total harness cost in trace metadata
 
+**Background agents and resume:** an async Agent call returns "Async agent launched" at
+once, so the parent turn ends while the subagent is still working. Each `sa_state` entry
+records the agent's transcript `path`, its `size` at last read, and the `parent_span_id` of
+its Agent tool span. Every fire re-ingests any known agent whose file has grown, even when
+its Agent call sits in a turn that is no longer re-sent. `ingest_subagent` always reads the
+whole subagent transcript (a resumed agent is usually mid-turn, and a tail with no user
+prompt builds no turns), sends generations from its last sent turn onward, and returns the
+agent's **whole** cost; `_subagent_record` replaces the stored totals with it rather than
+adding to them. Entries written before this carry no `path`, so they are only completed by
+`--reprocess`.
+
 **Nested sub-agents (CC 2.1.172+):** sub-agents can spawn sub-agents up to 5 levels deep.
 Transcripts stay in the flat `<session>/subagents/` dir; each `.meta.json`'s `toolUseId`
 points at the `Agent` tool_use in the *spawner's* transcript. `ingest_subagent` recurses
