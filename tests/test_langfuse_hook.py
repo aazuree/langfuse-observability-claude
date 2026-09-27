@@ -1260,6 +1260,12 @@ class TestCalculateTurnCost:
         ("claude-opus-4-20250514",      15.0,   75.0),
         ("claude-3-5-haiku-20241022",    0.80,   4.0),
         ("claude-3-haiku-20240307",      0.25,   1.25),
+        ("claude-3-7-sonnet-20250219",   3.0,   15.0),
+        ("claude-3-5-sonnet-20241022",   3.0,   15.0),
+        ("anthropic.claude-3-5-sonnet-20241022-v2:0", 3.0, 15.0),
+        ("us.anthropic.claude-sonnet-4-5-20250929-v1:0", 3.0, 15.0),
+        ("claude-fable-5-1",            10.0,   50.0),
+        ("claude-mythos-5-1",           10.0,   50.0),
     ])
     def test_all_known_models_have_explicit_pricing(self, model, expected_input, expected_output):
         """Ensures every known model ID hits an explicit branch, not the unknown-model fallback."""
@@ -1271,6 +1277,25 @@ class TestCalculateTurnCost:
             f"Model '{model}' triggered unknown-model fallback — update calculate_turn_cost()"
         assert abs(inp_cost - expected_input) < 0.001, f"{model} input cost wrong"
         assert abs(out_cost - expected_output) < 0.001, f"{model} output cost wrong"
+
+    @pytest.mark.parametrize("model", [
+        # Each of these contains a known family as a substring. Substring
+        # matching billed them silently at the predecessor's rate — the bug
+        # already fixed for Opus (claude-opus-5-5 billed as Opus 5).
+        "claude-sonnet-5-5",
+        "claude-sonnet-6",
+        "claude-haiku-5",
+        "claude-haiku-4-6",
+        "claude-fable-6",
+        "claude-mythos-6",
+    ])
+    def test_unreleased_versions_of_known_families_warn(self, model, monkeypatch):
+        warnings = []
+        monkeypatch.setattr(hook, "log", lambda msg: warnings.append(msg))
+        usage = self._usage(inp=1_000_000, out=1_000_000)
+        cost, *_ = hook.calculate_turn_cost(usage, model)
+        assert cost == 0.0, f"{model} was priced instead of flagged"
+        assert any("[WARN]" in w and model in w for w in warnings)
 
     def test_total_equals_input_plus_output(self):
         usage = self._usage(inp=500_000, out=200_000, cache_read=100_000)
@@ -2318,10 +2343,10 @@ class TestProcessSession:
             for evt in batch
             if evt["type"] == "generation-create"
         ]
-        # Must be exactly Turn 1, Turn 2, Turn 3 — not Turn 1, Turn 3, Turn 5
-        assert gen_names[0].startswith("Turn 1:")
-        assert gen_names[1].startswith("Turn 2:")
-        assert gen_names[2].startswith("Turn 3:")
+        # Must be exactly Turn 1, Turn 2, Turn 3 — not Turn 1, Turn 3, Turn 5.
+        # Each fire also re-sends the previous turn (for its late
+        # turn_duration) under the same name, so compare distinct names.
+        assert sorted({n.split(":")[0] for n in gen_names}) == ["Turn 1", "Turn 2", "Turn 3"]
 
     def test_tool_spans_created(self, tmp_path, monkeypatch):
         state_dir = tmp_path / "state"

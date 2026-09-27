@@ -227,11 +227,13 @@ def _make_full_subagent_jsonl(directory, agent_id, start_ts="2026-03-29T10:00:01
         {
             "type": "assistant",
             "timestamp": "2026-03-29T10:00:10+00:00",
-            "stop_reason": "end_turn",
+            # Real transcripts carry stop_reason inside `message`, never at
+            # the entry's top level.
             "message": {
                 "id": f"msg-{agent_id}-2",
                 "role": "assistant",
                 "model": "claude-sonnet-4-6",
+                "stop_reason": "end_turn",
                 "content": [{"type": "text", "text": "Done implementing."}],
                 "usage": {
                     "input_tokens": 200, "output_tokens": 80,
@@ -545,12 +547,20 @@ def test_harness_cost_accumulates_across_hook_fires(tmp_path, monkeypatch):
         "run-agent must appear in agents list even in fire 2"
 
 
-def test_parent_cost_stored_in_sa_state(tmp_path, monkeypatch):
-    """After processing a session with subagents, sa_state stores _parent.total_cost."""
+def test_parent_cost_comes_from_the_whole_transcript(tmp_path, monkeypatch):
+    """parent_cost is priced from every parent turn on each fire.
+
+    It used to accumulate in sa_state["_parent"], which only started once a
+    subagent existed, so parent cost from earlier fires was lost. The key is
+    no longer written, and a stale one is dropped.
+    """
     state_dir = tmp_path / "state"
     state_dir.mkdir()
     monkeypatch.setattr(langfuse_hook, "STATE_DIR", str(state_dir))
-    monkeypatch.setattr(langfuse_hook, "send_to_langfuse", lambda batch: True)
+    sent = []
+    monkeypatch.setattr(langfuse_hook, "send_to_langfuse",
+                        lambda batch: sent.append(batch) or True)
+    langfuse_hook.save_subagent_state("parent-cost-session", {"_parent": {"total_cost": 99.0}})
 
     session_dir = tmp_path / "projects" / "test-project"
     session_dir.mkdir(parents=True)
@@ -602,8 +612,11 @@ def test_parent_cost_stored_in_sa_state(tmp_path, monkeypatch):
     )
 
     sa_state = langfuse_hook.load_subagent_state("parent-cost-session")
-    assert "_parent" in sa_state, "sa_state must contain _parent key after processing"
-    assert sa_state["_parent"]["total_cost"] > 0, "_parent.total_cost must be positive"
+    assert "_parent" not in sa_state
+    trace = next(e["body"] for e in sent[0] if e["type"] == "trace-create")
+    costs = trace["metadata"]["subagent_costs"]
+    assert costs["parent_cost"] == trace["metadata"]["session_cost_usd"] > 0
+    assert costs["parent_cost"] < 99.0
 
 
 def test_subagent_state_not_saved_on_send_failure(tmp_path, monkeypatch):
@@ -716,8 +729,8 @@ def test_project_dir_from_cwd_hidden_dirs():
 
 def test_project_dir_from_cwd_worktree_path():
     """Real worktree cwd matches observed Claude Code project dir naming."""
-    cwd = "/home/bharath/repository/git/langfuse-observability/.claude/worktrees/attribution-skill-capture"
-    expected = "-home-bharath-repository-git-langfuse-observability--claude-worktrees-attribution-skill-capture"
+    cwd = "/home/user/repo/langfuse-observability/.claude/worktrees/attribution-skill-capture"
+    expected = "-home-user-repo-langfuse-observability--claude-worktrees-attribution-skill-capture"
     assert langfuse_hook._project_dir_from_cwd(cwd) == expected
 
 
@@ -1021,8 +1034,7 @@ def _make_agent_spawning_jsonl(directory, agent_id, child_tool_use_id,
              {"type": "tool_result", "tool_use_id": child_tool_use_id,
               "content": "done"}]}},
         {"type": "assistant", "timestamp": "2026-06-10T10:00:10+00:00",
-         "stop_reason": "end_turn",
-         "message": {"id": f"m2-{agent_id}", "role": "assistant",
+         "message": {"stop_reason": "end_turn", "id": f"m2-{agent_id}", "role": "assistant",
                      "model": "claude-opus-4-8",
                      "content": [{"type": "text", "text": "child done"}],
                      "usage": {"input_tokens": 5, "output_tokens": 5,
@@ -1121,8 +1133,7 @@ def test_process_session_nested_subagents_tag_and_rollup(tmp_path, monkeypatch):
          "message": {"role": "user", "content": [
              {"type": "tool_result", "tool_use_id": "toolu_P1", "content": "done"}]}},
         {"type": "assistant", "timestamp": "2026-06-10T10:00:21+00:00",
-         "stop_reason": "end_turn",
-         "message": {"id": "mm2", "role": "assistant", "model": "claude-opus-4-8",
+         "message": {"stop_reason": "end_turn", "id": "mm2", "role": "assistant", "model": "claude-opus-4-8",
                      "content": [{"type": "text", "text": "all done"}],
                      "usage": {"input_tokens": 5, "output_tokens": 5,
                                "cache_read_input_tokens": 0,

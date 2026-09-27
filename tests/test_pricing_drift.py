@@ -132,6 +132,46 @@ class TestCompare:
         assert count == 0, [r for r in rows if r["status"] == "DRIFT"]
 
 
+class TestNewModels:
+    """A model Anthropic ships that the hook cannot price must fail the check.
+
+    The fixed MODELS list only catches rate changes on models we already know;
+    without this, a new release shows up only as $0 turns in the dashboard.
+    """
+
+    def _anthropic(self, **rates):
+        entry = feed_entry(3.0, 15.0, 0.30, 3.75, 6.0)
+        entry["litellm_provider"] = "anthropic"
+        entry.update(rates)
+        return entry
+
+    def test_unpriceable_anthropic_model_is_drift(self, monkeypatch):
+        monkeypatch.setattr(hook, "log", lambda msg: None)
+        monkeypatch.setattr(drift, "MODELS", [])
+        rows, count = drift.compare(hook, {"claude-sonnet-9": self._anthropic()}, INTRO_TS)
+        assert count == 1
+        assert rows == [{"model": "claude-sonnet-9", "status": "NEW",
+                         "reason": "in feed, not priced by calculate_turn_cost()",
+                         "deltas": {}}]
+
+    def test_priceable_model_outside_models_list_is_not_reported(self, monkeypatch):
+        monkeypatch.setattr(drift, "MODELS", [])
+        rows, count = drift.compare(hook, {"claude-sonnet-4-5": self._anthropic()}, INTRO_TS)
+        assert (rows, count) == ([], 0)
+
+    def test_other_providers_are_ignored(self, monkeypatch):
+        monkeypatch.setattr(drift, "MODELS", [])
+        entry = self._anthropic(litellm_provider="bedrock")
+        rows, count = drift.compare(hook, {"claude-sonnet-9": entry}, INTRO_TS)
+        assert (rows, count) == ([], 0)
+
+    def test_deprecated_models_are_ignored(self, monkeypatch):
+        monkeypatch.setattr(drift, "MODELS", [])
+        entry = self._anthropic(deprecation_date="2026-01-01")
+        rows, count = drift.compare(hook, {"claude-2": entry}, INTRO_TS)
+        assert (rows, count) == ([], 0)
+
+
 class TestFetchFeed:
     def test_reads_local_path(self, tmp_path):
         payload = {"claude-opus-5": feed_entry(5.0, 25.0, 0.50, 6.25, 10.0)}

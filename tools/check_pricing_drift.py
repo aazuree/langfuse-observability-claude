@@ -24,6 +24,9 @@ What it does NOT cover (still manual):
   * Models absent from the feed (e.g. Mythos 5, a Project Glasswing model) —
     those are reported as SKIP, not as a failure.
 
+A current first-party model in the feed that calculate_turn_cost() cannot price
+at all is reported as NEW and counts as drift.
+
 Usage
 -----
     python3 tools/check_pricing_drift.py            # exit 1 on drift
@@ -60,7 +63,9 @@ MODELS = [
     "claude-sonnet-4-6",
     "claude-haiku-4-5",
     "claude-fable-5",
+    "claude-fable-5-1",
     "claude-mythos-5",
+    "claude-mythos-5-1",
 ]
 
 # Our axis name -> the feed's per-token field name.
@@ -132,8 +137,32 @@ def fetch_feed(source):
         return json.loads(resp.read().decode("utf-8"))
 
 
+def unpriced_feed_models(hook, feed, now_iso):
+    """Current first-party models in the feed that the hook prices at $0.
+
+    MODELS only covers rate changes on models we already know about. This
+    catches the other half: a release the hook has never heard of, which would
+    otherwise surface only as $0 turns plus a [WARN] once someone used it.
+    """
+    today = now_iso[:10]
+    found = []
+    for model, entry in sorted(feed.items()):
+        if model in MODELS or not isinstance(entry, dict):
+            continue
+        if entry.get("litellm_provider") != "anthropic":
+            continue
+        if not model.startswith("claude") or "input_cost_per_token" not in entry:
+            continue
+        deprecated = entry.get("deprecation_date")
+        if deprecated and str(deprecated) <= today:
+            continue
+        if probe_rates(hook, model, now_iso)["input"] == 0.0:
+            found.append(model)
+    return found
+
+
 def compare(hook, feed, now_iso):
-    """Return (rows, drift_count). One row per model."""
+    """Return (rows, drift_count). One row per checked or unpriced model."""
     rows = []
     drift = 0
     for model in MODELS:
@@ -163,6 +192,11 @@ def compare(hook, feed, now_iso):
         else:
             rows.append({"model": model, "status": "OK",
                          "reason": "", "deltas": deltas})
+    for model in unpriced_feed_models(hook, feed, now_iso):
+        drift += 1
+        rows.append({"model": model, "status": "NEW",
+                     "reason": "in feed, not priced by calculate_turn_cost()",
+                     "deltas": {}})
     return rows, drift
 
 
@@ -195,6 +229,8 @@ def main():
     for row in rows:
         if row["status"] == "SKIP":
             print(f"  SKIP  {row['model']:<22} ({row['reason']})")
+        elif row["status"] == "NEW":
+            print(f"  NEW   {row['model']:<22} ({row['reason']})")
         elif row["status"] == "OK":
             note = [a for a, d in row["deltas"].items() if "note" in d]
             suffix = f"  [feed lacks: {', '.join(note)}]" if note else ""

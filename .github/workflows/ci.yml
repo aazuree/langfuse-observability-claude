@@ -12,11 +12,29 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The checks diff against earlier commits. The default depth-1 clone
+          # has none, so `git diff` failed, the pipeline swallowed the error,
+          # and both checks passed without looking at a single file.
+          fetch-depth: 0
+
+      - name: List changed files
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            RANGE="origin/${{ github.base_ref }}...HEAD"
+          elif [ "${{ github.event.before }}" != "0000000000000000000000000000000000000000" ]; then
+            RANGE="${{ github.event.before }}..HEAD"   # every commit in the push
+          else
+            RANGE="HEAD~1..HEAD"
+          fi
+          git diff --name-only --diff-filter=ACM "$RANGE" > "$RUNNER_TEMP/changed.txt"
+          echo "Checking $(wc -l < "$RUNNER_TEMP/changed.txt") changed file(s) in $RANGE"
 
       - name: Block sensitive file extensions
         run: |
           BLOCKED_EXTENSIONS="\.key$|\.pem$|\.p12$|\.pfx$|\.jks$|\.sqlite$|\.sqlite3$|\.credentials$|\.secret$"
-          FOUND=$(git diff --name-only --diff-filter=ACM ${{ github.event_name == 'pull_request' && 'origin/main...HEAD' || 'HEAD~1..HEAD' }} | grep -iE "$BLOCKED_EXTENSIONS" || true)
+          FOUND=$(grep -iE "$BLOCKED_EXTENSIONS" "$RUNNER_TEMP/changed.txt" || true)
           if [ -n "$FOUND" ]; then
             echo "::error::Sensitive files detected:"
             echo "$FOUND"
@@ -28,16 +46,16 @@ jobs:
         run: |
           MAX_SIZE=5242880
           LARGE=""
-          for f in $(git diff --name-only --diff-filter=ACM ${{ github.event_name == 'pull_request' && 'origin/main...HEAD' || 'HEAD~1..HEAD' }}); do
+          while IFS= read -r f; do
             if [ -f "$f" ]; then
-              SIZE=$(stat --format=%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null)
+              SIZE=$(stat --format=%s "$f")
               if [ "$SIZE" -gt "$MAX_SIZE" ]; then
                 LARGE="$LARGE\n  $f ($(numfmt --to=iec $SIZE))"
               fi
             fi
-          done
+          done < "$RUNNER_TEMP/changed.txt"
           if [ -n "$LARGE" ]; then
-            echo "::error::Files exceed 5MB limit:$LARGE"
+            echo -e "::error::Files exceed 5MB limit:$LARGE"
             exit 1
           fi
           echo "All files under 5MB."
@@ -51,5 +69,7 @@ jobs:
       - name: Install uv
         uses: astral-sh/setup-uv@v4
 
+      # 3.10 is the oldest Python the hooks run on (PEP 604 `X | None`
+      # annotations are evaluated at import). Testing on it keeps that true.
       - name: Run tests
-        run: uv run --with pytest pytest tests/ -v
+        run: uv run --no-project --python 3.10 --with pytest pytest tests/ -v

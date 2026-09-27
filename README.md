@@ -32,7 +32,7 @@ The setup script:
 1. Prompts for your admin email and password
 2. Generates `.env` with random secrets (including unique project API keys)
 3. Starts Langfuse via Docker Compose (6 services)
-4. Backs up existing `~/.claude/settings.json` (if present) and configures the `Stop` hook
+4. Backs up existing `~/.claude/settings.json` (if present) and registers the `Stop` and `StopFailure` hooks (running in the background, `"async": true`). A hook already pointed at a different Langfuse host is left alone
 
 **Dashboard**: http://localhost:3100
 **Login**: the credentials you entered during setup
@@ -45,7 +45,7 @@ mode stays the default.
 ## Prerequisites
 
 - Docker and Docker Compose
-- Python 3.8+
+- Python 3.10+
 - Claude Code CLI
 - `openssl` (for secret generation)
 
@@ -76,6 +76,7 @@ langfuse-observability/
 ├── langfuse-hook.py       # Stop hook: transcript -> Langfuse ingestion
 ├── session-start-hook.py  # StopFailure hook: tags traces with stop-failure + last API error
 ├── setup.sh               # One-command setup (secrets, docker, hook config)
+├── tools/                 # Pricing drift check + setup.sh helpers
 ├── .env.example           # Template (safe to commit)
 ├── .env                   # Actual secrets (gitignored)
 ├── tests/
@@ -83,7 +84,7 @@ langfuse-observability/
 │   ├── test_session_hooks.py      # StopFailure hook tests
 │   ├── test_hook_scores.py        # Hook-level score classifier tests
 │   ├── test_subagent_tracking.py  # Subagent cost tracking tests
-│   └── test_new_captures.py       # New transcript-field capture tests
+│   └── ...                        # one file per feature; see CLAUDE.md
 └── README.md
 ```
 
@@ -91,10 +92,10 @@ langfuse-observability/
 
 The hook script (`langfuse-hook.py`) is invoked by Claude Code after each assistant response:
 
-1. **Incremental processing** — tracks a line offset per session, only sends new messages each turn
+1. **Incremental processing** — tracks a line offset per session and sends only new turns, while every trace-level rollup (tokens, cost, scores) is recomputed over the whole session
 2. **Turn detection** — groups transcript entries into user→assistant turns
 3. **Tool call matching** — pairs `tool_use` blocks with their `tool_result` responses via `tool_use_id`
-4. **Token deduplication** — assistant messages with the same `message.id` are streaming updates; takes the last for final usage
+4. **Token deduplication** — assistant messages with the same `message.id` are streaming updates carrying identical usage; it is counted once
 5. **Timing** — uses message timestamps for latency, `turn_duration` entries for total turn time, first assistant timestamp for TTFT
 6. **Cost** — computes equivalent Anthropic API cost from token counts (configurable via `REPORT_API_EQUIVALENT_COST` flag)
 7. **Subagent tracking** — discovers subagent transcripts (from Agent tool invocations) via a 3-pass correlation (`.meta.json` `toolUseId` → `agentId` → timestamp proximity), ingests them as nested observations, and rolls up per-subagent cost in trace metadata
@@ -143,7 +144,19 @@ The Stop hook in `~/.claude/settings.json`:
         "hooks": [
           {
             "type": "command",
-            "command": "LANGFUSE_PUBLIC_KEY=<your-pk> LANGFUSE_SECRET_KEY=<your-sk> python3 /path/to/langfuse-hook.py"
+            "command": "LANGFUSE_HOST=http://localhost:3100 LANGFUSE_PUBLIC_KEY=<your-pk> LANGFUSE_SECRET_KEY=<your-sk> python3 /path/to/langfuse-hook.py",
+            "async": true
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "LANGFUSE_HOST=http://localhost:3100 LANGFUSE_PUBLIC_KEY=<your-pk> LANGFUSE_SECRET_KEY=<your-sk> python3 /path/to/session-start-hook.py",
+            "async": true
           }
         ]
       }
@@ -152,7 +165,7 @@ The Stop hook in `~/.claude/settings.json`:
 }
 ```
 
-Replace `<your-pk>` and `<your-sk>` with the project keys printed during `./setup.sh`, and update the path to match where you cloned the repo.
+Replace `<your-pk>` and `<your-sk>` with the project keys printed during `./setup.sh`, and update the path to match where you cloned the repo. `"async": true` keeps the hook from blocking Claude Code; the hook serialises overlapping fires of one session itself.
 
 ## Re-ingesting Past Sessions
 
@@ -167,7 +180,13 @@ SK=$(grep '^LANGFUSE_INIT_PROJECT_SECRET_KEY=' .env | cut -d= -f2)
 LANGFUSE_PUBLIC_KEY=$PK LANGFUSE_SECRET_KEY=$SK python3 langfuse-hook.py --reprocess
 ```
 
-This finds all transcript files, deletes any existing traces to avoid duplicates, and re-ingests everything from scratch.
+This finds all transcript files and re-ingests them from scratch. It does **not** delete traces: IDs are deterministic, so a re-ingest upserts in place. When an upgrade renumbers turns (see CLAUDE.md, "Turn numbering changed"), delete first and wait for Langfuse's asynchronous delete to finish:
+
+```bash
+LANGFUSE_PUBLIC_KEY=$PK LANGFUSE_SECRET_KEY=$SK python3 langfuse-hook.py --delete-traces
+# ...wait until the traces are gone from the UI...
+LANGFUSE_PUBLIC_KEY=$PK LANGFUSE_SECRET_KEY=$SK python3 langfuse-hook.py --reprocess
+```
 
 ## Subagent Cost Tracking
 
@@ -202,7 +221,7 @@ Set `REPORT_API_EQUIVALENT_COST = True` in `langfuse-hook.py` (default) to repor
 
 - **Langfuse init vars**: `LANGFUSE_INIT_USER_EMAIL` must be valid email format, `LANGFUSE_INIT_PROJECT_NAME` must not have spaces. Validation errors are generic with no detail.
 - **First login**: If the browser shows an error, try an incognito window (stale CSRF tokens).
-- **Hook does not block Claude Code**: runs asynchronously; if Langfuse is down, errors go to `~/.claude/langfuse-hook.log`.
+- **Hook does not block Claude Code** when registered with `"async": true` (setup does this); if Langfuse is down, errors go to `~/.claude/langfuse-hook.log`.
 - **Secret redaction**: The hook redacts common patterns but cannot catch all secrets. Avoid pasting raw credentials into Claude Code prompts.
 
 ## Why Not a Proxy (e.g. LiteLLM)?
