@@ -11,7 +11,7 @@ jobs:
     name: File restrictions
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # The checks diff against earlier commits. The default depth-1 clone
           # has none, so `git diff` failed, the pipeline swallowed the error,
@@ -64,10 +64,11 @@ jobs:
     name: Tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        # Exact version: setup-uv stopped publishing floating major tags in v8.
+        uses: astral-sh/setup-uv@v10.2.0
 
       # 3.10 is the oldest Python the hooks run on (PEP 604 `X | None`
       # annotations are evaluated at import). Testing on it keeps that true.
