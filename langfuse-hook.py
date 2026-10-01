@@ -1923,8 +1923,9 @@ def _model_family(model: str, name: str) -> str:
 # whether inference_geo="us" applies, keyed by _model_family(). Anything not
 # listed is unrecognised and reported as $0 with a [WARN] — never priced at a
 # neighbouring version's rate.
-# Source: platform.claude.com/docs/en/about-claude/pricing (verified 2026-09-23)
+# Source: platform.claude.com/docs/en/about-claude/pricing (verified 2026-10-01)
 _SONNET_RATES = {
+    "sonnet-5-5": ((2.00, 10.00, 0.20, 2.50, 4.00), True),
     # Sonnet 5: launched as "introductory through 2026-08-31", then made the
     # standard price; the $3/$15 step-up never happened.
     "sonnet-5":   ((2.00, 10.00, 0.20, 2.50, 4.00), True),
