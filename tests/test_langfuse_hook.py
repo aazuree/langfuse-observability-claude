@@ -1029,6 +1029,31 @@ class TestCalculateTurnCost:
         )
         assert abs(inp_cost - 2.0 * 1.1) < 0.001
 
+    # ----- Sonnet 5.5: same rates as Sonnet 5 -----
+
+    def test_sonnet_5_5_pricing(self):
+        usage = self._usage(inp=1_000_000, out=1_000_000)
+        cost, inp_cost, out_cost, details = hook.calculate_turn_cost(usage, "claude-sonnet-5-5")
+        assert abs(inp_cost - 2.0) < 0.001   # $2/1M input
+        assert abs(out_cost - 10.0) < 0.001  # $10/1M output
+
+    def test_sonnet_5_5_cache_tiers(self):
+        # Cache: read $0.20, write-5m $2.50, write-1h $4.00 per 1M
+        usage = self._usage(cache_read=1_000_000, cache_creation=2_000_000)
+        cost, _i, _o, details = hook.calculate_turn_cost(
+            usage, "claude-sonnet-5-5", cache_5m=1_000_000, cache_1h=1_000_000,
+        )
+        assert abs(details["cache_read_input_tokens"] - 0.20) < 0.001
+        assert abs(details["cache_creation_input_tokens"] - (2.50 + 4.00)) < 0.001
+
+    def test_sonnet_5_5_us_geo_eligible(self):
+        usage = self._usage(inp=1_000_000, out=1_000_000)
+        _c, inp_cost, out_cost, _d = hook.calculate_turn_cost(
+            usage, "claude-sonnet-5-5", inference_geo="us",
+        )
+        assert abs(inp_cost - 2.0 * 1.1) < 0.001
+        assert abs(out_cost - 10.0 * 1.1) < 0.001
+
     def test_fable_5_1_cache_read_is_0_025x(self):
         usage = self._usage(cache_read=1_000_000)
         for model in ("claude-fable-5-1", "claude-mythos-5-1"):
@@ -1282,7 +1307,7 @@ class TestCalculateTurnCost:
         # Each of these contains a known family as a substring. Substring
         # matching billed them silently at the predecessor's rate — the bug
         # already fixed for Opus (claude-opus-5-5 billed as Opus 5).
-        "claude-sonnet-5-5",
+        "claude-sonnet-5-6",
         "claude-sonnet-6",
         "claude-haiku-5",
         "claude-haiku-4-6",
