@@ -1029,7 +1029,7 @@ class TestCalculateTurnCost:
         )
         assert abs(inp_cost - 2.0 * 1.1) < 0.001
 
-    # ----- Sonnet 5.5: same rates as Sonnet 5 -----
+    # ----- Sonnet 5.5: Sonnet 5 rates, except cache reads at 0.05x -----
 
     def test_sonnet_5_5_pricing(self):
         usage = self._usage(inp=1_000_000, out=1_000_000)
@@ -1038,12 +1038,12 @@ class TestCalculateTurnCost:
         assert abs(out_cost - 10.0) < 0.001  # $10/1M output
 
     def test_sonnet_5_5_cache_tiers(self):
-        # Cache: read $0.20, write-5m $2.50, write-1h $4.00 per 1M
+        # Cache: read $0.10 (0.05x input, like Opus 5.5), write-5m $2.50, write-1h $4.00 per 1M
         usage = self._usage(cache_read=1_000_000, cache_creation=2_000_000)
         cost, _i, _o, details = hook.calculate_turn_cost(
             usage, "claude-sonnet-5-5", cache_5m=1_000_000, cache_1h=1_000_000,
         )
-        assert abs(details["cache_read_input_tokens"] - 0.20) < 0.001
+        assert abs(details["cache_read_input_tokens"] - 0.10) < 0.001
         assert abs(details["cache_creation_input_tokens"] - (2.50 + 4.00)) < 0.001
 
     def test_sonnet_5_5_us_geo_eligible(self):
