@@ -581,6 +581,7 @@ def ingest_subagent(
             inference_geo=turn.get("inference_geo", ""),
             web_search_requests=turn.get("web_search_requests", 0),
             turn_start_time=turn.get("start_time", ""),
+            long_context_usage=turn.get("usage_long"),
         )
 
         total_cost += turn_cost
@@ -624,6 +625,7 @@ def ingest_subagent(
                 request_ids=turn.get("request_ids", []),
                 stop_reason=turn.get("stop_reason", ""),
             ),
+            **gen_metadata_turn_signals(turn),
         }
 
         events.append({
@@ -1441,6 +1443,19 @@ def build_turns(entries: list[dict]) -> list[dict]:
                 # Previously only reachable via $CLAUDE_EFFORT on live fires; this
                 # source also survives --reprocess.
                 "effort": entry.get("effort", "") if etype == "assistant" else "",
+                # Per-entry signals. requestedModel (CC 2.1.295) differs from
+                # message.model only when Claude Code fell back to another model.
+                # thinkingDurationMs (2.1.287) is written on every streamed entry
+                # of a message with differing values; build_turns keeps the max.
+                # advisorModel (2.1.280) echoes the /advisor setting, not a call.
+                "requested_model": entry.get("requestedModel", "") if etype == "assistant" else "",
+                "thinking_duration_ms": entry.get("thinkingDurationMs") if etype == "assistant" else None,
+                "truncated_after_output": bool(entry.get("truncatedAfterOutput")) if etype == "assistant" else False,
+                "aborted_mid_stream": bool(entry.get("isAbortedMidStream")) if etype == "assistant" else False,
+                "advisor_model": entry.get("advisorModel", "") if etype == "assistant" else "",
+                # human / sdk / task_notification / peer (CC 2.1.278), on the
+                # user entry that opens a turn.
+                "turn_origin": entry.get("turnOrigin", "") if etype == "user" else "",
                 # A refused tool call, not a failed one (CC 2.1.2xx). Both arrive
                 # with is_error:true, so this is what keeps a denial out of
                 # tool_error_rate.
@@ -1501,6 +1516,8 @@ def build_turns(entries: list[dict]) -> list[dict]:
                 current_turn["start_time"] = me["timestamp"] or current_turn["start_time"]
                 current_turn["end_time"] = current_turn["start_time"]
                 current_turn["messages"].append(me)
+                if not current_turn["turn_origin"]:
+                    current_turn["turn_origin"] = me.get("turn_origin", "")
             elif text.strip():
                 if current_turn:
                     turns.append(current_turn)
@@ -1524,6 +1541,12 @@ def build_turns(entries: list[dict]) -> list[dict]:
                     "attribution_skills_all": set(),
                     "attribution_plugins_all": set(),
                     "effort": "",
+                    "requested_model": "",
+                    "_thinking_ms_by_mid": {},
+                    "truncated_after_output": False,
+                    "aborted_mid_stream": False,
+                    "advisor_model": "",
+                    "turn_origin": me.get("turn_origin", ""),
                 }
             elif current_turn:
                 current_turn["messages"].append(me)
@@ -1580,6 +1603,20 @@ def build_turns(entries: list[dict]) -> list[dict]:
             if me.get("effort"):
                 current_turn["effort"] = me["effort"]
 
+            # Last non-empty wins, as for effort and model.
+            if me.get("requested_model"):
+                current_turn["requested_model"] = me["requested_model"]
+            if me.get("advisor_model"):
+                current_turn["advisor_model"] = me["advisor_model"]
+            if me.get("truncated_after_output"):
+                current_turn["truncated_after_output"] = True
+            if me.get("aborted_mid_stream"):
+                current_turn["aborted_mid_stream"] = True
+            tdm = me.get("thinking_duration_ms")
+            if isinstance(tdm, (int, float)) and not isinstance(tdm, bool):
+                by_mid = current_turn["_thinking_ms_by_mid"]
+                by_mid[mid] = max(by_mid.get(mid, 0), tdm)
+
             current_turn["end_time"] = me["timestamp"]
             current_turn["api_call_ids"].add(mid)
 
@@ -1624,15 +1661,32 @@ def build_turns(entries: list[dict]) -> list[dict]:
         thinking_tokens = 0
         cm_missed_tokens = 0
         cm_by_reason = {}
+        # Usage from requests whose prompt exceeds LONG_CONTEXT_THRESHOLD. The
+        # tier is decided per request, so it must be split here, before the
+        # per-turn sums lose the request boundaries.
+        usage_long = {"input": 0, "output": 0, "cache_read": 0,
+                      "cache_creation": 0, "cache_5m": 0, "cache_1h": 0}
+        long_requests = 0
         for mid in turn["api_call_ids"]:
             u = msg_id_final_usage.get(mid, {})
             inp = u.get("input_tokens", 0)
             out = u.get("output_tokens", 0)
+            cr = u.get("cache_read_input_tokens", 0)
+            ccr = u.get("cache_creation_input_tokens", 0)
             usage["input"] += inp
             usage["output"] += out
             usage["total"] += inp + out
-            usage["cache_read"] += u.get("cache_read_input_tokens", 0)
-            usage["cache_creation"] += u.get("cache_creation_input_tokens", 0)
+            usage["cache_read"] += cr
+            usage["cache_creation"] += ccr
+            if inp + cr + ccr > LONG_CONTEXT_THRESHOLD:
+                long_requests += 1
+                cc_tiers = u.get("cache_creation", {}) or {}
+                usage_long["input"] += inp
+                usage_long["output"] += out
+                usage_long["cache_read"] += cr
+                usage_long["cache_creation"] += ccr
+                usage_long["cache_5m"] += cc_tiers.get("ephemeral_5m_input_tokens", 0)
+                usage_long["cache_1h"] += cc_tiers.get("ephemeral_1h_input_tokens", 0)
             # Scalar fields: last non-empty value wins
             if u.get("speed"):
                 speed = u["speed"]
@@ -1667,6 +1721,9 @@ def build_turns(entries: list[dict]) -> list[dict]:
             if me.get("request_id")
         ]
         turn["usage"] = usage
+        turn["usage_long"] = usage_long if long_requests else None
+        turn["long_context_requests"] = long_requests
+        turn["thinking_duration_ms"] = sum(turn.pop("_thinking_ms_by_mid").values())
         turn["speed"] = speed
         turn["service_tier"] = service_tier
         turn["inference_geo"] = inference_geo
@@ -1923,9 +1980,10 @@ def _model_family(model: str, name: str) -> str:
 # whether inference_geo="us" applies, keyed by _model_family(). Anything not
 # listed is unrecognised and reported as $0 with a [WARN] — never priced at a
 # neighbouring version's rate.
-# Source: platform.claude.com/docs/en/about-claude/pricing (verified 2026-10-01)
+# Source: platform.claude.com/docs/en/about-claude/pricing (verified 2026-10-09)
 _SONNET_RATES = {
-    "sonnet-5-5": ((2.00, 10.00, 0.20, 2.50, 4.00), True),
+    # Sonnet 5.5 cache reads are 0.05x input ($0.10), like Opus 5.5.
+    "sonnet-5-5": ((2.00, 10.00, 0.10, 2.50, 4.00), True),
     # Sonnet 5: launched as "introductory through 2026-08-31", then made the
     # standard price; the $3/$15 step-up never happened.
     "sonnet-5":   ((2.00, 10.00, 0.20, 2.50, 4.00), True),
@@ -1938,10 +1996,26 @@ _SONNET_RATES = {
     "sonnet-3":   ((3.00, 15.00, 0.30, 3.75, 6.00), False),
 }
 _HAIKU_RATES = {
+    # Haiku 5.5: rate for prompts up to LONG_CONTEXT_THRESHOLD; the higher
+    # rate for longer prompts is in _LONG_CONTEXT_RATES. No /fast variant.
+    "haiku-5-5": ((0.10, 0.50, 0.01, 0.125, 0.20), True),
     "haiku-4-5": ((1.00, 5.00, 0.10, 1.25, 2.00), False),
     "haiku-3-5": ((0.80, 4.00, 0.08, 1.00, 1.60), False),
     "haiku-3":   ((0.25, 1.25, 0.03, 0.30, 0.50), False),
 }
+# Prompt-length pricing. A request whose prompt (input + cache reads + cache
+# writes) is over the threshold pays these rates for all of its tokens, output
+# included, even when part of the prompt is a cache hit. Each request is tiered
+# on its own. Keyed by pricing family; models not listed have one rate.
+LONG_CONTEXT_THRESHOLD = 100_000
+_LONG_CONTEXT_RATES = {
+    "haiku-5-5": (0.50, 2.50, 0.05, 0.625, 1.00),
+}
+
+
+def _has_long_context_tier(model: str) -> bool:
+    m = model.lower()
+    return "haiku" in m and _model_family(m, "haiku") in _LONG_CONTEXT_RATES
 # Fable 5 / Mythos 5 (Project Glasswing sibling): identical pricing. The 5.1
 # releases cut cache reads to $0.25 (0.025x input). Neither has a /fast
 # variant, and their data-residency multiplier is unverified.
@@ -1979,6 +2053,7 @@ def calculate_turn_cost(
     inference_geo: str = "",
     web_search_requests: int = 0,
     turn_start_time: str = "",
+    long_context_usage: dict | None = None,
 ) -> tuple:
     """Calculate cost for a turn's token usage.
 
@@ -1992,6 +2067,11 @@ def calculate_turn_cost(
         reprocessing bills a historical turn at the rate live at the time. No
         window is active today: Sonnet 5's $2/$10 "introductory" rate became its
         standard rate, so the date switch it used was removed.
+    long_context_usage: the part of `usage` that came from requests whose
+        prompt was over LONG_CONTEXT_THRESHOLD (build_turns' `usage_long`:
+        input, output, cache_read, cache_creation, cache_5m, cache_1h). Billed
+        at _LONG_CONTEXT_RATES for models that have them (Haiku 5.5); ignored
+        for every other model.
 
     Returns: (turn_cost, input_cost, output_cost, cost_details)
     """
@@ -2015,11 +2095,14 @@ def calculate_turn_cost(
     # function and the CLAUDE.md Cost Model table when that happens.
     supports_inference_geo = False  # Only Opus 4.6+/Sonnet 4.6+ accept inference_geo
     supports_fast_mode = False      # Only Opus 4.6+ (excluding 4.5) support /fast
+    long_rates = None               # Prompt-length tier; only Haiku 5.5 has one
     if "haiku" in m:
-        rates = _HAIKU_RATES.get(_model_family(m, "haiku"))
+        family = _model_family(m, "haiku")
+        rates = _HAIKU_RATES.get(family)
         if rates is None:
             return _unrecognised_model(model)
         (p_in, p_out, p_cr, p_cc5, p_cc1), supports_inference_geo = rates
+        long_rates = _LONG_CONTEXT_RATES.get(family)
     elif "opus" in m:
         # Whitelist of current Opus generations. Substring matching previously
         # over-billed any future "opus-4-9+" release at the legacy $15/$75 rate,
@@ -2069,25 +2152,38 @@ def calculate_turn_cost(
         p_cc5 *= fast_mult
         p_cc1 *= fast_mult
 
-    # Data residency 1.1x (Opus 4.6+/Sonnet 4.6+). Stacks on top of fast mode.
-    if inference_geo.lower() == "us" and supports_inference_geo:
-        p_in *= US_GEO_MULTIPLIER
-        p_out *= US_GEO_MULTIPLIER
-        p_cr *= US_GEO_MULTIPLIER
-        p_cc5 *= US_GEO_MULTIPLIER
-        p_cc1 *= US_GEO_MULTIPLIER
+    # Data residency 1.1x (Opus 4.6+/Sonnet 4.6+/Haiku 5.5). Stacks on top of
+    # fast mode, and on Haiku 5.5 applies to the long-prompt rates as well.
+    geo = US_GEO_MULTIPLIER if (inference_geo.lower() == "us" and supports_inference_geo) else 1.0
+    rates = tuple(p * geo for p in (p_in, p_out, p_cr, p_cc5, p_cc1))
 
-    # Cache creation cost: use per-tier breakdown when available
-    if cache_5m or cache_1h:
-        cc_cost = (cache_5m * p_cc5 + cache_1h * p_cc1) / 1_000_000
-    else:
-        cc_cost = usage["cache_creation"] * p_cc5 / 1_000_000
+    # Split the turn into its short- and long-prompt parts, each priced at
+    # its own rates. Without a long tier the whole turn is the short part.
+    lu = long_context_usage if (long_rates and long_context_usage) else None
+    parts = [(
+        {k: usage.get(k, 0) - (lu or {}).get(k, 0)
+         for k in ("input", "output", "cache_read", "cache_creation")},
+        cache_5m - (lu or {}).get("cache_5m", 0),
+        cache_1h - (lu or {}).get("cache_1h", 0),
+        rates,
+    )]
+    if lu:
+        parts.append((lu, lu.get("cache_5m", 0), lu.get("cache_1h", 0),
+                      tuple(p * geo for p in long_rates)))
 
-    input_token_cost = usage["input"] * p_in / 1_000_000
-    cache_read_cost = usage["cache_read"] * p_cr / 1_000_000
+    input_token_cost = cache_read_cost = cc_cost = output_cost = 0.0
+    for u, c5, c1, (r_in, r_out, r_cr, r_cc5, r_cc1) in parts:
+        # Cache creation cost: use per-tier breakdown when available
+        if c5 or c1:
+            cc_cost += (c5 * r_cc5 + c1 * r_cc1) / 1_000_000
+        else:
+            cc_cost += u["cache_creation"] * r_cc5 / 1_000_000
+        input_token_cost += u["input"] * r_in / 1_000_000
+        cache_read_cost += u["cache_read"] * r_cr / 1_000_000
+        output_cost += u["output"] * r_out / 1_000_000
+
     web_search_cost = web_search_requests * WEB_SEARCH_COST_PER_REQUEST
     input_cost = input_token_cost + cache_read_cost + cc_cost
-    output_cost = usage["output"] * p_out / 1_000_000
     turn_cost = input_cost + output_cost + web_search_cost
 
     cost_details = {
@@ -2206,6 +2302,9 @@ def _turn_cost_usd(turn: dict, model: str | None = None) -> float:
         inference_geo=turn.get("inference_geo", ""),
         web_search_requests=turn.get("web_search_requests", 0),
         turn_start_time=turn.get("start_time", ""),
+        # Counterfactual pricing under another model keeps the request split:
+        # it only applies if that model has a long-prompt tier.
+        long_context_usage=turn.get("usage_long"),
     )
     return cost
 
@@ -2590,6 +2689,53 @@ def gen_metadata_attribution(turn: dict) -> dict:
     return out
 
 
+def gen_metadata_turn_signals(turn: dict) -> dict:
+    """Per-generation transcript signals; empty dict when nothing to emit.
+
+    requested_model is emitted only when it differs from the model that
+    answered (a model fallback); on every other turn it repeats `model`.
+    """
+    out = {}
+    req = turn.get("requested_model") or ""
+    if req and req != (turn.get("model") or ""):
+        out["requested_model"] = req
+        out["model_fallback"] = True
+    if turn.get("thinking_duration_ms"):
+        out["thinking_duration_ms"] = turn["thinking_duration_ms"]
+    if turn.get("truncated_after_output"):
+        out["truncated_after_output"] = True
+    if turn.get("aborted_mid_stream"):
+        out["aborted_mid_stream"] = True
+    if turn.get("advisor_model"):
+        out["advisor_model"] = turn["advisor_model"]
+    if turn.get("turn_origin"):
+        out["turn_origin"] = turn["turn_origin"]
+    # Only where it changed the price: other models bill long prompts at the
+    # same rate, so the count would read as a surcharge that never happened.
+    if turn.get("long_context_requests") and _has_long_context_tier(turn.get("model") or ""):
+        out["long_context_requests"] = turn["long_context_requests"]
+    return out
+
+
+def build_turn_signal_summary(turns: list[dict]) -> dict | None:
+    """Session rollup of gen_metadata_turn_signals; None when no turn has any."""
+    signals = [gen_metadata_turn_signals(t) for t in turns]
+    if not any(signals):
+        return None
+    origins: dict[str, int] = {}
+    for s in signals:
+        if s.get("turn_origin"):
+            origins[s["turn_origin"]] = origins.get(s["turn_origin"], 0) + 1
+    return {
+        "turn_origins": origins,
+        "model_fallback_turns": sum(1 for s in signals if s.get("model_fallback")),
+        "truncated_turns": sum(1 for s in signals if s.get("truncated_after_output")),
+        "aborted_turns": sum(1 for s in signals if s.get("aborted_mid_stream")),
+        "thinking_duration_ms": sum(s.get("thinking_duration_ms", 0) for s in signals),
+        "long_context_requests": sum(s.get("long_context_requests", 0) for s in signals),
+    }
+
+
 def gen_metadata_cache_miss(turn: dict) -> dict:
     """Per-generation cache-miss metadata; empty dict when no miss in the turn."""
     cm = turn.get("cache_miss")
@@ -2727,6 +2873,7 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
             inference_geo=t.get("inference_geo", ""),
             web_search_requests=t.get("web_search_requests", 0),
             turn_start_time=t.get("start_time", ""),
+            long_context_usage=t.get("usage_long"),
         )
     session_cost = sum(t["_cost"][0] for t in turns)
 
@@ -2738,6 +2885,7 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
 
     # Check if any turn used fast inference
     has_fast = any(t.get("speed") == "fast" for t in turns)
+    turn_signals = build_turn_signal_summary(turns)
 
     # Session-level effort: last turn in this batch that carried one (CC 2.1.220+
     # transcript field), else the live $CLAUDE_EFFORT fallback. Transcript wins
@@ -2876,6 +3024,7 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
                 "opus_5_5_savings": build_opus_5_5_savings(turns),
                 "cache_miss": build_cache_miss_summary(turns),
                 "thinking": build_thinking_summary(turns),
+                "turn_signals": turn_signals,
                 "effort_level": effort or None,
                 "worktree": worktree_state,
                 "background_tasks": background_tasks or None,
@@ -2894,6 +3043,8 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
                 "has-errors" if has_errors else None,
                 "has-api-error-messages" if api_error_messages else None,
                 "has-interrupts" if interrupts else None,
+                "model-fallback" if (turn_signals or {}).get("model_fallback_turns") else None,
+                "has-truncated-output" if (turn_signals or {}).get("truncated_turns") else None,
                 "has-queued-prompts" if queue_operations else None,
                 "has-background-tasks" if background_tasks else None,
                 "model-missing" if has_missing_model else None,
@@ -3000,6 +3151,7 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
                     stop_reason=turn.get("stop_reason", ""),
                 ),
                 **gen_metadata_attribution(turn),
+                **gen_metadata_turn_signals(turn),
                 **gen_metadata_cache_miss(turn),
             },
         }

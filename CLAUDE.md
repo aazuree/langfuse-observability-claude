@@ -183,7 +183,7 @@ uv run pytest tests/ -k "discover" -v  # Run tests matching pattern
 
 ## Cost Model
 
-Pricing is model-aware (per 1M tokens). Source: [platform.claude.com/docs/en/about-claude/pricing](https://platform.claude.com/docs/en/about-claude/pricing) (last verified 2026-10-01).
+Pricing is model-aware (per 1M tokens). Source: [platform.claude.com/docs/en/about-claude/pricing](https://platform.claude.com/docs/en/about-claude/pricing) (last verified 2026-10-09).
 
 | Model | Input | Output | Cache Read | Cache Write 5m | Cache Write 1h |
 |-------|-------|--------|------------|----------------|----------------|
@@ -191,13 +191,18 @@ Pricing is model-aware (per 1M tokens). Source: [platform.claude.com/docs/en/abo
 | Opus 5.5 | $4.00 | $20.00 | $0.20 | $5.00 | $8.00 |
 | Opus 5 / 4.8 / 4.7 / 4.6 / 4.5 | $5.00 | $25.00 | $0.50 | $6.25 | $10.00 |
 | Opus 4.1 / 4.0 (legacy) | $15.00 | $75.00 | $1.50 | $18.75 | $30.00 |
-| Sonnet 5.5 / 5 | $2.00 | $10.00 | $0.20 | $2.50 | $4.00 |
+| Sonnet 5.5 | $2.00 | $10.00 | $0.10 | $2.50 | $4.00 |
+| Sonnet 5 | $2.00 | $10.00 | $0.20 | $2.50 | $4.00 |
 | Sonnet 4.6 / 4.5 / 4 | $3.00 | $15.00 | $0.30 | $3.75 | $6.00 |
+| Haiku 5.5 (prompt ≤ 100K) | $0.10 | $0.50 | $0.01 | $0.125 | $0.20 |
+| Haiku 5.5 (prompt > 100K) | $0.50 | $2.50 | $0.05 | $0.625 | $1.00 |
 | Haiku 4.5 | $1.00 | $5.00 | $0.10 | $1.25 | $2.00 |
 | Haiku 3.5 | $0.80 | $4.00 | $0.08 | $1.00 | $1.60 |
 | Haiku 3 (deprecated) | $0.25 | $1.25 | $0.03 | $0.30 | $0.50 |
 
-**Sonnet 5 is flat $2/$10.** It launched at $2/$10 billed as "introductory through 2026-08-31", with a step-up to $3/$15 on 2026-09-01. Anthropic cancelled the step-up and made $2/$10 the standard price (pricing page, verified 2026-09-23). The date switch (`SONNET5_INTRO_END`) was removed; `calculate_turn_cost` keeps its `turn_start_time` parameter for any future date-aware pricing window. Sonnet 5.5 launched at the same $2/$10 (verified 2026-10-01). All Sonnet 4.x and earlier versions are flat $3/$15.
+**Sonnet 5 is flat $2/$10.** It launched at $2/$10 billed as "introductory through 2026-08-31", with a step-up to $3/$15 on 2026-09-01. Anthropic cancelled the step-up and made $2/$10 the standard price (pricing page, verified 2026-09-23). The date switch (`SONNET5_INTRO_END`) was removed; `calculate_turn_cost` keeps its `turn_start_time` parameter for any future date-aware pricing window. Sonnet 5.5 launched at the same $2/$10 (verified 2026-10-01), but its cache reads are **0.05x** input ($0.10), like Opus 5.5 — the hook billed them at $0.20 until 2026-10-09, so Sonnet 5.5 traces ingested before then overstate cache-read cost 2x until reprocessed. All Sonnet 4.x and earlier versions are flat $3/$15.
+
+**Haiku 5.5** (`claude-haiku-5-5`, default Haiku since CC 2.1.293) is priced by **prompt length per request**: a request whose prompt (input + cache reads + cache writes) is over 100,000 tokens pays the higher rates for *all* its tokens, output included, even when part of the prompt is a cache hit. Because a turn sums several API requests, the tier cannot be decided from turn totals: `build_turns` puts each request over `LONG_CONTEXT_THRESHOLD` into a per-turn `usage_long` bucket (and counts them in `long_context_requests` metadata), and `calculate_turn_cost(long_context_usage=...)` bills that part at `_LONG_CONTEXT_RATES`. Models without an entry there ignore the bucket. Data residency 1.1x applies to both tiers; no fast mode.
 
 **Fable 5.1 / Mythos 5.1** cache reads are $0.25 (0.025x input), not the $1.00 of Fable 5 / Mythos 5. Other rates are identical.
 
@@ -218,7 +223,7 @@ now hits the `[WARN]` + `$0` path instead of inheriting its predecessor's rate.
 Sonnet, Haiku, Fable and Mythos work the same way: `_model_family()` parses both the
 `claude-sonnet-4-5` and the Claude-3-era `claude-3-5-sonnet` schemes, and the result is
 looked up in `_SONNET_RATES` / `_HAIKU_RATES` / `_TOP_TIER_RATES`. `claude-sonnet-6` or
-`claude-haiku-5` therefore warn instead of silently billing at a neighbour's rate.
+`claude-haiku-6` therefore warn instead of silently billing at a neighbour's rate.
 
 **New-tokenizer note:** Opus 4.7+, Fable 5, **and Sonnet 5 / 5.5** ship a new tokenizer that produces ~30% more tokens for the same input text vs. prior models (Sonnet 4.6 and earlier keep the old tokenizer). Per-token rates are unchanged, but absolute session cost for equivalent workloads is meaningfully higher — the extra cost comes from token *counts* (already in `usageDetails`), not the rate table.
 
@@ -233,7 +238,7 @@ These stack multiplicatively on the base rates above (and apply uniformly across
 - **Fast mode (`speed="fast"`)**: per-model premium — **2x** on Opus 5.5 ($8/$40), Opus 5 and Opus 4.8 ($10/$50), **6x** on Opus 4.6 / 4.7 ($30/$150). Opus 4.5 and Sonnet/Haiku are ineligible and keep base rates. Multipliers live in `FAST_MODE_MULTIPLIERS` in `langfuse-hook.py`.
   - Fast mode is now offered on **Opus 5.5 / 5 / 4.8 only** — `speed="fast"` on Opus 4.7 returns an API error, and the Opus 4.6 `-fast` model ID was retired (requests silently fall back to standard). The 4.6/4.7 entries stay in the table on purpose: turns recorded while fast mode was live on those generations *were* billed at 6x, and reprocessing must keep billing them that way.
 - **Fable 5 / Mythos 5**: ineligible for fast mode (no `/fast` variant) and data residency (`inference_geo` multiplier unverified) — always billed at base $10/$50. Update `calculate_turn_cost` if Anthropic publishes multipliers for them.
-- **Data residency (`inference_geo="us"`)**: 1.1x on Opus 4.6+ (including Opus 5 and 5.5) / Sonnet 4.6+ (including Sonnet 5 and 5.5). Other models do not support the `inference_geo` parameter; multiplier is not applied.
+- **Data residency (`inference_geo="us"`)**: 1.1x on Opus 4.6+ (including Opus 5 and 5.5) / Sonnet 4.6+ (including Sonnet 5 and 5.5) / Haiku 5.5 (both prompt-length tiers). Other models do not support the `inference_geo` parameter; multiplier is not applied.
 - **Fast + US-geo stack**: 2x × 1.1x = 2.2x (Opus 5.5 / 5 / 4.8); 6x × 1.1x = 6.6x (Opus 4.6/4.7).
 
 ### Server-side Tool Billing
@@ -300,6 +305,7 @@ endpoint; the premium is the same for US and EU.
 | Opus 4.8 / 4.7 / 4.6 | $5 / $25 | $5 / $25 | $5.50 / $27.50 |
 | Sonnet 5.5 / 5 | $2 / $10 | unverified | unverified |
 | Sonnet 4.x | $3 / $15 | $3 / $15 | $3.30 / $16.50 |
+| Haiku 5.5 | $0.10 / $0.50 (≤100K) | unverified | unverified |
 | Haiku 4.5 | $1 / $5 | $1 / $5 | $1.10 / $5.50 |
 
 **Known gap (not coded):** the +10% geo premium is **not** auto-applied — Claude Code
@@ -313,8 +319,33 @@ checked against aws.amazon.com/bedrock/pricing.
 
 ## Tags and Metadata
 
-> Transcript-field coverage verified against Claude Code **v2.1.286** (2026-10-01). Changelog
-> v2.1.253–v2.1.286 reviewed for new transcript-JSONL fields or hook-input changes — nothing
+> Transcript-field coverage verified against Claude Code **v2.1.295** (2026-10-09) by a
+> **census of real transcripts** (242 sessions), not just the changelog. The changelog
+> rarely announces transcript fields: the v2.1.221–v2.1.286 reviews below found "nothing",
+> yet the census found these uncaptured fields from that range. Now captured per generation
+> (`gen_metadata_turn_signals`) and rolled up to the session `turn_signals` metadata:
+> - `requestedModel` (assistant, 2.1.295) — the model asked for. Equal to `message.model`
+>   except after a fallback, so it is emitted as `requested_model` + `model_fallback: true`
+>   only when the two differ; session tag `model-fallback`.
+> - `thinkingDurationMs` (assistant, 2.1.287) — written on every streamed entry of a
+>   message with differing values; max per message, summed per turn → `thinking_duration_ms`.
+> - `truncatedAfterOutput` (2.1.289) / `isAbortedMidStream` (2.1.252) — turn flags
+>   `truncated_after_output` / `aborted_mid_stream`; session tag `has-truncated-output`.
+> - `advisorModel` (2.1.280) — echo of the `/advisor` setting on every entry, not proof the
+>   advisor ran; emitted as `advisor_model`.
+> - `turnOrigin` (user, 2.1.278: `human`/`sdk`/`task_notification`/`peer`) — on the entry
+>   that opens a turn; `turn_origin` per generation, `turn_origins` counts per session.
+>   Overlaps the older `origin`/`promptSource` used by `prompt_provenance`, but is present
+>   on every opening entry rather than a minority.
+>
+> Seen but **not captured**: `perTurnEffort` (duplicates `effort`), `quotaLimits`
+> (rate-limit status on rejected requests — candidate for a future event), `turnPosition`,
+> `apiBlockIndex`, `attributionAgent`, `scheduledTaskId`, `serverClassifierRequest`,
+> `wireToolInputs` / `wireIngestContext` (raw tool inputs, already in tool spans),
+> `usage.fallback_credit` (always null so far), and the `cost-state` entry (Claude Code's
+> own running cost total — usable as a cross-check against `session_cost_usd`).
+>
+> Changelog v2.1.253–v2.1.286 reviewed for new transcript-JSONL fields or hook-input changes — nothing
 > found (changes were fixes to redaction, subagents, retries and model fallback). One behaviour
 > to note: since 2.1.286 a refused default model is retried once on the previous model of the
 > same tier, so a session can carry turns from two models; per-turn `model` already handles it.
@@ -379,6 +410,8 @@ Each trace is enriched with:
 - `has-errors` — present if API errors occurred during the session (`system/api_error` entries)
 - `has-api-error-messages` — present when the session had assistant-channel API-error/auto-retry stubs (`isApiErrorMessage`); see `api_error_messages` metadata
 - `has-interrupts` — present when the user interrupted (ESC) at least one assistant turn (`interruptedMessageId`)
+- `model-fallback` — present when any turn was answered by a different model than its `requestedModel` (CC 2.1.295+)
+- `has-truncated-output` — present when any turn carried `truncatedAfterOutput`
 - `has-queued-prompts` — present when the user queued at least one follow-up prompt mid-turn (`queue-operation` entries); see `queue_operations` metadata
 - `model-missing` — present when any turn had **billable tokens but no `model` field**; that turn's cost is reported as `$0` (never defaulted to a priced model) and a `[WARN]` is logged. Filter on this to find sessions with under-reported cost from upstream transcript gaps.
 - `permission:<mode>` — current permission mode (`default`, `acceptEdits`, `plan`, `bypassPermissions`)

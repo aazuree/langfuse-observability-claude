@@ -115,16 +115,20 @@ class TestCompare:
 
     def test_current_table_matches_a_snapshot_of_the_real_feed(self, monkeypatch):
         """Guards every priced model at once against a pinned copy of the
-        upstream feed's values (verified against platform.claude.com 2026-08-01)."""
+        upstream feed's values (verified against platform.claude.com 2026-08-01;
+        Sonnet 5.5 and Haiku 5.5 short-prompt rates 2026-10-09)."""
         monkeypatch.setattr(drift, "MODELS", [
             "claude-opus-5", "claude-opus-4-8", "claude-opus-4-6",
-            "claude-sonnet-4-6", "claude-haiku-4-5", "claude-fable-5",
+            "claude-sonnet-5-5", "claude-sonnet-4-6", "claude-haiku-5-5",
+            "claude-haiku-4-5", "claude-fable-5",
         ])
         feed = {
             "claude-opus-5":     feed_entry(5.0, 25.0, 0.50, 6.25, 10.0),
             "claude-opus-4-8":   feed_entry(5.0, 25.0, 0.50, 6.25, 10.0),
             "claude-opus-4-6":   feed_entry(5.0, 25.0, 0.50, 6.25, 10.0),
+            "claude-sonnet-5-5": feed_entry(2.0, 10.0, 0.10, 2.50, 4.0),
             "claude-sonnet-4-6": feed_entry(3.0, 15.0, 0.30, 3.75, 6.0),
+            "claude-haiku-5-5":  feed_entry(0.10, 0.50, 0.01, 0.125, 0.20),
             "claude-haiku-4-5":  feed_entry(1.0, 5.0, 0.10, 1.25, 2.0),
             "claude-fable-5":    feed_entry(10.0, 50.0, 1.00, 12.50, 20.0),
         }

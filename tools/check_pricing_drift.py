@@ -17,6 +17,8 @@ update the table and CLAUDE.md by hand.
 What it does NOT cover (still manual):
   * Fast-mode multipliers (`FAST_MODE_MULTIPLIERS`)
   * Data-residency multiplier (`US_GEO_MULTIPLIER` / `inference_geo`)
+  * Prompt-length tiers (`_LONG_CONTEXT_RATES`, Haiku 5.5 over 100K tokens) —
+    only the short-prompt rate is probed and compared.
   * Date-aware introductory pricing windows (none active today) — the
     feed only ever carries *today's* live rate, which is exactly what this
     script compares against.
@@ -62,6 +64,7 @@ MODELS = [
     "claude-sonnet-5-5",
     "claude-sonnet-5",
     "claude-sonnet-4-6",
+    "claude-haiku-5-5",
     "claude-haiku-4-5",
     "claude-fable-5",
     "claude-fable-5-1",
