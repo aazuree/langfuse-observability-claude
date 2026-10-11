@@ -98,6 +98,21 @@ class TestConfigureHooks:
         assert "SessionStart" not in settings["hooks"]
         assert _hooks(settings, "StopFailure") == [{"type": "command", "command": CMD, "async": True}]
 
+    def test_missing_events_follow_an_existing_remote_hook(self):
+        """All three events share one state file per session, so they must
+        send to one Langfuse. A remote Stop entry decides where the newly
+        registered StopFailure / SessionEnd entries send too."""
+        remote = ("LANGFUSE_HOST=http://10.9.0.1:3100 LANGFUSE_PUBLIC_KEY=pk-r "
+                  "LANGFUSE_SECRET_KEY=sk-r python3 /r/langfuse-hook.py")
+        settings, notes = configure_hooks.configure({"hooks": {
+            "Stop": [{"hooks": [{"type": "command", "command": remote, "async": True}]}],
+            "StopFailure": [{"hooks": [{"type": "command",
+                                        "command": "python3 /r/session-start-hook.py"}]}],
+        }}, CMD)
+        for event in configure_hooks.EVENTS:
+            assert [h["command"] for h in _hooks(settings, event)] == [remote]
+        assert any("10.9.0.1" in n for n in notes)
+
     def test_main_backs_up_and_writes(self, tmp_path, monkeypatch):
         path = tmp_path / "settings.json"
         path.write_text(json.dumps({"theme": "dark"}))

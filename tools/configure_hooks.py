@@ -13,8 +13,10 @@ spliced into source code.
   finished.
 - Updates an existing entry's keys, but never re-points a hook at a
   different Langfuse: an entry whose LANGFUSE_HOST differs from the new
-  command's (e.g. a remote Pi stack) is left alone and reported. A command
-  without LANGFUSE_HOST means localhost.
+  command's (e.g. a remote Pi stack) is left alone and reported, and the
+  events it does not cover yet get that same entry: the three events share
+  one state file per session, so they must all send to one Langfuse. A
+  command without LANGFUSE_HOST means localhost.
 - Registers with "async": true so the hook never blocks Claude Code.
   langfuse-hook.py takes a per-session lock, so overlapping fires are safe.
 - Removes entries from retired features: eval-hook.py and
@@ -39,8 +41,9 @@ def _host(command: str) -> str:
     return (match.group(1) if match else DEFAULT_HOST).rstrip("/")
 
 
-def _upsert(groups: list, command: str, notes: list) -> None:
-    """Point every langfuse-hook.py entry in `groups` at `command`, or add one."""
+def _upsert(groups: list, command: str, notes: list, missing: str) -> None:
+    """Point every langfuse-hook.py entry in `groups` at `command`, or add
+    `missing` when the event has none."""
     found = False
     for group in groups:
         for hook in group.get("hooks", []):
@@ -55,7 +58,7 @@ def _upsert(groups: list, command: str, notes: list) -> None:
             hook["command"] = command
             hook["async"] = True
     if not found:
-        groups.append({"hooks": [{"type": "command", "command": command, "async": True}]})
+        groups.append({"hooks": [{"type": "command", "command": missing, "async": True}]})
 
 
 def configure(settings: dict, command: str) -> tuple:
@@ -71,8 +74,20 @@ def configure(settings: dict, command: str) -> tuple:
         if not hooks[event]:
             del hooks[event]
 
+    # A hook already sending elsewhere decides where the missing events send.
+    missing = command
     for event in EVENTS:
-        _upsert(hooks.setdefault(event, []), command, notes)
+        for group in hooks.get(event, []):
+            for hook in group.get("hooks", []):
+                existing = hook.get("command", "")
+                if "langfuse-hook.py" in existing and _host(existing) != _host(command):
+                    missing = existing
+    if missing != command:
+        notes.append(f"registered the missing events with the existing hook for "
+                     f"{_host(missing)}, so a session never splits across two Langfuse hosts")
+
+    for event in EVENTS:
+        _upsert(hooks.setdefault(event, []), command, notes, missing)
     return settings, notes
 
 
