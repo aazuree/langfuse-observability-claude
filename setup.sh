@@ -166,8 +166,7 @@ mkdir -p "$HOME/.claude"
 # LANGFUSE_HOST is always explicit, so the hook targets the stack this .env
 # describes (localhost, or the LAN IP in LAN/Pi mode).
 HOOK_ENV="LANGFUSE_HOST=$HOST_URL LANGFUSE_PUBLIC_KEY=$PROJECT_PK LANGFUSE_SECRET_KEY=$PROJECT_SK"
-STOP_HOOK_CMD="$HOOK_ENV python3 $HOOK_SCRIPT" \
-STOP_FAILURE_HOOK_CMD="$HOOK_ENV python3 $SCRIPT_DIR/session-start-hook.py" \
+HOOK_CMD="$HOOK_ENV python3 $HOOK_SCRIPT" \
     python3 "$SCRIPT_DIR/tools/configure_hooks.py" "$CLAUDE_SETTINGS"
 
 echo ""

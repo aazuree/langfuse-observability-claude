@@ -47,8 +47,8 @@ class TestRenderEnv:
             raise AssertionError("a placeholder with no value must not pass through")
 
 
-STOP = "LANGFUSE_HOST=http://localhost:3100 LANGFUSE_PUBLIC_KEY=pk LANGFUSE_SECRET_KEY=sk python3 /r/langfuse-hook.py"
-FAIL = "LANGFUSE_HOST=http://localhost:3100 LANGFUSE_PUBLIC_KEY=pk LANGFUSE_SECRET_KEY=sk python3 /r/session-start-hook.py"
+CMD = "LANGFUSE_HOST=http://localhost:3100 LANGFUSE_PUBLIC_KEY=pk LANGFUSE_SECRET_KEY=sk python3 /r/langfuse-hook.py"
+EVENTS = ("Stop", "StopFailure", "SessionEnd")
 
 
 def _hooks(settings, event):
@@ -56,50 +56,53 @@ def _hooks(settings, event):
 
 
 class TestConfigureHooks:
-    def test_adds_both_hooks_to_settings_without_them(self):
+    def test_registers_the_hook_on_every_event(self):
         """An existing settings.json without the hook used to get only a
         printed "add this manually" snippet."""
-        settings, notes = configure_hooks.configure({"theme": "dark"}, STOP, FAIL)
+        settings, notes = configure_hooks.configure({"theme": "dark"}, CMD)
         assert settings["theme"] == "dark"
-        assert _hooks(settings, "Stop") == [{"type": "command", "command": STOP, "async": True}]
-        assert _hooks(settings, "StopFailure") == [{"type": "command", "command": FAIL, "async": True}]
+        for event in EVENTS:
+            assert _hooks(settings, event) == [{"type": "command", "command": CMD, "async": True}]
 
     def test_updates_keys_on_the_same_host(self):
-        old = STOP.replace("pk", "pk-old")
+        old = CMD.replace("pk", "pk-old")
         settings, _ = configure_hooks.configure(
-            {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": old}]}]}}, STOP, FAIL)
-        assert [h["command"] for h in _hooks(settings, "Stop")] == [STOP]
+            {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": old}]}]}}, CMD)
+        assert [h["command"] for h in _hooks(settings, "Stop")] == [CMD]
 
     def test_leaves_a_hook_pointed_at_another_host_alone(self):
-        remote = STOP.replace("localhost", "10.9.0.1")
+        remote = CMD.replace("localhost", "10.9.0.1")
         settings, notes = configure_hooks.configure(
-            {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": remote}]}]}}, STOP, FAIL)
+            {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": remote}]}]}}, CMD)
         assert [h["command"] for h in _hooks(settings, "Stop")] == [remote]
         assert any("10.9.0.1" in n for n in notes)
 
     def test_a_command_without_a_host_counts_as_localhost(self):
         bare = "LANGFUSE_PUBLIC_KEY=pk-old LANGFUSE_SECRET_KEY=sk python3 /r/langfuse-hook.py"
         settings, _ = configure_hooks.configure(
-            {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": bare}]}]}}, STOP, FAIL)
-        assert [h["command"] for h in _hooks(settings, "Stop")] == [STOP]
+            {"hooks": {"Stop": [{"hooks": [{"type": "command", "command": bare}]}]}}, CMD)
+        assert [h["command"] for h in _hooks(settings, "Stop")] == [CMD]
 
-    def test_other_hooks_are_untouched_and_legacy_entries_removed(self):
+    def test_other_hooks_are_untouched_and_retired_entries_removed(self):
         other = {"type": "command", "command": "notify-send done"}
+        retired_failure = {"type": "command", "async": True,
+                           "command": "LANGFUSE_HOST=http://10.9.0.1:3100 python3 /r/session-start-hook.py"}
         settings, _ = configure_hooks.configure({"hooks": {
             "Stop": [{"hooks": [other, {"type": "command", "command": "python3 /r/eval-hook.py"}]}],
             "SessionStart": [{"hooks": [{"type": "command",
                                          "command": "python3 /r/session-start-hook.py"}]}],
-        }}, STOP, FAIL)
+            "StopFailure": [{"hooks": [retired_failure]}],
+        }}, CMD)
         assert other in _hooks(settings, "Stop")
         assert not any("eval-hook" in h["command"] for h in _hooks(settings, "Stop"))
         assert "SessionStart" not in settings["hooks"]
+        assert _hooks(settings, "StopFailure") == [{"type": "command", "command": CMD, "async": True}]
 
     def test_main_backs_up_and_writes(self, tmp_path, monkeypatch):
         path = tmp_path / "settings.json"
         path.write_text(json.dumps({"theme": "dark"}))
-        monkeypatch.setenv("STOP_HOOK_CMD", STOP)
-        monkeypatch.setenv("STOP_FAILURE_HOOK_CMD", FAIL)
+        monkeypatch.setenv("HOOK_CMD", CMD)
         assert configure_hooks.main([str(path)]) == 0
-        assert _hooks(json.loads(path.read_text()), "Stop")[0]["command"] == STOP
+        assert _hooks(json.loads(path.read_text()), "SessionEnd")[0]["command"] == CMD
         backups = [p for p in os.listdir(tmp_path) if p.startswith("settings.json.backup.")]
         assert len(backups) == 1

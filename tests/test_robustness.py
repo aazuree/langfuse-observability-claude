@@ -17,10 +17,6 @@ _spec = importlib.util.spec_from_file_location(
     "langfuse_hook", os.path.join(_dir, "langfuse-hook.py"))
 hook = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(hook)
-_sspec = importlib.util.spec_from_file_location(
-    "session_start_hook", os.path.join(_dir, "session-start-hook.py"))
-sh = importlib.util.module_from_spec(_sspec)
-_sspec.loader.exec_module(sh)
 
 import langfuse_common
 
@@ -116,19 +112,3 @@ class TestExceptionGuard:
 
         hook.reprocess_all()
         assert seen == ["aaa", "bbb"]
-
-    def test_stop_failure_hook_logs_a_crash(self, monkeypatch):
-        monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(
-            {"hook_event_name": "StopFailure", "session_id": "s1",
-             "transcript_path": "/x.jsonl"})))
-        monkeypatch.setattr(sh, "LANGFUSE_PUBLIC_KEY", "pk")
-        monkeypatch.setattr(sh, "LANGFUSE_SECRET_KEY", "sk")
-
-        def crash(*a, **kw):
-            raise ValueError("nope")
-        monkeypatch.setattr(sh, "build_stop_failure_batch", crash)
-        logged = []
-        monkeypatch.setattr(sh, "log", logged.append)
-
-        sh.main()  # must not raise
-        assert any("[ERROR]" in m and "ValueError" in m for m in logged)
