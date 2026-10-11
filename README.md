@@ -32,7 +32,7 @@ The setup script:
 1. Prompts for your admin email and password
 2. Generates `.env` with random secrets (including unique project API keys)
 3. Starts Langfuse via Docker Compose (6 services)
-4. Backs up existing `~/.claude/settings.json` (if present) and registers the `Stop` and `StopFailure` hooks (running in the background, `"async": true`). A hook already pointed at a different Langfuse host is left alone
+4. Backs up existing `~/.claude/settings.json` (if present) and registers `langfuse-hook.py` on the `Stop`, `StopFailure` and `SessionEnd` events (running in the background, `"async": true`). A hook already pointed at a different Langfuse host is left alone
 
 **Dashboard**: http://localhost:3100
 **Login**: the credentials you entered during setup
@@ -54,9 +54,10 @@ mode stays the default.
 ```
 Claude Code CLI
       |
-      | (Stop hook fires after each response)
+      | Stop / StopFailure / SessionEnd hooks
       v
-langfuse-hook.py  ──POST──>  Langfuse API (localhost:3100)
+langfuse-hook.py  ──OTLP──>  Langfuse API (localhost:3100)
+                  (one trace per turn; session scores via the scores API)
                                     |
                               ┌─────┴─────┐
                               │  Langfuse  │
@@ -73,16 +74,17 @@ langfuse-hook.py  ──POST──>  Langfuse API (localhost:3100)
 ```
 langfuse-observability/
 ├── docker-compose.yml     # Langfuse stack (6 services)
-├── langfuse-hook.py       # Stop hook: transcript -> Langfuse ingestion
-├── session-start-hook.py  # StopFailure hook: tags traces with stop-failure + last API error
+├── langfuse-hook.py       # The hook: transcript -> one trace per turn, sent over OTLP
+├── langfuse_otlp.py       # Hook events -> OTLP/JSON export with langfuse.* attributes
 ├── setup.sh               # One-command setup (secrets, docker, hook config)
 ├── tools/                 # Pricing drift check + setup.sh helpers
 ├── .env.example           # Template (safe to commit)
 ├── .env                   # Actual secrets (gitignored)
 ├── tests/
 │   ├── test_langfuse_hook.py      # Core hook unit tests
-│   ├── test_session_hooks.py      # StopFailure hook tests
-│   ├── test_hook_scores.py        # Hook-level score classifier tests
+│   ├── test_otlp.py               # OTLP translation tests
+│   ├── test_send.py               # Send path: one request per fire, status handling
+│   ├── test_hook_scores.py        # Session score classifier tests
 │   ├── test_subagent_tracking.py  # Subagent cost tracking tests
 │   └── ...                        # one file per feature; see CLAUDE.md
 └── README.md
@@ -90,15 +92,16 @@ langfuse-observability/
 
 ## How It Works
 
-The hook script (`langfuse-hook.py`) is invoked by Claude Code after each assistant response:
+The hook script (`langfuse-hook.py`) is invoked by Claude Code after each assistant response (`Stop`), after a turn that ended in an API error (`StopFailure`), and when the session ends (`SessionEnd`):
 
-1. **Incremental processing** — tracks a line offset per session and sends only new turns, while every trace-level rollup (tokens, cost, scores) is recomputed over the whole session
+1. **One trace per turn, sent once** — each finished turn becomes its own trace, grouped by `session.id`; Langfuse v4 keeps every export of a span, so a turn is only sent once it is finished. Session-wide rollups (tokens, cost, subagent costs, ...) are recomputed every fire and sent as session-level scores
 2. **Turn detection** — groups transcript entries into user→assistant turns
 3. **Tool call matching** — pairs `tool_use` blocks with their `tool_result` responses via `tool_use_id`
 4. **Token deduplication** — assistant messages with the same `message.id` are streaming updates carrying identical usage; it is counted once
 5. **Timing** — uses message timestamps for latency, `turn_duration` entries for total turn time, first assistant timestamp for TTFT
-6. **Cost** — computes equivalent Anthropic API cost from token counts (configurable via `REPORT_API_EQUIVALENT_COST` flag)
-7. **Subagent tracking** — discovers subagent transcripts (from Agent tool invocations) via a 3-pass correlation (`.meta.json` `toolUseId` → `agentId` → timestamp proximity), ingests them as nested observations, and rolls up per-subagent cost in trace metadata
+6. **Cost** — computes equivalent Anthropic API cost from token counts
+7. **Subagent tracking** — finds subagent transcripts through their `.meta.json` `toolUseId` (the Agent call that spawned them), ingests them as nested observations, and rolls up per-subagent cost in the session score
+8. **Transport** — OTLP/HTTP to `/api/public/otel/v1/traces` with `langfuse.*` + `gen_ai.*` attributes; scores to `/api/public/scores`
 
 ## Services
 
@@ -134,7 +137,7 @@ curl -s http://localhost:3100/api/public/traces \
 
 ## Hook Configuration
 
-The Stop hook in `~/.claude/settings.json`:
+The hook in `~/.claude/settings.json` (the same command on three events):
 
 ```json
 {
@@ -150,17 +153,8 @@ The Stop hook in `~/.claude/settings.json`:
         ]
       }
     ],
-    "StopFailure": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "LANGFUSE_HOST=http://localhost:3100 LANGFUSE_PUBLIC_KEY=<your-pk> LANGFUSE_SECRET_KEY=<your-sk> python3 /path/to/session-start-hook.py",
-            "async": true
-          }
-        ]
-      }
-    ]
+    "StopFailure": [ ...the same entry... ],
+    "SessionEnd": [ ...the same entry... ]
   }
 }
 ```
@@ -176,23 +170,21 @@ If you set up Langfuse after already using Claude Code, or need to rebuild after
 PK=$(grep '^LANGFUSE_INIT_PROJECT_PUBLIC_KEY=' .env | cut -d= -f2)
 SK=$(grep '^LANGFUSE_INIT_PROJECT_SECRET_KEY=' .env | cut -d= -f2)
 
+# Delete what Langfuse already has for these sessions, then wait for the
+# asynchronous delete to finish (traces gone from the UI, typically <15 min)
+LANGFUSE_PUBLIC_KEY=$PK LANGFUSE_SECRET_KEY=$SK python3 langfuse-hook.py --delete-traces
+
 # Reprocess all sessions from ~/.claude/projects/
 LANGFUSE_PUBLIC_KEY=$PK LANGFUSE_SECRET_KEY=$SK python3 langfuse-hook.py --reprocess
 ```
 
-This finds all transcript files and re-ingests them from scratch. It does **not** delete traces: IDs are deterministic, so a re-ingest upserts in place. When an upgrade renumbers turns (see CLAUDE.md, "Turn numbering changed"), delete first and wait for Langfuse's asynchronous delete to finish:
-
-```bash
-LANGFUSE_PUBLIC_KEY=$PK LANGFUSE_SECRET_KEY=$SK python3 langfuse-hook.py --delete-traces
-# ...wait until the traces are gone from the UI...
-LANGFUSE_PUBLIC_KEY=$PK LANGFUSE_SECRET_KEY=$SK python3 langfuse-hook.py --reprocess
-```
+Always delete first: Langfuse v4 keeps every export of a span, so re-sending a session that is still there doubles its cost. Claude Code keeps transcripts for 30 days, so older sessions cannot be re-sent.
 
 ## Subagent Cost Tracking
 
-When Claude Code spawns subagents via the Agent tool, the hook automatically discovers their transcripts at `<session>/subagents/agent-{id}.jsonl`, correlates them (`.meta.json` `toolUseId` → `agentId` → timestamp proximity), and ingests them as nested generations/spans under the parent Agent tool span.
+When Claude Code spawns subagents via the Agent tool, the hook automatically discovers their transcripts at `<session>/subagents/agent-{id}.jsonl`, matches them to their Agent call through the `.meta.json` `toolUseId`, and ingests them as nested generations/spans under that Agent tool span, in the trace of the turn that launched them.
 
-Traces with subagents get `has-subagents` and `subagents:{count}` tags, and trace metadata includes a `subagent_costs` summary with per-agent cost breakdowns and total harness cost. Nested sub-agent dispatches (CC 2.1.172+) are followed recursively up to 5 levels and appear as nested generations/spans with per-agent lineage in `subagent_costs`.
+Turn traces of such sessions get `has-subagents` and `subagents:{count}` tags, and the session score's metadata includes a `subagent_costs` summary with per-agent cost breakdowns and total harness cost. Nested sub-agent dispatches (CC 2.1.172+) are followed recursively up to 5 levels and appear as nested generations/spans with per-agent lineage in `subagent_costs`.
 
 ## Running Tests
 
@@ -205,7 +197,7 @@ run never appends fixture sessions to `~/.claude/langfuse-hook.log`.
 
 ## Cost Estimation
 
-Set `REPORT_API_EQUIVALENT_COST = True` in `langfuse-hook.py` (default) to report what each turn would cost at Anthropic API rates. Useful for tracking usage even on a Pro subscription where the actual marginal cost is $0.
+Each turn reports what it would cost at Anthropic API rates (model-aware, cache 5m/1h tiers, fast mode, data residency, web search). Useful for tracking usage even on a subscription where the actual marginal cost is $0. See CLAUDE.md, "Cost Model".
 
 ## Security
 

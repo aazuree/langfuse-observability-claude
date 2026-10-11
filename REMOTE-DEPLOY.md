@@ -22,7 +22,7 @@ Nothing here changes the default local experience.
 ## What actually gets exposed
 
 Only **`langfuse-web` (port 3100)** is published beyond localhost. It serves both
-the dashboard UI *and* the `/api/public/ingestion` endpoint the hook POSTs to, so a
+the dashboard UI *and* the OTLP / scores endpoints the hook POSTs to, so a
 single interface change covers both. PostgreSQL, ClickHouse, Redis, MinIO and the
 worker stay bound to `127.0.0.1` on the Pi — no reason to put a database on the LAN.
 
@@ -62,7 +62,7 @@ PI_IP=192.168.1.50
 NEXTAUTH_URL=http://$PI_IP:3100 LANGFUSE_WEB_BIND=$PI_IP ./setup.sh
 ```
 
-`setup.sh` also tries to configure a Claude Code Stop hook in `~/.claude/settings.json`
+`setup.sh` also tries to configure the Claude Code hook in `~/.claude/settings.json`
 on whatever machine it runs on. On a headless Pi that has no Claude Code, that hook
 is harmless (it just writes a settings file that never fires) — ignore it. The hook
 that matters lives on your **dev machine** (Step 2).
@@ -84,7 +84,8 @@ grep '^LANGFUSE_INIT_PROJECT_SECRET_KEY=' .env   # sk-lf-...
 ## Step 2 — Point your dev machine's hook at the Pi
 
 On your **dev machine** (where Claude Code runs), edit `~/.claude/settings.json`.
-Add `LANGFUSE_HOST=http://<pi-ip>:3100` to the front of the hook commands, and use
+Register the hook on `Stop`, `StopFailure` and `SessionEnd` (the same command on
+all three), with `LANGFUSE_HOST=http://<pi-ip>:3100` at the front, and use
 the **pk/sk from the Pi's `.env`** (Step 1) — the keys must match the Pi's project:
 
 ```json
@@ -96,12 +97,8 @@ the **pk/sk from the Pi's `.env`** (Step 1) — the keys must match the Pi's pro
         "async": true
       } ] }
     ],
-    "StopFailure": [
-      { "hooks": [ { "type": "command",
-        "command": "LANGFUSE_HOST=http://192.168.1.50:3100 LANGFUSE_PUBLIC_KEY=pk-lf-... LANGFUSE_SECRET_KEY=sk-lf-... python3 /path/to/session-start-hook.py",
-        "async": true
-      } ] }
-    ]
+    "StopFailure": [ ...the same entry... ],
+    "SessionEnd": [ ...the same entry... ]
   }
 }
 ```
@@ -112,7 +109,7 @@ the containers moved to the Pi.
 ## Step 3 — Verify end-to-end
 
 ```bash
-# From the dev machine: the Pi's ingestion API is reachable
+# From the dev machine: the Pi's API is reachable
 curl -sf http://<pi-ip>:3100 >/dev/null && echo "reachable"
 
 # Run any Claude Code turn, then tail the hook log
