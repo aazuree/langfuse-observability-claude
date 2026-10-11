@@ -166,6 +166,27 @@ class TestEachTurnIsSentOnce:
         hook.process_session(fires.sid, str(fires.path), "/w/proj", final=True)
         assert [t["name"] for t in turn_traces(fires.batches[-1])] == ["question 1"]
 
+    def test_a_turn_with_no_reply_is_not_sent_even_at_session_end(self, tmp_path, monkeypatch):
+        """`/exit` leaves a last turn with no reply. If SessionEnd sent it, a
+        resumed session's next prompt would merge into that already-sent
+        turn (user entries merge until a reply) and its cost would never be
+        exported. Found in 3 of 92 local sessions."""
+        fires = _Fires(tmp_path, monkeypatch)
+        fires.fire(_turn(1, minute=0))
+        exit_stub = [{"type": "user", "uuid": "x1", "timestamp": "2026-09-20T10:01:00+00:00",
+                      "message": {"role": "user",
+                                  "content": "<command-name>/exit</command-name>"}}]
+        with open(fires.path, "a") as f:
+            f.write(json.dumps(exit_stub[0]) + "\n")
+        hook.process_session(fires.sid, str(fires.path), "/w/proj", final=True)
+        assert turn_traces(fires.batches[-1]) == []
+
+        resumed = fires.fire(_turn(2, minute=5))
+        gens = list(fires.gens(resumed).values())
+        assert len(gens) == 1 and gens[0]["costDetails"]["total"] > 0
+        sent = [g for b in fires.batches for g in fires.gens(b)]
+        assert len(sent) == len(set(sent)) == 2
+
     def test_turn_duration_is_kept_when_already_written(self, tmp_path, monkeypatch):
         """Claude Code writes system/turn_duration after the Stop hook, so a
         live fire usually misses it; a re-ingest picks it up."""

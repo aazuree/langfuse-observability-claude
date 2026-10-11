@@ -2634,10 +2634,18 @@ def complete_turn_count(turns: list[dict], final: bool) -> int:
     reason — on a Stop fire the turn that just finished has one. It is held
     back otherwise: an async fire can read the transcript after a queued
     prompt has already opened the next turn. `final` (SessionEnd, reprocess of
-    an idle transcript) sends everything.
+    an idle transcript) sends everything else.
+
+    A last turn with no reply (`/exit`, `/model`, a prompt interrupted before
+    any answer) is never sent, not even when `final`: user entries merge
+    into one turn until a reply arrives, so if the session is resumed the
+    next prompt and its reply join that turn. Sending it would mark the
+    index as done and lose the reply's cost. It has none of its own.
     """
     if not turns:
         return 0
+    if not turns[-1].get("api_call_ids"):
+        return len(turns) - 1
     if final or (turns[-1].get("stop_reason") or "") in TERMINAL_STOP_REASONS:
         return len(turns)
     return len(turns) - 1
@@ -2933,6 +2941,9 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
                 continue
             sa_parent_span = f"span-{turn_id}-{sa_tc_idx}"
             prev = sa_state.get(sa_id, {})
+            # Measured before the read: a write landing mid-read then shows
+            # as growth on the next fire instead of being counted as seen.
+            sa_size = _file_size(sa_path)
             sa_events, sa_cost, sa_offset, sa_tc, sa_status = ingest_subagent(
                 agent_id=sa_id,
                 transcript_path=sa_path,
@@ -2950,7 +2961,7 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
             sa_state[sa_id] = _subagent_record(
                 prev, sa_events, sa_cost, sa_offset, sa_tc, sa_status,
                 description=sa_desc, subagent_type=sa_type,
-                path=sa_path, size=_file_size(sa_path), parent_span_id=sa_parent_span,
+                path=sa_path, size=sa_size, parent_span_id=sa_parent_span,
                 trace_id=trace_id, depth=1,
             )
             for evt in batch:
@@ -3130,10 +3141,13 @@ def delete_all_traces() -> int:
         ok = delete_traces(session_trace_ids(session_id, str(transcript)))
         ok &= delete_scores([session_score_id(session_id, n) for n in SESSION_SCORE_NAMES])
         failures += not ok
-        for suffix in (".offset", ".subagents.json"):
-            state_file = Path(STATE_DIR) / f"{session_id}{suffix}"
-            if state_file.exists():
-                state_file.unlink()
+        # Keep the state of a session whose delete failed: its traces are
+        # still there, and resetting would make the next fire re-send them.
+        if ok:
+            for suffix in (".offset", ".subagents.json"):
+                state_file = Path(STATE_DIR) / f"{session_id}{suffix}"
+                if state_file.exists():
+                    state_file.unlink()
         print(f"[{idx}/{len(transcripts)}] {'deleted' if ok else 'FAILED '} {session_id}")
     print(f"\nDone: {len(transcripts) - failures} deleted, {failures} failed. "
           "Langfuse deletes asynchronously — wait until the traces are gone "

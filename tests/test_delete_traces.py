@@ -97,9 +97,13 @@ def test_reports_failures(tmp_path, monkeypatch):
     monkeypatch.setattr(hook, "STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setattr(hook, "LANGFUSE_PUBLIC_KEY", "pk")
     monkeypatch.setattr(hook, "LANGFUSE_SECRET_KEY", "sk")
+    hook.save_state("s1", 10, 2)
     monkeypatch.setattr(hook, "delete_traces", lambda ids: False)
     monkeypatch.setattr(hook, "delete_scores", lambda ids: True)
     assert hook.delete_all_traces() == 1
+    # The traces are still there, so the next fire must not re-send them:
+    # v4 would store every span twice.
+    assert hook.load_state("s1") == (10, 2)
 
 
 def test_a_failed_score_delete_is_a_failure(tmp_path, monkeypatch):
