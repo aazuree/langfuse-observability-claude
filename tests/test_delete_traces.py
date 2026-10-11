@@ -77,8 +77,13 @@ def test_deletes_every_local_session_and_resets_its_state(tmp_path, monkeypatch)
     monkeypatch.setattr(hook, "LANGFUSE_SECRET_KEY", "sk")
     deleted = []
     monkeypatch.setattr(hook, "delete_traces", lambda ids: deleted.extend(ids) or True)
+    scores = []
+    monkeypatch.setattr(hook, "delete_scores", lambda ids: scores.extend(ids) or True)
 
     assert hook.delete_all_traces() == 0
+    # Session scores are not part of any trace, so a trace delete leaves them.
+    assert hook.session_score_id("s2", "session_cost_usd") in scores
+    assert len(scores) == 2 * len(hook.SESSION_SCORE_NAMES)
     assert "trace-s1" in deleted and "trace-s2" in deleted
     assert _turn_trace("s2", 1) in deleted
     # The next fire must re-send the whole session, not just new lines.
@@ -93,7 +98,29 @@ def test_reports_failures(tmp_path, monkeypatch):
     monkeypatch.setattr(hook, "LANGFUSE_PUBLIC_KEY", "pk")
     monkeypatch.setattr(hook, "LANGFUSE_SECRET_KEY", "sk")
     monkeypatch.setattr(hook, "delete_traces", lambda ids: False)
+    monkeypatch.setattr(hook, "delete_scores", lambda ids: True)
     assert hook.delete_all_traces() == 1
+
+
+def test_a_failed_score_delete_is_a_failure(tmp_path, monkeypatch):
+    _projects(tmp_path, "s1")
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    monkeypatch.setattr(hook, "STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(hook, "LANGFUSE_PUBLIC_KEY", "pk")
+    monkeypatch.setattr(hook, "LANGFUSE_SECRET_KEY", "sk")
+    monkeypatch.setattr(hook, "delete_traces", lambda ids: True)
+    monkeypatch.setattr(hook, "delete_scores", lambda ids: False)
+    assert hook.delete_all_traces() == 1
+
+
+def test_score_events_use_the_ids_that_get_deleted(tmp_path):
+    """The ids the delete targets are the ids the scores were sent with."""
+    turns = [{"usage": {"cache_read": 5, "cache_create": 5}, "tool_calls": []}]
+    events = hook.build_hook_score_events("s1", turns, 1.0, {})
+    assert events
+    for e in events:
+        assert e["body"]["name"] in hook.SESSION_SCORE_NAMES
+        assert e["body"]["id"] == hook.session_score_id("s1", e["body"]["name"])
 
 
 class TestDeleteTraces:
@@ -118,6 +145,26 @@ class TestDeleteTraces:
         monkeypatch.setattr(hook, "urlopen", down)
         assert hook.delete_traces(["t1"]) is False
         assert any("[ERROR]" in m and "DELETE" in m for m in logged)
+
+
+class TestDeleteScores:
+    def test_one_delete_per_score(self, monkeypatch):
+        monkeypatch.setattr(langfuse_common, "LANGFUSE_PUBLIC_KEY", "pk")
+        monkeypatch.setattr(langfuse_common, "LANGFUSE_SECRET_KEY", "sk")
+        requests = []
+        monkeypatch.setattr(hook, "urlopen", lambda req, timeout=30: requests.append(req) or _Resp())
+        assert hook.delete_scores(["score-a", "score-b"]) is True
+        assert [r.get_method() for r in requests] == ["DELETE", "DELETE"]
+        assert requests[0].full_url.endswith("/api/public/scores/score-a")
+        assert requests[0].data is None
+
+    def test_failure_returns_false(self, monkeypatch):
+        monkeypatch.setattr(hook, "log", lambda m: None)
+
+        def down(req, timeout=30):
+            raise URLError("connection refused")
+        monkeypatch.setattr(hook, "urlopen", down)
+        assert hook.delete_scores(["score-a"]) is False
 
 
 def test_cli_flag_dispatches(monkeypatch):

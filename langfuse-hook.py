@@ -131,9 +131,10 @@ def _post(url: str, data: bytes, headers: dict) -> str:
         return "transient"
 
 
-def _post_json(method: str, url: str, payload: dict) -> str:
+def _post_json(method: str, url: str, payload: dict | None = None) -> str:
     """JSON request with the same outcome classification as _post."""
-    req = Request(url, data=json.dumps(payload).encode(), method=method, headers={
+    data = json.dumps(payload).encode() if payload is not None else None
+    req = Request(url, data=data, method=method, headers={
         "Content-Type": "application/json",
         "Authorization": make_auth_header(),
     })
@@ -1199,13 +1200,43 @@ def _is_synthetic_prompt(text: str) -> bool:
     return bool(_SYNTHETIC_PROMPT_RE.match(text)) or text.startswith("[Request interrupted")
 
 
+_COMMAND_NAME_RE = re.compile(r"<command-name>\s*(.*?)\s*</command-name>", re.S)
+_COMMAND_ARGS_RE = re.compile(r"<command-args>(.*?)</command-args>", re.S)
+_SUMMARY_RE = re.compile(r"<summary>(.*?)</summary>", re.S)
+_SKILL_BODY_RE = re.compile(r"^Base directory for this skill: (\S+)")
+
+
+def _stub_label(text: str) -> str:
+    """A readable name for input nobody typed as prose; "" when none fits."""
+    text = text.strip()
+    if text.startswith("<task-notification>"):
+        m = _SUMMARY_RE.search(text)
+        summary = " ".join(m.group(1).split()) if m else ""
+        return f"Task notification: {summary}" if summary else "Task notification"
+    m = _COMMAND_NAME_RE.search(text)
+    if m and _is_synthetic_prompt(text):
+        args = _COMMAND_ARGS_RE.search(text)
+        return " ".join(filter(None, (m.group(1), " ".join(args.group(1).split()) if args else "")))
+    m = _SKILL_BODY_RE.match(text)
+    if m:
+        return f"Skill: {os.path.basename(m.group(1).rstrip('/'))}"
+    return ""
+
+
 def _display_prompt(parts: list) -> str:
     """The part of a turn's input to name it by: the first typed text,
-    else the first non-stub text (e.g. a skill expansion), else whatever
-    there is. `parts` is [(text, is_meta), ...] in file order."""
+    else a label for what started the turn (slash command, task
+    notification, skill body), else the first non-stub text, else
+    whatever there is. `parts` is [(text, is_meta), ...] in file order.
+
+    Each turn is its own trace, so this is the trace name."""
     for text, is_meta in parts:
         if not is_meta and not _is_synthetic_prompt(text):
             return text.strip()
+    for text, _ in parts:
+        label = _stub_label(text)
+        if label:
+            return label
     for text, _ in parts:
         if not _is_synthetic_prompt(text):
             return text.strip()
@@ -2416,6 +2447,16 @@ def build_attribution_tags(summary: dict | None) -> list[str]:
     return sorted(set(tags))
 
 
+# Every score the hook writes for a session. Ids depend only on session and
+# name, so --delete-traces can remove them without asking Langfuse.
+SESSION_SCORE_NAMES = ("session_cost_usd", "cache_hit_rate", "tool_error_rate",
+                       "tool_denial_rate")
+
+
+def session_score_id(session_id: str, name: str) -> str:
+    return f"score-{uuid.uuid5(uuid.NAMESPACE_URL, f'{session_id}:score:{name}')}"
+
+
 def build_hook_score_events(
     session_id: str,
     turns: list[dict],
@@ -2445,9 +2486,8 @@ def build_hook_score_events(
 
     events = []
     for score in scores:
-        score_id = uuid.uuid5(uuid.NAMESPACE_URL, f"{session_id}:score:{score['name']}")
         events.append({"type": "score-create", "body": {
-            "id": f"score-{score_id}",
+            "id": session_score_id(session_id, score["name"]),
             "sessionId": session_id,
             "dataType": "NUMERIC",
             "source": "API",
@@ -3044,6 +3084,20 @@ def delete_traces(trace_ids: list[str]) -> bool:
     return True
 
 
+def delete_scores(score_ids: list[str]) -> bool:
+    """Delete scores by id. True when every call succeeded.
+
+    Session scores belong to no trace, so deleting a session's traces leaves
+    them behind, metadata and all. Langfuse merges score metadata key by key
+    on upsert, so a re-ingest would otherwise keep keys the new run no longer
+    writes. Deleting an id that does not exist succeeds.
+    """
+    ok = True
+    for score_id in score_ids:
+        ok &= _post_json("DELETE", f"{LANGFUSE_HOST}/api/public/scores/{score_id}") == "ok"
+    return ok
+
+
 def session_trace_ids(session_id: str, transcript_path: str) -> list[str]:
     """Every trace this hook can have written for a session.
 
@@ -3057,7 +3111,8 @@ def session_trace_ids(session_id: str, transcript_path: str) -> list[str]:
 
 
 def delete_all_traces() -> int:
-    """Delete the traces of every local session and reset its hook state.
+    """Delete the traces and session scores of every local session and
+    reset its hook state.
 
     Langfuse v4 keeps every export of a span, so re-ingesting a session
     without deleting it first doubles its cost. State is reset too, so the
@@ -3073,6 +3128,7 @@ def delete_all_traces() -> int:
     for idx, transcript in enumerate(transcripts, 1):
         session_id = sanitize_id(transcript.stem)
         ok = delete_traces(session_trace_ids(session_id, str(transcript)))
+        ok &= delete_scores([session_score_id(session_id, n) for n in SESSION_SCORE_NAMES])
         failures += not ok
         for suffix in (".offset", ".subagents.json"):
             state_file = Path(STATE_DIR) / f"{session_id}{suffix}"
