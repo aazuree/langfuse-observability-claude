@@ -138,7 +138,7 @@ tests/
   test_turn_merging.py           # Consecutive user entries before a reply form one turn
   test_session_lock.py           # Per-session lock for overlapping (async) fires
   test_robustness.py             # Atomic state writes, logged crashes
-  test_delete_traces.py          # --delete-traces (every per-turn trace + the old session trace)
+  test_delete_traces.py          # --delete-traces (every per-turn trace, the old session trace, session scores)
   test_setup_tools.py            # tools/render_env.py and tools/configure_hooks.py
 ```
 
@@ -398,7 +398,11 @@ checked against aws.amazon.com/bedrock/pricing.
 Each turn is its own trace, grouped by `session.id` (Langfuse **Sessions** view sums
 cost and tokens across them). A turn trace carries:
 
-- **name** — the turn's prompt (80 chars, redacted); fallback `Turn <n>`
+- **name** — the turn's prompt (80 chars, redacted); fallback `Turn <n>`. A turn with no typed
+  prose is named by what started it (`_stub_label`): `/<command> <args>` for a slash command,
+  `Task notification: <summary>` for a background task finishing, `Skill: <name>` for a skill
+  body. Without this, 147 of 483 local turns were named by raw `<task-notification>` /
+  `<local-command-caveat>` markup or the first line of a skill body
 - **metadata** — session state as of the fire that sent it: `session_title` (see
   precedence below), `cwd`, `repo_name`, `git_branch`, `cli_version`, `entrypoint`,
   `custom_title`, `ai_title`, `agent_name`, `session_kind`, `permission_mode`,
@@ -446,7 +450,7 @@ Session-wide rollups are not on the traces: they ride on the session-level
 1. `customTitle` from `type: "custom-title"` (user-set via in-CLI title command)
 2. `aiTitle` from `type: "ai-title"` (Claude-generated short title once enough session context exists)
 3. `agentName` from `type: "agent-name"` (auto-generated mid-session slug, e.g. `langfuse-usagedetails-fix`)
-4. Truncated first non-synthetic user prompt (80 chars) — the turn's `display_prompt`: the first typed (non-`isMeta`) text that is not a `<tag>` stub or an interrupt marker
+4. Truncated first non-synthetic user prompt (80 chars) — the turn's `display_prompt`: the first typed (non-`isMeta`) text that is not a `<tag>` stub or an interrupt marker, else the stub label (`/command args`, `Skill: <name>`)
 5. `{repo_name}/{git_branch}` composite — stable fallback when prompt is empty
 6. `"Claude Code Session"` hardcoded fallback
 
@@ -554,7 +558,7 @@ Visible model reasoning is gated by the API `thinking.display` parameter (defaul
 - **Cache tokens only show via usage details.** `cache_read` / `cache_create` (with `cache_5m` / `cache_1h` tier breakdowns) appear as separate line items only because they are keys of `usage_details`.
 - **Metadata values are strings.** Each key is its own attribute (`langfuse.trace.metadata.<k>`, `langfuse.observation.metadata.<k>`) so it is filterable; non-string values are JSON-encoded. Any other attribute lands under `metadata.attributes`.
 - **Trace-level attributes go on the root span** (the turn's generation): `langfuse.trace.name`, `langfuse.trace.tags`, `langfuse.trace.metadata.*`. `session.id` / `user.id` go on every span so filters work on child observations too.
-- **Scores are not spans.** They go to `POST /api/public/scores` and upsert by id.
+- **Scores are not spans.** They go to `POST /api/public/scores` and upsert by id. The value is replaced, but **metadata merges key by key** (verified 4.48.0): a key a later fire no longer writes keeps its old value. Scores belong to no trace, so a trace delete leaves them; `--delete-traces` deletes them by id (`session_score_id`).
 - **Ingestion is async.** A 200 means "queued"; observations appear a few seconds later, and malformed-but-parseable attributes are dropped silently.
 
 ## Token Anatomy
@@ -626,9 +630,10 @@ Session score `session_cost_usd` → metadata `subagent_costs` summary
 
 - **Moved to OTLP, one trace per turn (2026-10-11).** Before, every session was one
   `trace-<session>` trace sent through the legacy ingestion API. Migrate a stack with
-  `--delete-traces` (deletes every per-turn trace *and* the old `trace-<session>` one for
-  each local transcript, and resets hook state), wait until the traces are gone, switch the
-  stack to `LANGFUSE_MIGRATION_V4_WRITE_MODE=events_only` (see REMOTE-DEPLOY.md), then
+  `--delete-traces` **while the stack still runs `legacy`** (deletes every per-turn trace,
+  the old `trace-<session>` one and the session scores for each local transcript, and
+  resets hook state), wait until the traces are gone, switch the stack to
+  `LANGFUSE_MIGRATION_V4_WRITE_MODE=events_only` (the compose default; see REMOTE-DEPLOY.md), then
   `--reprocess`. Sessions older than Claude Code's 30-day transcript retention cannot be
   re-sent. **Never `--reprocess` without deleting first:** v4 keeps every export, so it
   doubles cost.
