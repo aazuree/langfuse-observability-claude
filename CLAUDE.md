@@ -635,8 +635,10 @@ Session score `session_cost_usd` → metadata `subagent_costs` summary
   resets hook state), wait until the traces are gone, switch the stack to
   `LANGFUSE_MIGRATION_V4_WRITE_MODE=events_only` (the compose default; see REMOTE-DEPLOY.md), then
   `--reprocess`. Sessions older than Claude Code's 30-day transcript retention cannot be
-  re-sent. **Never `--reprocess` without deleting first:** v4 keeps every export, so it
-  doubles cost.
+  re-sent. `--reprocess` keeps hook state and sends only turns it marks unsent, so it is
+  safe to repeat; a full re-send needs `--delete-traces` first, which resets that state.
+  (It used to reset state itself, and v4 keeps every export, so a reprocess without a
+  completed delete doubled cost.)
 
 - `.env` contains generated secrets - never commit it
 - The hook never blocks Claude Code: `setup.sh` registers it on Stop / StopFailure / SessionEnd with `"async": true`, and every error, including an unexpected crash, goes to the hook log. A hook registered without `async` runs in the foreground (measured: median 0.8s, max 23s per Stop)

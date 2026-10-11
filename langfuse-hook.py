@@ -3170,10 +3170,13 @@ REPROCESS_IDLE_S = 3600
 
 
 def reprocess_all() -> None:
-    """Re-send every local transcript from scratch.
+    """Send every local transcript's unsent turns.
 
-    Run --delete-traces first and wait for Langfuse to finish: v4 keeps every
-    export of a span, so re-sending a session that is still there doubles it.
+    State is kept: each session sends only what its state says is unsent, so
+    running this twice, or on sessions already in Langfuse, sends nothing new
+    (v4 keeps every export of a span, so a blind re-send doubles cost). To
+    re-send everything, run --delete-traces first — it resets state — and
+    wait for Langfuse to finish deleting.
     """
     if not LANGFUSE_PUBLIC_KEY or not LANGFUSE_SECRET_KEY:
         print("Error: LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY must be set")
@@ -3193,11 +3196,6 @@ def reprocess_all() -> None:
         session_id = sanitize_id(transcript.stem)
         slug = extract_slug(str(transcript)) or extract_custom_title(str(transcript))
         cwd = extract_cwd(str(transcript))
-
-        for suffix in (".offset", ".subagents.json"):
-            state_file = Path(STATE_DIR) / f"{session_id}{suffix}"
-            if state_file.exists():
-                state_file.unlink()
 
         label = f"{session_id}"
         if slug:

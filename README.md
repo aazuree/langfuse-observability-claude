@@ -174,7 +174,8 @@ SK=$(grep '^LANGFUSE_INIT_PROJECT_SECRET_KEY=' .env | cut -d= -f2)
 # asynchronous delete to finish (traces gone from the UI, typically <15 min)
 LANGFUSE_PUBLIC_KEY=$PK LANGFUSE_SECRET_KEY=$SK python3 langfuse-hook.py --delete-traces
 
-# Reprocess all sessions from ~/.claude/projects/
+# Reprocess all sessions from ~/.claude/projects/. It sends only what hook
+# state marks unsent (--delete-traces resets it), so running it twice is safe.
 LANGFUSE_PUBLIC_KEY=$PK LANGFUSE_SECRET_KEY=$SK python3 langfuse-hook.py --reprocess
 ```
 

@@ -180,3 +180,23 @@ def test_cli_flag_dispatches(monkeypatch):
     except SystemExit as e:
         assert e.code == 0
     assert called
+
+
+def test_reprocess_sends_only_what_state_says_is_unsent(tmp_path, monkeypatch):
+    """Langfuse v4 stores every export of a span, so a reprocess that reset
+    state and re-sent everything doubled cost whenever it ran without a
+    completed --delete-traces first, or twice. --delete-traces resets state
+    itself; reprocess sends only what is unsent and is safe to repeat."""
+    _projects(tmp_path, "s1")
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    monkeypatch.setattr(hook, "STATE_DIR", str(tmp_path / "state"))
+    monkeypatch.setattr(hook, "LANGFUSE_PUBLIC_KEY", "pk")
+    monkeypatch.setattr(hook, "LANGFUSE_SECRET_KEY", "sk")
+    monkeypatch.setattr(hook, "log", lambda m: None)
+    sent = []
+    monkeypatch.setattr(hook, "send_to_langfuse", lambda b: sent.append(b) or True)
+
+    hook.reprocess_all()
+    hook.reprocess_all()
+    gens = [e["body"]["id"] for b in sent for e in b if e["type"] == "generation-create"]
+    assert len(gens) == len(set(gens)) == 2
