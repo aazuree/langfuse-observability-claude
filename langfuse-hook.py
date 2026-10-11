@@ -16,6 +16,7 @@ Environment variables:
 """
 
 import contextlib
+import gzip
 import hashlib
 import json
 import os
@@ -33,17 +34,18 @@ from urllib.request import Request, urlopen
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from langfuse_common import (
     atomic_write_text,
-    classify_ingestion_errors,
     iter_transcript,
     log as common_log,
     make_auth_header,
     redact_secrets,
 )
+import langfuse_otlp
 
 LANGFUSE_HOST = os.environ.get("LANGFUSE_HOST", "http://localhost:3100")
 LANGFUSE_PUBLIC_KEY = os.environ.get("LANGFUSE_PUBLIC_KEY", "")
 LANGFUSE_SECRET_KEY = os.environ.get("LANGFUSE_SECRET_KEY", "")
-INGESTION_URL = f"{LANGFUSE_HOST}/api/public/ingestion"
+OTLP_URL = f"{LANGFUSE_HOST}/api/public/otel/v1/traces"
+SCORES_URL = f"{LANGFUSE_HOST}/api/public/scores"
 
 # LANGFUSE_HOOK_LOG lets the test suite redirect the log; without it a pytest run
 # writes fixture sessions into the production log and makes the tail useless.
@@ -99,80 +101,67 @@ def _entries(source):
     return iter_transcript(source)
 
 
-# Whole-request HTTP statuses that no retry can fix: malformed, too large, or
-# unprocessable. See send_to_langfuse.
+# Statuses that no retry can fix: malformed, too large, or unprocessable.
 PERMANENT_HTTP_STATUSES = frozenset({400, 413, 422})
 
 
-def send_to_langfuse(batch: list[dict]) -> bool:
-    """Send events to Langfuse in batches of 50.
-
-    Args:
-        batch: List of event dicts to send
-
-    Returns:
-        True when the caller may advance the transcript line offset — either
-        everything was accepted, or what failed can never succeed on a retry.
-        False when the send should be retried on the next fire.
-
-    Permanent rejections return True *and* log an [ERROR]: those events are
-    lost, but holding the offset back would wedge the session, resending an
-    ever-growing window that can never drain. Losing them loudly beats
-    ingesting nothing forever.
-    """
-    transient = 0
-    permanent = 0
-    for i in range(0, len(batch), 50):
-        chunk = batch[i : i + 50]
-        payload = json.dumps({"batch": chunk}).encode()
-        req = Request(
-            INGESTION_URL,
-            data=payload,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": make_auth_header(),
-            },
-            method="POST",
-        )
+def _post(url: str, data: bytes, headers: dict) -> str:
+    """POST to Langfuse. Returns "ok", "permanent" or "transient"."""
+    req = Request(url, data=data, method="POST", headers={
+        "Content-Type": "application/json",
+        "Authorization": make_auth_header(),
+        **headers,
+    })
+    try:
+        with urlopen(req, timeout=30) as resp:
+            resp.read()
+        return "ok"
+    except HTTPError as e:
         try:
-            with urlopen(req, timeout=15) as resp:
-                body = resp.read().decode()
-                t, p, details = classify_ingestion_errors(body)
-                transient += t
-                permanent += p
-                if t or p:
-                    # Never truncate these: `errors` trails `successes` in the
-                    # body, so a prefix-only log hid exactly this.
-                    log(
-                        f"[ERROR] Langfuse rejected {t + p} of {len(chunk)} event(s) "
-                        f"({resp.status}; {t} retryable, {p} permanent): "
-                        + " | ".join(details[:10])
-                    )
-                else:
-                    log(f"Langfuse accepted {len(chunk)} events ({resp.status})")
-        except HTTPError as e:
-            # The whole request was refused. 400/413/422 mean this payload
-            # can never be accepted; retrying it would resend a growing batch
-            # on every fire. 401/403 (bad keys) and 5xx/429 can be fixed or
-            # pass, so those keep the events for the next fire.
-            if e.code in PERMANENT_HTTP_STATUSES:
-                log(f"[ERROR] Langfuse rejected the whole request of {len(chunk)} "
-                    f"event(s) (HTTP {e.code}): {e.reason}")
-                permanent += len(chunk)
-            else:
-                log(f"Failed to send to Langfuse: HTTP {e.code} {e.reason}")
-                transient += 1
-        except (URLError, TimeoutError, OSError) as e:
-            log(f"Failed to send to Langfuse: {e}")
-            transient += 1
+            detail = e.read().decode(errors="replace")[:500]
+        except OSError:
+            detail = ""
+        if e.code in PERMANENT_HTTP_STATUSES:
+            log(f"[ERROR] Langfuse rejected {url.rsplit('/api/public/', 1)[-1]} "
+                f"(HTTP {e.code}): {detail}")
+            return "permanent"
+        # 401/403 (bad keys) get fixed by a human; 408/429/5xx pass. Either way
+        # dropping the data now would lose it for good.
+        log(f"Failed to send to Langfuse: HTTP {e.code} {e.reason}")
+        return "transient"
+    except (URLError, TimeoutError, OSError) as e:
+        log(f"Failed to send to Langfuse: {e}")
+        return "transient"
 
-    if transient:
-        return False
-    if permanent:
-        log(
-            f"[ERROR] {permanent} event(s) permanently rejected and dropped; "
-            "advancing offset anyway so the session does not stall"
+
+def send_to_langfuse(batch: list[dict]) -> bool:
+    """Export one fire's events: spans over OTLP, then scores.
+
+    Returns True when the caller may advance the session state — the spans
+    were delivered, or rejected in a way no retry can fix (logged [ERROR]).
+
+    The spans go in a single gzipped request, so they land whole or not at
+    all: Langfuse v4 does not deduplicate a re-exported span, and a retry
+    after a partial success would duplicate the part that got through.
+    Scores are sent only after the spans landed. They upsert by id and are
+    recomputed every fire, so a failed score is logged and left to the next
+    fire instead of holding the spans back.
+    """
+    export, scores = langfuse_otlp.build_export(batch)
+    spans = export["resourceSpans"][0]["scopeSpans"][0]["spans"]
+    if spans:
+        result = _post(
+            OTLP_URL,
+            gzip.compress(json.dumps(export).encode()),
+            {"Content-Encoding": "gzip", "x-langfuse-ingestion-version": "4"},
         )
+        if result == "transient":
+            return False
+        if result == "ok":
+            log(f"Langfuse accepted {len(spans)} span(s)")
+    for score in scores:
+        if _post(SCORES_URL, json.dumps(score).encode(), {}) != "ok":
+            log(f"[WARN] Score {score.get('name')} not sent; it is recomputed next fire")
     return True
 
 

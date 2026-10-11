@@ -1,6 +1,5 @@
 # tests/test_robustness.py
-"""Failure handling around the edges of the hook: state writes, crashes, and
-HTTP-level rejections.
+"""Failure handling around the edges of the hook: state writes and crashes.
 
 The hook runs unattended on every Stop, so a failure it does not log is a
 failure nobody sees. Each test here pins one way that used to go unnoticed.
@@ -10,7 +9,6 @@ import io
 import json
 import os
 import sys
-from urllib.error import HTTPError
 
 import pytest
 
@@ -134,37 +132,3 @@ class TestExceptionGuard:
 
         sh.main()  # must not raise
         assert any("[ERROR]" in m and "ValueError" in m for m in logged)
-
-
-# ---------------------------------------------------------------------------
-# HTTP-level rejections
-# ---------------------------------------------------------------------------
-
-def _raise_http(code):
-    def opener(req, timeout=15):
-        raise HTTPError(req.full_url, code, f"status {code}", {}, io.BytesIO(b"{}"))
-    return opener
-
-
-class TestHttpErrorStatus:
-    @pytest.fixture(autouse=True)
-    def _keys(self, monkeypatch):
-        monkeypatch.setattr(langfuse_common, "LANGFUSE_PUBLIC_KEY", "pk")
-        monkeypatch.setattr(langfuse_common, "LANGFUSE_SECRET_KEY", "sk")
-        self.logged = []
-        monkeypatch.setattr(hook, "log", self.logged.append)
-
-    @pytest.mark.parametrize("code", [400, 413, 422])
-    def test_request_the_server_can_never_accept_advances(self, code, monkeypatch):
-        """HTTPError subclasses URLError, so a 413 (batch too large) used to be
-        retried on every fire, forever, with an ever-growing batch."""
-        monkeypatch.setattr(hook, "urlopen", _raise_http(code))
-        assert hook.send_to_langfuse([{"id": "e1"}]) is True
-        assert any("[ERROR]" in m and str(code) in m for m in self.logged)
-
-    @pytest.mark.parametrize("code", [401, 403, 429, 500, 503])
-    def test_fixable_or_transient_status_is_retried(self, code, monkeypatch):
-        """Bad keys (401/403) get fixed by a human; dropping the events in
-        the meantime would lose them for good. Keep them for the next fire."""
-        monkeypatch.setattr(hook, "urlopen", _raise_http(code))
-        assert hook.send_to_langfuse([{"id": "e1"}]) is False

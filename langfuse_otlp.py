@@ -94,12 +94,14 @@ def _trace_attrs(trace: dict) -> list:
     return attrs
 
 
-def _span(body: dict, obs_type: str, trace: dict, session_id: str, user_id: str) -> dict:
+def _span(body: dict, obs_type: str, trace: dict) -> dict:
     start = _nanos(body.get("startTime"))
     end = _nanos(body.get("endTime")) or start
     attrs = [_kv("langfuse.observation.type", obs_type)]
-    sid = trace.get("sessionId") or session_id
-    uid = trace.get("userId") or user_id
+    # Observations carry their own session/user: a background subagent's
+    # later turns join a trace whose trace-create was sent in an earlier fire.
+    sid = body.get("sessionId") or trace.get("sessionId")
+    uid = body.get("userId") or trace.get("userId")
     if sid:
         attrs.append(_kv("session.id", sid))
     if uid:
@@ -138,12 +140,8 @@ def _span(body: dict, obs_type: str, trace: dict, session_id: str, user_id: str)
     return span
 
 
-def build_export(events: list[dict], session_id: str = "", user_id: str = "") -> tuple[dict, list]:
-    """Return (OTLP/JSON export, score bodies) for a list of hook events.
-
-    `session_id` / `user_id` cover spans whose trace-create is not in this
-    batch — a background subagent's later turns join a trace sent earlier.
-    """
+def build_export(events: list[dict]) -> tuple[dict, list]:
+    """Return (OTLP/JSON export, score bodies) for a list of hook events."""
     traces = {e["body"]["id"]: e["body"] for e in events if e["type"] == "trace-create"}
     spans, scores = [], []
     for e in events:
@@ -152,21 +150,9 @@ def build_export(events: list[dict], session_id: str = "", user_id: str = "") ->
             scores.append(body)
         elif e["type"] in ("generation-create", "span-create"):
             obs_type = "generation" if e["type"] == "generation-create" else "tool"
-            spans.append(_span(body, obs_type, traces.get(body["traceId"], {}), session_id, user_id))
+            spans.append(_span(body, obs_type, traces.get(body["traceId"], {})))
     export = {"resourceSpans": [{
         "resource": {"attributes": [_kv("service.name", SERVICE_NAME)]},
         "scopeSpans": [{"scope": {"name": SCOPE_NAME}, "spans": spans}],
     }]}
     return export, scores
-
-
-def chunk_export(export: dict, max_spans: int = 200):
-    """Yield exports of at most `max_spans` spans each, preserving order."""
-    resource = export["resourceSpans"][0]["resource"]
-    scope = export["resourceSpans"][0]["scopeSpans"][0]["scope"]
-    spans = export["resourceSpans"][0]["scopeSpans"][0]["spans"]
-    for i in range(0, len(spans), max_spans):
-        yield {"resourceSpans": [{
-            "resource": resource,
-            "scopeSpans": [{"scope": scope, "spans": spans[i:i + max_spans]}],
-        }]}

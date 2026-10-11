@@ -131,11 +131,12 @@ def test_child_span_is_a_tool_nested_under_its_parent():
     assert "langfuse.trace.name" not in a
 
 
-def test_spans_without_their_trace_event_still_get_session_from_caller():
+def test_spans_without_their_trace_event_use_their_own_session():
     # A background subagent's later turns are exported without the
     # trace-create of the turn that launched it.
     events = [e for e in _events() if e["type"] == "span-create"]
-    payload, _ = otlp.build_export(events, session_id="sess-1", user_id="alice")
+    events[0]["body"].update(sessionId="sess-1", userId="alice")
+    payload, _ = otlp.build_export(events)
     a = _attrs(_spans(payload)[0])
     assert a["session.id"] == "sess-1"
     assert a["user.id"] == "alice"
@@ -147,10 +148,3 @@ def test_missing_end_time_falls_back_to_start():
     payload, _ = otlp.build_export(events)
     tool = next(s for s in _spans(payload) if s["name"] == "Read")
     assert tool["endTimeUnixNano"] == tool["startTimeUnixNano"]
-
-
-def test_chunks_split_spans_but_keep_every_span():
-    payload, _ = otlp.build_export(_events())
-    chunks = list(otlp.chunk_export(payload, max_spans=1))
-    assert len(chunks) == 2
-    assert sum(len(_spans(c)) for c in chunks) == 2
