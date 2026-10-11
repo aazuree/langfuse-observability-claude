@@ -13,6 +13,8 @@ import tempfile
 
 import pytest
 
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
 _LOG_DIR = tempfile.mkdtemp(prefix="langfuse-hook-tests-")
 os.environ["LANGFUSE_HOOK_LOG"] = os.path.join(_LOG_DIR, "langfuse-hook.log")
 
