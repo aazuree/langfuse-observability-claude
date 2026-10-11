@@ -296,19 +296,32 @@ What changes in `events_only`:
 ### Moving an existing stack from `legacy`
 
 The trace shape changed with the move to OTLP (one trace per turn instead of one
-per session), so the old traces are deleted and every session re-sent. Delete
-**while the stack still runs `legacy`**, so the v3 tables are emptied too.
+per session), so sessions that still have a local transcript are deleted and
+re-sent. Older sessions (Claude Code keeps transcripts for 30 days) cannot be
+re-sent; `events_only` does not read the v3 tables, so they would vanish from
+the UI. A one-time historic backfill copies them into the events tables in
+their old shape (one trace per session), cost unchanged. Verified on 4.56.0:
+the four background migrations finished in about 3 minutes on a small stack.
 
 1. Back up PostgreSQL and ClickHouse volumes.
 2. If `.env` does not pin the write mode, start the stack pinned to legacy:
    `LANGFUSE_MIGRATION_V4_WRITE_MODE=legacy LANGFUSE_MIGRATION_V4_NATIVE_OTEL_BEHAVIOUR=dual_write LANGFUSE_MIGRATION_V4_ALLOW_PREVIEW_OPT_IN=false docker compose up -d`
 3. `python3 langfuse-hook.py --delete-traces` (same host/key env as `--reprocess`).
-   It deletes every turn trace, the old per-session trace and the session scores.
-4. Wait until the traces are gone from the UI. Langfuse deletes asynchronously;
-   in `legacy` / `dual` it took about 6 minutes per session batch in testing.
-5. Set the write mode to `events_only` (remove the pins or set the table's
-   values in `.env`) and `docker compose up -d`.
-6. `python3 langfuse-hook.py --reprocess`.
+   It deletes every turn trace, the old per-session trace and the session scores
+   of each local transcript, and resets their hook state. Run it from a plain
+   terminal: a Claude Code session's own Stop fires would re-send it early.
+4. Wait until those traces are gone from the UI. Langfuse deletes
+   asynchronously; in `legacy` it took about 6 minutes in testing. The backfill
+   must not run before the deletes finish, or it copies the deleted sessions.
+5. Backfill the older sessions: start the stack in `dual` with the backfill on,
+   `LANGFUSE_MIGRATION_V4_WRITE_MODE=dual LANGFUSE_MIGRATION_V4_NATIVE_OTEL_BEHAVIOUR=direct LANGFUSE_MIGRATION_V4_ALLOW_PREVIEW_OPT_IN=true LANGFUSE_BACKGROUND_MIGRATION_V4_ENABLE_HISTORIC_BACKFILL=true docker compose up -d`,
+   and wait for `docker compose logs langfuse-worker | grep "Finished background migration"`
+   to list `step_4_backfill_events_full_from_dataset_run_items`. It runs once.
+   Skip this step to drop history older than the transcripts instead.
+6. Switch to `events_only`: remove the pins (or set the table's values in `.env`)
+   and `docker compose up -d`.
+7. `python3 langfuse-hook.py --reprocess`. It sends only what hook state marks
+   unsent, so it is safe to run again.
 
 Infrastructure already satisfies the v4 floors — ClickHouse 25.12 minimum
 (26.4 recommended), PostgreSQL 15 minimum, Redis 7.0 minimum.

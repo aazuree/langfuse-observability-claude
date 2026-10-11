@@ -632,10 +632,10 @@ Session score `session_cost_usd` → metadata `subagent_costs` summary
   `trace-<session>` trace sent through the legacy ingestion API. Migrate a stack with
   `--delete-traces` **while the stack still runs `legacy`** (deletes every per-turn trace,
   the old `trace-<session>` one and the session scores for each local transcript, and
-  resets hook state), wait until the traces are gone, switch the stack to
-  `LANGFUSE_MIGRATION_V4_WRITE_MODE=events_only` (the compose default; see REMOTE-DEPLOY.md), then
-  `--reprocess`. Sessions older than Claude Code's 30-day transcript retention cannot be
-  re-sent. `--reprocess` keeps hook state and sends only turns it marks unsent, so it is
+  resets hook state), wait until the traces are gone, run the one-time `dual` + historic
+  backfill so sessions older than Claude Code's 30-day transcript retention stay visible
+  (they cannot be re-sent), switch the stack to `LANGFUSE_MIGRATION_V4_WRITE_MODE=events_only`
+  (the compose default), then `--reprocess`. Exact steps: REMOTE-DEPLOY.md, "Langfuse v4". `--reprocess` keeps hook state and sends only turns it marks unsent, so it is
   safe to repeat; a full re-send needs `--delete-traces` first, which resets that state.
   (It used to reset state itself, and v4 keeps every export, so a reprocess without a
   completed delete doubled cost.)
