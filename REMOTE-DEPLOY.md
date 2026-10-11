@@ -22,7 +22,7 @@ Nothing here changes the default local experience.
 ## What actually gets exposed
 
 Only **`langfuse-web` (port 3100)** is published beyond localhost. It serves both
-the dashboard UI *and* the `/api/public/ingestion` endpoint the hook POSTs to, so a
+the dashboard UI *and* the OTLP / scores endpoints the hook POSTs to, so a
 single interface change covers both. PostgreSQL, ClickHouse, Redis, MinIO and the
 worker stay bound to `127.0.0.1` on the Pi — no reason to put a database on the LAN.
 
@@ -62,7 +62,7 @@ PI_IP=192.168.1.50
 NEXTAUTH_URL=http://$PI_IP:3100 LANGFUSE_WEB_BIND=$PI_IP ./setup.sh
 ```
 
-`setup.sh` also tries to configure a Claude Code Stop hook in `~/.claude/settings.json`
+`setup.sh` also tries to configure the Claude Code hook in `~/.claude/settings.json`
 on whatever machine it runs on. On a headless Pi that has no Claude Code, that hook
 is harmless (it just writes a settings file that never fires) — ignore it. The hook
 that matters lives on your **dev machine** (Step 2).
@@ -84,7 +84,8 @@ grep '^LANGFUSE_INIT_PROJECT_SECRET_KEY=' .env   # sk-lf-...
 ## Step 2 — Point your dev machine's hook at the Pi
 
 On your **dev machine** (where Claude Code runs), edit `~/.claude/settings.json`.
-Add `LANGFUSE_HOST=http://<pi-ip>:3100` to the front of the hook commands, and use
+Register the hook on `Stop`, `StopFailure` and `SessionEnd` (the same command on
+all three), with `LANGFUSE_HOST=http://<pi-ip>:3100` at the front, and use
 the **pk/sk from the Pi's `.env`** (Step 1) — the keys must match the Pi's project:
 
 ```json
@@ -96,12 +97,8 @@ the **pk/sk from the Pi's `.env`** (Step 1) — the keys must match the Pi's pro
         "async": true
       } ] }
     ],
-    "StopFailure": [
-      { "hooks": [ { "type": "command",
-        "command": "LANGFUSE_HOST=http://192.168.1.50:3100 LANGFUSE_PUBLIC_KEY=pk-lf-... LANGFUSE_SECRET_KEY=sk-lf-... python3 /path/to/session-start-hook.py",
-        "async": true
-      } ] }
-    ]
+    "StopFailure": [ ...the same entry... ],
+    "SessionEnd": [ ...the same entry... ]
   }
 }
 ```
@@ -112,7 +109,7 @@ the containers moved to the Pi.
 ## Step 3 — Verify end-to-end
 
 ```bash
-# From the dev machine: the Pi's ingestion API is reachable
+# From the dev machine: the Pi's API is reachable
 curl -sf http://<pi-ip>:3100 >/dev/null && echo "reachable"
 
 # Run any Claude Code turn, then tail the hook log
@@ -263,36 +260,71 @@ it defaults back to `http://localhost:3100`.
 
 ---
 
-## Langfuse v4 (running since 2026-08-26)
+## Langfuse v4
 
-The stack runs **Langfuse v4** with `LANGFUSE_MIGRATION_V4_WRITE_MODE=legacy`.
+The stack runs **Langfuse v4** with `LANGFUSE_MIGRATION_V4_WRITE_MODE=events_only`:
+only the v4 events tables (`events_full` / `events_core`) are written and read.
+The hook exports over OpenTelemetry (`/api/public/otel/v1/traces`) and sends its
+session scores to `/api/public/scores`; the legacy batch endpoint
+(`/api/public/ingestion`) it used before is retired in `events_only`.
 
-v4 moves to an observations-first data model (`events_full` / `events_core`)
-that replaces the v3 `traces` / `observations` tables, but the migration is
-staged and reversible: in `legacy` mode v4 keeps writing the v3 tables and
-keeps the legacy batch ingestion endpoints serving. Historic traces stay
-browsable as virtual root spans, and the ClickHouse schema migrations apply
-automatically on first start.
+Each write mode needs its companion variables, because the worker validates the
+combination at boot:
 
-> ⚠️ **Do not set `events_only`.** That is the v4 cutover, and it replaces the
-> legacy batch ingestion endpoints with OpenTelemetry-based ingestion.
-> `langfuse-hook.py` POSTs to `/api/public/ingestion` over plain stdlib HTTP,
-> so the cutover breaks ingestion outright until the hook is ported to OTel.
-> `dual` is safe (it writes both), but adds roughly a 15-minute UI delay for
-> non-SDK producers like ours, which cannot propagate attributes client-side.
+| variable | `events_only` (default) | `legacy` |
+|---|---|---|
+| `LANGFUSE_MIGRATION_V4_WRITE_MODE` | `events_only` | `legacy` |
+| `LANGFUSE_MIGRATION_V4_NATIVE_OTEL_BEHAVIOUR` | `direct` (`dual_write` → worker refuses to boot) | `dual_write` (`direct` → worker refuses to boot) |
+| `LANGFUSE_MIGRATION_V4_ALLOW_PREVIEW_OPT_IN` | `true` (v4 read paths, v2 observations API) | `false` |
+| `LANGFUSE_BACKGROUND_MIGRATION_V4_ENABLE_HISTORIC_BACKFILL` | `false` | `false` |
 
-`legacy` is not a single switch. Three companion variables must be set with
-it, because their v4 defaults assume the new events tables are being written:
+The hook works in all three modes (verified 2026-10-11 on 4.48.0 and 4.56.0): it sends the
+`x-langfuse-ingestion-version: 4` header, so `legacy` writes its spans to the v3
+tables, `dual` to both, and `events_only` to the events tables only.
 
-| variable | v4 default | needs to be | why |
-|---|---|---|---|
-| `LANGFUSE_MIGRATION_V4_NATIVE_OTEL_BEHAVIOUR` | `direct` | `dual_write` | `direct` targets `events_full`, unread in legacy — **the worker refuses to boot** |
-| `LANGFUSE_MIGRATION_V4_ALLOW_PREVIEW_OPT_IN` | `true` | `false` | gates v4 read paths that would query unwritten tables |
-| `LANGFUSE_BACKGROUND_MIGRATION_V4_ENABLE_HISTORIC_BACKFILL` | `true` | `false` | the backfill runs exactly once; it must not run before dual-write is active |
+What changes in `events_only`:
+
+- The v1 read API is gone: `GET /api/public/traces`, `/sessions`, `/scores`
+  (and v2 scores) return 404. Use `GET /api/public/v2/observations` and
+  `GET /api/public/v3/scores`. `DELETE /api/public/traces` and
+  `DELETE /api/public/scores/{id}` still work.
+- A span exported twice is stored twice (no merge on id). The hook exports each
+  observation once; re-sending a session means deleting it first.
+- Score metadata merges key by key on upsert, so a key the hook stops writing
+  stays on the score until the score is deleted.
+
+### Moving an existing stack from `legacy`
+
+The trace shape changed with the move to OTLP (one trace per turn instead of one
+per session), so sessions that still have a local transcript are deleted and
+re-sent. Older sessions (Claude Code keeps transcripts for 30 days) cannot be
+re-sent; `events_only` does not read the v3 tables, so they would vanish from
+the UI. A one-time historic backfill copies them into the events tables in
+their old shape (one trace per session), cost unchanged. Verified on 4.56.0:
+the four background migrations finished in about 3 minutes on a small stack.
+
+1. Back up PostgreSQL and ClickHouse volumes.
+2. If `.env` does not pin the write mode, start the stack pinned to legacy:
+   `LANGFUSE_MIGRATION_V4_WRITE_MODE=legacy LANGFUSE_MIGRATION_V4_NATIVE_OTEL_BEHAVIOUR=dual_write LANGFUSE_MIGRATION_V4_ALLOW_PREVIEW_OPT_IN=false docker compose up -d`
+3. `python3 langfuse-hook.py --delete-traces` (same host/key env as `--reprocess`).
+   It deletes every turn trace, the old per-session trace and the session scores
+   of each local transcript, and resets their hook state. Run it from a plain
+   terminal: a Claude Code session's own Stop fires would re-send it early.
+4. Wait until those traces are gone from the UI. Langfuse deletes
+   asynchronously; in `legacy` it took about 6 minutes in testing. The backfill
+   must not run before the deletes finish, or it copies the deleted sessions.
+5. Backfill the older sessions: start the stack in `dual` with the backfill on,
+   `LANGFUSE_MIGRATION_V4_WRITE_MODE=dual LANGFUSE_MIGRATION_V4_NATIVE_OTEL_BEHAVIOUR=direct LANGFUSE_MIGRATION_V4_ALLOW_PREVIEW_OPT_IN=true LANGFUSE_BACKGROUND_MIGRATION_V4_ENABLE_HISTORIC_BACKFILL=true docker compose up -d`,
+   and wait for `docker compose logs langfuse-worker | grep "Finished background migration"`
+   to list `step_4_backfill_events_full_from_dataset_run_items`. It runs once.
+   Skip this step to drop history older than the transcripts instead.
+6. Switch to `events_only`: remove the pins (or set the table's values in `.env`)
+   and `docker compose up -d`.
+7. `python3 langfuse-hook.py --reprocess`. It sends only what hook state marks
+   unsent, so it is safe to run again.
 
 Infrastructure already satisfies the v4 floors — ClickHouse 25.12 minimum
-(26.4 recommended), PostgreSQL 15 minimum, Redis 7.0 minimum. Back up both
-PostgreSQL **and** ClickHouse before any further migration step.
+(26.4 recommended), PostgreSQL 15 minimum, Redis 7.0 minimum.
 
 ## Known limitations
 

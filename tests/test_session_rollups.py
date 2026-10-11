@@ -1,19 +1,20 @@
 # tests/test_session_rollups.py
-"""Trace-level values must describe the whole session, not the latest fire.
+"""Session rollups describe the whole session; each turn is sent once.
 
-Each Stop fire upserts the same trace. The hook used to compute every trace
-rollup (turn_count, token totals, cost_by_model, stop_reasons, scores, ...)
-from only the turns that were new in that fire, so each fire overwrote the
-session's numbers with one turn's worth. On the live stack, traces with 7-19
-turns showed turn_count=1 and a cost_by_model of $0.13 against a real $2.09.
-
-Metadata keys sent as null made it worse: Langfuse merges trace metadata key
-by key, and a null value erases what an earlier fire wrote.
+Every turn is its own trace, exported once when it is finished — Langfuse v4
+keeps every export of a span, so re-sending a turn would double it. The
+session-wide rollups (turn_count, token totals, cost_by_model, stop_reasons,
+...) are recomputed over the whole transcript on every fire and sent on the
+session-level `session_cost_usd` score, which upserts by id. Computing them
+from one fire's turns is the bug this guards against: traces with 7-19 turns
+once showed turn_count=1 and $0.13 of a real $2.09.
 """
 import builtins
 import importlib.util
 import json
 import os
+
+from helpers import session_rollups, turn_traces
 
 _spec = importlib.util.spec_from_file_location(
     "langfuse_hook", os.path.join(os.path.dirname(__file__), "..", "langfuse-hook.py"))
@@ -95,7 +96,7 @@ class TestTraceRollupsCoverTheSession:
         fires = _Fires(tmp_path, monkeypatch)
         fires.fire(_turn(1, minute=0))
         fires.fire(_turn(2, minute=1))
-        md = fires.trace(fires.fire(_turn(3, minute=2)))["metadata"]
+        md = session_rollups(fires.fire(_turn(3, minute=2)))
 
         assert md["turn_count"] == 3
         assert md["total_input_tokens"] == 300
@@ -111,59 +112,91 @@ class TestTraceRollupsCoverTheSession:
         batch = fires.fire(_turn(2, minute=1))
         assert fires.scores(batch)["tool_error_rate"] == 1.0
 
-    def test_trace_input_and_timestamp_stay_on_the_first_turn(self, tmp_path, monkeypatch):
-        fires = _Fires(tmp_path, monkeypatch)
-        fires.fire(_turn(1, minute=0))
-        trace = fires.trace(fires.fire(_turn(2, minute=1)))
-        assert trace["input"] == "question 1"
-        assert trace["timestamp"].startswith("2026-09-20T10:00:00")
-
-    def test_parent_cost_includes_fires_before_the_first_subagent(self, tmp_path, monkeypatch):
-        """sa_state['_parent'] only started accumulating once a subagent was
-        known, so earlier fires' parent cost was missing from harness totals."""
+    def test_session_cost_covers_every_turn_sent_so_far(self, tmp_path, monkeypatch):
         fires = _Fires(tmp_path, monkeypatch)
         fires.fire(_turn(1, minute=0))
         batch = fires.fire(_turn(2, minute=1))
-        # The second fire re-sends turn 1, so dedupe generations by ID.
-        gens = {gid: g for b in fires.batches for gid, g in fires.gens(b).items()}
-        whole = sum(g["costDetails"]["total"] for g in gens.values())
-        assert fires.trace(batch)["metadata"]["session_cost_usd"] == round(whole, 6)
+        gens = [g for b in fires.batches for g in fires.gens(b).values()]
+        whole = sum(g["costDetails"]["total"] for g in gens)
+        assert session_rollups(batch)["session_cost_usd"] == round(whole, 6)
+        assert fires.scores(batch)["session_cost_usd"] == round(whole, 6)
 
 
 class TestNullMetadataIsNotSent:
     def test_absent_rollups_are_omitted_not_null(self, tmp_path, monkeypatch):
-        """Langfuse merges metadata key by key and a null erases the earlier
-        value, so `api_errors: None` on a clean fire wiped a previous error."""
         fires = _Fires(tmp_path, monkeypatch)
-        trace = fires.trace(fires.fire(_turn(1, minute=0)))
-        assert "api_errors" not in trace["metadata"]
-        assert None not in trace["metadata"].values()
-        assert None not in trace.values()
+        md = session_rollups(fires.fire(_turn(1, minute=0)))
+        assert "api_errors" not in md
+        assert None not in md.values()
 
 
-class TestLateTurnDuration:
-    def test_duration_written_after_the_stop_hook_reaches_its_turn(self, tmp_path, monkeypatch):
-        """Claude Code writes system/turn_duration *after* the Stop hook runs
-        (101 of 103 observed turns). The next fire must re-send the previous
-        turn so the duration lands on it."""
+class TestEachTurnIsSentOnce:
+    def test_every_turn_is_its_own_trace_sent_exactly_once(self, tmp_path, monkeypatch):
         fires = _Fires(tmp_path, monkeypatch)
-        first = fires.fire(_turn(1, minute=0))
-        (gen1_id,) = fires.gens(first)
+        fires.fire(_turn(1, minute=0) + _turn(2, minute=1))
+        fires.fire(_turn(3, minute=2))
+        traces = [t for b in fires.batches for t in turn_traces(b)]
+        gens = [g for b in fires.batches for g in fires.gens(b)]
+        assert [t["name"] for t in traces] == ["question 1", "question 2", "question 3"]
+        assert len(set(t["id"] for t in traces)) == 3
+        assert len(gens) == len(set(gens)) == 3
+        assert {t["sessionId"] for t in traces} == {"sess"}
 
-        second = fires.fire([_turn_duration(0, 6, 5000)] + _turn(2, minute=1))
-        gens = fires.gens(second)
-        assert gens[gen1_id]["metadata"]["duration_ms"] == 5000
-        other = [g for gid, g in gens.items() if gid != gen1_id]
-        assert len(other) == 1
-        assert "duration_ms" not in other[0]["metadata"]
-
-    def test_only_the_last_sent_turn_is_resent(self, tmp_path, monkeypatch):
+    def test_an_unfinished_last_turn_waits_for_a_later_fire(self, tmp_path, monkeypatch):
+        """An async fire can read the transcript after a queued prompt opened
+        the next turn. That turn is mid-flight and must not be sent yet."""
         fires = _Fires(tmp_path, monkeypatch)
-        fires.fire(_turn(1, minute=0) + _turn(2, minute=1) + _turn(3, minute=2))
-        batch = fires.fire(_turn(4, minute=3))
-        names = sorted(g["name"] for g in fires.gens(batch).values())
-        assert names == ["Turn 3: question 3", "Turn 4: question 4"]
+        queued = [{"type": "user", "uuid": "u2", "timestamp": "2026-09-20T10:01:00+00:00",
+                   "message": {"role": "user", "content": "question 2"}}]
+        first = fires.fire(_turn(1, minute=0) + queued)
+        assert [t["name"] for t in turn_traces(first)] == ["question 1"]
 
+        reply = _turn(2, minute=1)[1:]  # the assistant reply to the queued prompt
+        second = fires.fire(reply)
+        assert [t["name"] for t in turn_traces(second)] == ["question 2"]
+
+    def test_a_turn_still_calling_tools_is_held(self, tmp_path, monkeypatch):
+        fires = _Fires(tmp_path, monkeypatch)
+        mid = _turn(1, minute=0, tool_error=True)  # ends on stop_reason tool_use
+        assert turn_traces(fires.fire(mid)) == []
+
+    def test_session_end_sends_an_unfinished_last_turn(self, tmp_path, monkeypatch):
+        fires = _Fires(tmp_path, monkeypatch)
+        fires.fire(_turn(1, minute=0, tool_error=True))
+        hook.process_session(fires.sid, str(fires.path), "/w/proj", final=True)
+        assert [t["name"] for t in turn_traces(fires.batches[-1])] == ["question 1"]
+
+    def test_a_turn_with_no_reply_is_not_sent_even_at_session_end(self, tmp_path, monkeypatch):
+        """`/exit` leaves a last turn with no reply. If SessionEnd sent it, a
+        resumed session's next prompt would merge into that already-sent
+        turn (user entries merge until a reply) and its cost would never be
+        exported. Found in 3 of 92 local sessions."""
+        fires = _Fires(tmp_path, monkeypatch)
+        fires.fire(_turn(1, minute=0))
+        exit_stub = [{"type": "user", "uuid": "x1", "timestamp": "2026-09-20T10:01:00+00:00",
+                      "message": {"role": "user",
+                                  "content": "<command-name>/exit</command-name>"}}]
+        with open(fires.path, "a") as f:
+            f.write(json.dumps(exit_stub[0]) + "\n")
+        hook.process_session(fires.sid, str(fires.path), "/w/proj", final=True)
+        assert turn_traces(fires.batches[-1]) == []
+
+        resumed = fires.fire(_turn(2, minute=5))
+        gens = list(fires.gens(resumed).values())
+        assert len(gens) == 1 and gens[0]["costDetails"]["total"] > 0
+        sent = [g for b in fires.batches for g in fires.gens(b)]
+        assert len(sent) == len(set(sent)) == 2
+
+    def test_turn_duration_is_kept_when_already_written(self, tmp_path, monkeypatch):
+        """Claude Code writes system/turn_duration after the Stop hook, so a
+        live fire usually misses it; a re-ingest picks it up."""
+        fires = _Fires(tmp_path, monkeypatch)
+        batch = fires.fire(_turn(1, minute=0) + [_turn_duration(0, 6, 5000)])
+        (gen,) = fires.gens(batch).values()
+        assert gen["metadata"]["duration_ms"] == 5000
+
+
+class TestTurnDurationParsing:
     def test_duration_attaches_by_file_order_not_a_30s_window(self):
         """A slow Stop hook (p99 19s, max 23s observed) pushes turn_duration
         past the old 30s proximity window."""

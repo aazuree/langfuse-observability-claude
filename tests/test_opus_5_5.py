@@ -1,5 +1,6 @@
 """Opus 5.5 pricing plus the per-model / per-effort / refusal rollups that
 make an Opus 5 -> Opus 5.5 switch legible in Langfuse."""
+from helpers import session_rollups
 import importlib.util
 import json
 from pathlib import Path
@@ -197,7 +198,7 @@ def test_process_session_emits_model_tags_and_rollups(tmp_path, monkeypatch):
 
     trace = next(e for e in captured["batch"] if e["type"] == "trace-create")
     tags = trace["body"]["tags"]
-    meta = trace["body"]["metadata"]
+    meta = session_rollups(captured["batch"])
     assert "model:claude-opus-5" in tags
     assert "model:claude-opus-5-5" in tags
     assert "refusal:reasoning_extraction" in tags

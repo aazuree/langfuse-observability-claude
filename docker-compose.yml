@@ -5,7 +5,7 @@
 # External connections from other machines will not be able to reach these services directly.
 services:
   langfuse-worker:
-    image: docker.io/langfuse/langfuse-worker:4.48.0
+    image: docker.io/langfuse/langfuse-worker:4.56.0
     restart: always
     depends_on: &langfuse-depends-on
       postgres:
@@ -19,16 +19,16 @@ services:
     ports:
       - 127.0.0.1:3130:3030
     environment: &langfuse-worker-env
-      # v4 keeps writing the v3 tables and keeps the legacy batch ingestion
-      # endpoints alive. The hook POSTs to /api/public/ingestion, which only
-      # goes away at the events_only cutover — do not change this to
-      # events_only without migrating the hook to OTel ingestion first.
-      LANGFUSE_MIGRATION_V4_WRITE_MODE: ${LANGFUSE_MIGRATION_V4_WRITE_MODE:-legacy}
-      # These three must accompany legacy mode. Their v4 defaults (direct /
-      # true / true) assume the new events tables are being written, which
-      # legacy does not do — `direct` makes the worker refuse to boot outright.
-      LANGFUSE_MIGRATION_V4_NATIVE_OTEL_BEHAVIOUR: ${LANGFUSE_MIGRATION_V4_NATIVE_OTEL_BEHAVIOUR:-dual_write}
-      LANGFUSE_MIGRATION_V4_ALLOW_PREVIEW_OPT_IN: ${LANGFUSE_MIGRATION_V4_ALLOW_PREVIEW_OPT_IN:-false}
+      # v4 data model: write only the events tables. The hook exports over
+      # OTLP, which needs no legacy tables. A stack upgraded from `legacy`
+      # must delete its traces first (REMOTE-DEPLOY.md, "Langfuse v4").
+      LANGFUSE_MIGRATION_V4_WRITE_MODE: ${LANGFUSE_MIGRATION_V4_WRITE_MODE:-events_only}
+      # These move with the write mode: events_only requires `direct` (the
+      # worker refuses to boot with dual_write), and the v4 read paths (UI,
+      # v2 observations API) need the preview opt-in. No backfill: there is
+      # no legacy data to copy once the traces are deleted and re-sent.
+      LANGFUSE_MIGRATION_V4_NATIVE_OTEL_BEHAVIOUR: ${LANGFUSE_MIGRATION_V4_NATIVE_OTEL_BEHAVIOUR:-direct}
+      LANGFUSE_MIGRATION_V4_ALLOW_PREVIEW_OPT_IN: ${LANGFUSE_MIGRATION_V4_ALLOW_PREVIEW_OPT_IN:-true}
       LANGFUSE_BACKGROUND_MIGRATION_V4_ENABLE_HISTORIC_BACKFILL: ${LANGFUSE_BACKGROUND_MIGRATION_V4_ENABLE_HISTORIC_BACKFILL:-false}
       NEXTAUTH_URL: ${NEXTAUTH_URL:-http://localhost:3100}
       DATABASE_URL: ${DATABASE_URL:-postgresql://postgres:postgres@postgres:5432/postgres} # CHANGEME
@@ -80,7 +80,7 @@ services:
       SMTP_CONNECTION_URL: ${SMTP_CONNECTION_URL:-}
 
   langfuse-web:
-    image: docker.io/langfuse/langfuse:4.48.0
+    image: docker.io/langfuse/langfuse:4.56.0
     restart: always
     depends_on: *langfuse-depends-on
     ports:
@@ -104,7 +104,7 @@ services:
       LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-}
 
   clickhouse:
-    image: docker.io/clickhouse/clickhouse-server:26.9.7.9
+    image: docker.io/clickhouse/clickhouse-server:26.9.16.11
     restart: always
     user: "101:101"
     environment:
@@ -146,7 +146,7 @@ services:
       start_period: 1s
 
   redis:
-    image: docker.io/redis:8.8.3
+    image: docker.io/redis:8.10.2
     restart: always
     # CHANGEME: row below to secure redis password
     command: >

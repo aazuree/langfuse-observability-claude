@@ -104,9 +104,7 @@ class TestCalculateToolDenialRate:
 
 class TestDenialRateScoreEmission:
     def _scores(self, turns):
-        events = hook.build_hook_score_events(
-            "trace-1", "sess-1", "hi", turns, 0.0,
-        )
+        events = hook.build_hook_score_events("sess-1", turns, 0.0)
         return {e["body"]["name"]: e["body"]["value"] for e in events}
 
     def test_emits_denial_rate_alongside_error_rate(self):

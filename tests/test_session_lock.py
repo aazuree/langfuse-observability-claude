@@ -24,7 +24,7 @@ def _transcript(tmp_path):
         {"type": "user", "timestamp": "2026-09-20T10:00:00+00:00",
          "message": {"role": "user", "content": "hi"}},
         {"type": "assistant", "timestamp": "2026-09-20T10:00:01+00:00",
-         "message": {"id": "m1", "role": "assistant", "model": "claude-sonnet-5",
+         "message": {"id": "m1", "role": "assistant", "stop_reason": "end_turn", "model": "claude-sonnet-5",
                      "content": [{"type": "text", "text": "hello"}],
                      "usage": {"input_tokens": 1, "output_tokens": 1,
                                "cache_read_input_tokens": 0,

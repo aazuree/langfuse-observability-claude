@@ -23,80 +23,76 @@ docker compose down -v
 # View hook logs
 tail -f ~/.claude/langfuse-hook.log
 
-# Re-ingest all sessions (LOCAL stack — reads keys from this checkout's .env)
+# Re-ingest all sessions (LOCAL stack — reads keys from this checkout's .env).
+# Delete first: Langfuse v4 keeps every export of a span, so re-sending a
+# session that is still there doubles its cost. Deletes are asynchronous —
+# wait until the traces are gone from the UI (typically <15 min) before --reprocess.
 PK=$(grep '^LANGFUSE_INIT_PROJECT_PUBLIC_KEY=' .env | cut -d= -f2)
 SK=$(grep '^LANGFUSE_INIT_PROJECT_SECRET_KEY=' .env | cut -d= -f2)
+LANGFUSE_PUBLIC_KEY=$PK LANGFUSE_SECRET_KEY=$SK python3 langfuse-hook.py --delete-traces
 LANGFUSE_PUBLIC_KEY=$PK LANGFUSE_SECRET_KEY=$SK python3 langfuse-hook.py --reprocess
 
 # Re-ingest all sessions (REMOTE stack, e.g. Pi — copy host+keys from the Stop hook
 # command in ~/.claude/settings.json; the local .env does NOT hold the remote keys)
-LANGFUSE_HOST=http://<remote-ip>:3100 \
-  LANGFUSE_PUBLIC_KEY=pk-lf-... LANGFUSE_SECRET_KEY=sk-lf-... \
-  python3 langfuse-hook.py --reprocess
+export LANGFUSE_HOST=http://<remote-ip>:3100 LANGFUSE_PUBLIC_KEY=pk-lf-... LANGFUSE_SECRET_KEY=sk-lf-...
+python3 langfuse-hook.py --delete-traces   # then wait for the deletes
+python3 langfuse-hook.py --reprocess
 ```
 
-> **Reprocessing against a remote stack:** `--reprocess` takes its target from
-> `LANGFUSE_HOST` (default `http://localhost:3100`) and its credentials from the
-> environment — it never reads `.env`. Omitting `LANGFUSE_HOST` on a remote deployment
-> sends everything to localhost and fails with `Connection refused` for every session
-> (state is not advanced, so nothing is lost — but nothing is updated either). The
-> remote instance also has its **own** project keys: the `.env` in this checkout belongs
-> to the local stack and will not authenticate against the remote one. Always source
-> both host and keys from the `Stop` hook command in `~/.claude/settings.json`.
-> Run it from the **main checkout**, not a worktree — `.env` is gitignored and absent
-> from worktrees.
+> **Reprocessing against a remote stack:** `--delete-traces` and `--reprocess` take
+> their target from `LANGFUSE_HOST` (default `http://localhost:3100`) and their
+> credentials from the environment — they never read `.env`. Omitting `LANGFUSE_HOST` on
+> a remote deployment sends everything to localhost and fails with `Connection refused`
+> for every session. The remote instance also has its **own** project keys: the `.env`
+> in this checkout belongs to the local stack and will not authenticate against the
+> remote one. Always source both host and keys from the `Stop` hook command in
+> `~/.claude/settings.json`. Run it from the **main checkout**, not a worktree — `.env`
+> is gitignored and absent from worktrees.
 
 - **Dashboard**: http://localhost:3100
 - **Hook log**: `~/.claude/langfuse-hook.log` (auto-rotates at 10 MB)
-- **State files**: `~/.claude/langfuse-state/<session_id>.offset` (parent), `<session_id>.subagents.json` (subagents), `<session_id>.lock` (per-session `flock`: fires of one session run one at a time, waiting up to `SESSION_LOCK_TIMEOUT_S = 120`; needed once the Stop hook runs `"async": true`)
+- **State files**: `~/.claude/langfuse-state/<session_id>.offset` (parent: line offset + number of turns sent), `<session_id>.subagents.json` (subagents), `<session_id>.lock` (per-session `flock`: fires of one session run one at a time, waiting up to `SESSION_LOCK_TIMEOUT_S = 180`; needed because the hook runs `"async": true`)
 
-### Reading the ingestion result
+### Reading the send result
 
-The ingestion endpoint answers **`207 Multi-Status`**: the HTTP status only says
-the request was accepted, and the body reports each event's fate:
+The hook sends over **OTLP** (`POST /api/public/otel/v1/traces`, header
+`x-langfuse-ingestion-version: 4`) — Langfuse v4 retires the legacy
+`/api/public/ingestion` batch API (Cloud sunset 2026-11-16; self-hosted `legacy` write
+mode is removed in an upcoming major). `langfuse_otlp.py` translates the hook's
+internal trace / generation / span dicts into OTLP spans with the `langfuse.*`
+attributes Langfuse maps natively; scores go separately to `POST /api/public/scores`.
 
-```json
-{"successes": [{"id": "...", "status": 201}], "errors": [{"id": "...", "status": 400, "message": "..."}]}
-```
+**Langfuse v4 keeps every export of a span** — it does not deduplicate a re-sent span
+ID. So each fire's spans go in **one gzipped request** (they land whole or not at all)
+and are sent exactly once. `send_to_langfuse` returns whether the caller may advance
+the session state:
 
-`classify_ingestion_errors()` (in `langfuse_common.py`, shared by both hooks)
-splits those per-event failures into two kinds, because they need opposite
-handling:
-
-| kind | statuses | `send_to_langfuse` returns | effect |
+| outcome | statuses | returns | effect |
 |---|---|---|---|
-| transient | 5xx, 429, 408, network, unparseable body | `False` | offset held back, retried next fire |
-| permanent | 400/401/403/404/422, unreadable error entry | `True` + `[ERROR]` log | events dropped, offset advances |
+| delivered | 2xx | `True` | state advances |
+| permanent | 400 / 413 / 422 | `True` + `[ERROR] Langfuse rejected …` | spans dropped loudly, state advances |
+| transient | 401 / 403 / 408 / 429 / 5xx / network | `False` | state held, whole batch retried next fire |
 
-A whole request refused with an HTTP error status (not a 207) follows the
-same split: **400 / 413 / 422** are permanent (the payload can never be
-accepted), while **401 / 403** are retried with 5xx/429, because bad keys get
-fixed by a human and dropping the events meanwhile would lose them.
-
-Advancing on a permanent rejection is deliberate. Retrying a validation error
-can never succeed, and holding the offset back would wedge the session: every
-later fire would resend an ever-growing window that can never drain. Losing
-those events loudly beats ingesting nothing forever. Grep the log for
-`[ERROR] Langfuse rejected` to find them.
-
-> This is also the failure shape of the Langfuse v4 `events_only` cutover, where
-> the endpoint keeps returning 207 while rejecting every event type except
-> `score-create`. See REMOTE-DEPLOY.md.
+Langfuse answers a **structurally** malformed export (missing span/trace IDs,
+attributes not a KeyValue list) with a whole-batch 400 and an explanation (read from
+its source, `processOtelIngestion.ts`). Anything else gets a 200 and is processed
+asynchronously — **semantic problems are never reported back**, so check a trace in the
+UI after changing the attribute mapping. Scores are sent only after the spans landed;
+they upsert by id and are recomputed every fire, so a failed score logs `[WARN]` and
+does not hold the spans back.
 
 ## Architecture
 
 ```
 Claude Code CLI
-    | (Stop hook fires after each response)
+    | Stop        — a turn finished
+    | StopFailure — a turn ended in an API error (Stop does not fire)
+    | SessionEnd  — last chance for an unfinished final turn
     v
-langfuse-hook.py --> POST --> Langfuse API (localhost:3100)
-                          (trace-create from transcript: turns, tokens, cost)
+langfuse-hook.py ── OTLP spans ──> /api/public/otel/v1/traces
+                 └─ session scores ─> /api/public/scores
                                   |
                     PostgreSQL, ClickHouse, Redis, MinIO
-
-    | (StopFailure hook fires when a turn ends in API error)
-    v
-session-start-hook.py --> POST --> Langfuse API (trace-create upsert: stop-failure tag)
 ```
 
 All services bound to `127.0.0.1` only. API key never leaves the machine.
@@ -104,7 +100,7 @@ All services bound to `127.0.0.1` only. API key never leaves the machine.
 ## Tech Stack
 
 - **Hook script**: Python 3.10+ (PEP 604 annotations are evaluated at import; CI runs on 3.10), stdlib only (zero external deps)
-- **Backend**: Langfuse v4 in legacy write mode (web + worker), PostgreSQL 18, ClickHouse 26, Redis 8, MinIO
+- **Backend**: Langfuse v4 (web + worker), PostgreSQL 18, ClickHouse 26, Redis 8, MinIO. The hook needs only the OTLP endpoint and the scores API, so the stack can run `LANGFUSE_MIGRATION_V4_WRITE_MODE=events_only`
 - **Deployment**: Docker Compose (6 services)
 - **Setup**: `./setup.sh` (generates secrets, starts containers, configures hook)
 
@@ -112,7 +108,8 @@ All services bound to `127.0.0.1` only. API key never leaves the machine.
 
 ```
 langfuse-hook.py                 # Core hook script - parses transcripts, sends to Langfuse
-session-start-hook.py            # StopFailure hook - tags traces with stop-failure + last API error
+langfuse_otlp.py                 # Hook events -> OTLP/JSON export (langfuse.* attributes), scores split out
+langfuse_common.py               # Redaction, logging, auth header, atomic writes
 docker-compose.yml               # Full Langfuse stack (6 services)
 setup.sh                         # One-command setup (generates .env, starts services, configures hook)
 .env.example                     # Template for environment variables
@@ -120,10 +117,13 @@ setup.sh                         # One-command setup (generates .env, starts ser
 tools/
   check_pricing_drift.py         # Compares hardcoded pricing against a public feed (manual/CI, never run by the hook)
   render_env.py                  # setup.sh: fills the .env template literally (no sed), escapes $ for compose
-  configure_hooks.py             # setup.sh: registers Stop + StopFailure hooks (async) in settings.json
+  configure_hooks.py             # setup.sh: registers langfuse-hook.py on Stop + StopFailure + SessionEnd (async)
 tests/
   test_langfuse_hook.py          # Core hook unit tests
-  conftest.py                    # Redirects LANGFUSE_HOOK_LOG so tests never touch the real log
+  conftest.py                    # Redirects LANGFUSE_HOOK_LOG so tests never touch the real log; repo root on sys.path
+  helpers.py                     # Readers for a sent batch: turn traces, session score / rollups
+  test_otlp.py                   # Event -> OTLP span translation (IDs, attributes, trace attrs on the root)
+  test_send.py                   # One gzipped OTLP request per fire; status handling; scores after spans
   test_pricing_drift.py          # Pricing drift-checker tests (offline, synthetic feeds)
   test_thinking_tokens.py        # output_tokens_details.thinking_tokens capture + rollup
   test_prompt_provenance.py      # origin.kind / promptSource / turnCompanion capture
@@ -131,15 +131,14 @@ tests/
   test_tool_denials.py           # toolDenialKind capture; denials kept out of tool_error_rate
   test_file_history_delta.py     # file-history-delta rollup (edits, distinct files, versions)
   test_log_isolation.py          # LOG_FILE env override + production-log isolation
-  test_session_hooks.py          # StopFailure hook tests
-  test_hook_scores.py            # Hook-level score classifier tests
+  test_hook_scores.py            # Session score classifier tests
   test_subagent_tracking.py      # Subagent cost tracking tests
   test_subagent_resume.py        # Background subagents resumed after their parent turn was sent
-  test_session_rollups.py        # Trace rollups cover the whole session; no null metadata; late turn_duration
+  test_session_rollups.py        # Session rollups cover the whole session; each turn sent once; unfinished turns held
   test_turn_merging.py           # Consecutive user entries before a reply form one turn
   test_session_lock.py           # Per-session lock for overlapping (async) fires
-  test_robustness.py             # Atomic state writes, logged crashes, HTTP-level rejections
-  test_delete_traces.py          # --delete-traces migration helper
+  test_robustness.py             # Atomic state writes, logged crashes
+  test_delete_traces.py          # --delete-traces (every per-turn trace, the old session trace, session scores)
   test_setup_tools.py            # tools/render_env.py and tools/configure_hooks.py
 ```
 
@@ -150,23 +149,23 @@ Use `uv` to run tests (handles virtualenv and dependency resolution automaticall
 ```bash
 uv run pytest tests/ -v              # Run all tests
 uv run pytest tests/test_subagent_tracking.py -v  # Run specific test file
-uv run pytest tests/ -k "discover" -v  # Run tests matching pattern
+uv run pytest tests/ -k "subagent" -v  # Run tests matching pattern
 ```
 
 ## Code Conventions
 
-- **No external Python dependencies** - stdlib only (urllib, json, base64, uuid, pathlib)
+- **No external Python dependencies** - stdlib only (urllib, json, gzip, base64, uuid, pathlib)
 - Constants at top of `langfuse-hook.py`: `MAX_TEXT=10000`, `MAX_TOOL_IO=5000`. Log rotation threshold: `MAX_LOG_BYTES=10MB` in `langfuse_common.py`
-- `LOG_FILE` honours the `LANGFUSE_HOOK_LOG` env var (both hooks), defaulting to `~/.claude/langfuse-hook.log`. `tests/conftest.py` sets it to a temp dir — **without that, a `pytest` run appends fixture sessions to the production log and its tail can no longer be trusted for live diagnosis.** Because `LOG_FILE` is evaluated at import time, the override must be set before the hook module is imported.
+- `LOG_FILE` honours the `LANGFUSE_HOOK_LOG` env var, defaulting to `~/.claude/langfuse-hook.log`. `tests/conftest.py` sets it to a temp dir — **without that, a `pytest` run appends fixture sessions to the production log and its tail can no longer be trusted for live diagnosis.** Because `LOG_FILE` is evaluated at import time, the override must be set before the hook module is imported.
 - Secret redaction via `SECRET_PATTERNS` regex list before any data leaves the machine
 - Session IDs sanitized via `sanitize_id()` to prevent path traversal
 - State files are written with `atomic_write_text()` (temp file + `os.replace`), so a crash mid-write cannot truncate an offset back to 0
-- Both hooks wrap their entry point: an unexpected exception is logged as `[ERROR] … crashed` with its traceback instead of vanishing to stderr. `--reprocess` logs and skips a failing session rather than aborting the run
-- Incremental processing: state files track the processed line offset and turn count per session. A fire with no new lines sends nothing
-- **Every trace rollup covers the whole session.** Each fire reads the transcript once, builds every turn, and computes all trace metadata, tags and scores from all of them — each fire upserts the same trace, so a rollup built from only the new lines would overwrite the session's numbers with one fire's worth. Generations are sent only from the last turn a previous fire sent onward: that turn is re-sent (same ID) because Claude Code writes its `system/turn_duration` *after* the Stop hook runs
-- Trace metadata never carries `null`: Langfuse merges metadata key by key and a null erases the value an earlier fire wrote, so absent rollups are omitted
-- Deterministic event IDs (UUID5) prevent duplicates on re-ingestion
-- Batch sends in chunks of 50 events to Langfuse ingestion API
+- The hook wraps its entry point: an unexpected exception is logged as `[ERROR] … crashed` with its traceback instead of vanishing to stderr. `--reprocess` logs and skips a failing session rather than aborting the run
+- Incremental processing: state files track the processed line offset and the number of turns sent per session. A fire with no new lines sends nothing (unless it is a `SessionEnd`)
+- **One trace per turn, sent once.** Each finished turn is its own trace (`id = uuid5(session:turn:<index>).hex`), grouped by `session.id`. Every turn but the last is finished; the last is finished when its reply ended for a terminal reason (`TERMINAL_STOP_REASONS`: `end_turn`, `stop_sequence`, `max_tokens`, `refusal`) — on a Stop fire the turn that just ended has one. Otherwise it is held for a later fire: an async fire can read the transcript after a queued prompt has already opened the next turn. `SessionEnd` and `--reprocess` of a transcript idle > `REPROCESS_IDLE_S` (1 h) send it anyway (`complete_turn_count`)
+- **Every session rollup covers the whole session.** Each fire reads the transcript once, builds every turn and recomputes all session rollups from all of them; they ride on the session-level `session_cost_usd` score, which upserts by id. A rollup built from only the new lines would overwrite the session's numbers with one fire's worth
+- `system/turn_duration` is written *after* the Stop hook runs, so a live fire usually misses it; it is captured when already present (re-ingest) and rolled up in `active_duration`
+- Deterministic IDs (UUID5 → hex trace/span IDs in `langfuse_otlp`) make a re-ingest after `--delete-traces` reproduce the same traces
 
 ## Key Data Flow
 
@@ -178,8 +177,8 @@ uv run pytest tests/ -k "discover" -v  # Run tests matching pattern
    TTFT is measured from the input the reply answers
 3. Deduplicate streaming updates (one usage per `message.id` — every streamed entry carries the same usage since v2.1.97, so the first is taken)
 4. Compute usage (tokens), latency, TTFT, cost
-5. Build Langfuse events (trace -> generation -> span hierarchy)
-6. POST batch to `/api/public/ingestion`, save state offset
+5. Build events for the finished, not-yet-sent turns (turn trace -> generation -> tool spans -> subagent generations), plus the session scores
+6. Translate to OTLP (`langfuse_otlp.build_export`), POST one gzipped export, then the scores; save state
 
 ## Cost Model
 
@@ -229,7 +228,7 @@ looked up in `_SONNET_RATES` / `_HAIKU_RATES` / `_TOP_TIER_RATES`. `claude-sonne
 
 Cache write cost is split by tier when `cache_5m` / `cache_1h` are available in `usageDetails`; otherwise all cache_create is billed at the 5m rate.
 
-**Extended-thinking tokens are NOT a separate billing category.** `usage.output_tokens_details.thinking_tokens` is a breakdown *inside* `output_tokens`, billed at the plain output rate. It is reported as the `output_thinking` line in `usageDetails` and rolled up in trace metadata `thinking` (`{total_thinking_tokens, total_output_tokens, share_of_output, turns_with_thinking, max_thinking_tokens}`) purely for analytics — never added to a cost total, and `calculate_turn_cost` does not take it as an input. It answers "what is the effort level actually buying", which the `effort_level` tag alone cannot. Note the token *count* is present even though CC has stripped thinking *text* from transcripts since v2.1.112.
+**Extended-thinking tokens are NOT a separate billing category.** `usage.output_tokens_details.thinking_tokens` is a breakdown *inside* `output_tokens`, billed at the plain output rate. It is reported as the `output_thinking` line in `usageDetails` and rolled up in the session rollup `thinking` (`{total_thinking_tokens, total_output_tokens, share_of_output, turns_with_thinking, max_thinking_tokens}`) purely for analytics — never added to a cost total, and `calculate_turn_cost` does not take it as an input. It answers "what is the effort level actually buying", which the `effort_level` tag alone cannot. Note the token *count* is present even though CC has stripped thinking *text* from transcripts since v2.1.112.
 
 ### Pricing Multipliers
 
@@ -246,8 +245,6 @@ These stack multiplicatively on the base rates above (and apply uniformly across
 - **Web search**: $0.01 per request (`$10 / 1,000 searches`). Billed via `costDetails.web_search` line item using `web_search_requests` from `usage.server_tool_use`. Added to turn total.
 - **Web fetch**: free (token cost only).
 - **Code execution**: $0.05/container-hour after 1,550 free hours/org/month. Not currently emitted by Claude Code; not billed.
-
-Set `REPORT_API_EQUIVALENT_COST = False` in `langfuse-hook.py` to report $0.
 
 **Keeping prices up to date:** Pricing is hardcoded in `calculate_turn_cost()` (`langfuse-hook.py`). When Anthropic releases new models or changes prices, update that function and the table above. Unknown models return $0 and emit a `[WARN]` in `langfuse-hook.log` — that's the signal to update. We send explicit costs rather than relying on Langfuse's built-in model table because Langfuse's table lags new model releases by days/weeks.
 
@@ -359,8 +356,9 @@ checked against aws.amazon.com/bedrock/pricing.
 > New in v2.1.220: **`effort` is now a per-assistant-entry transcript field** (previously
 > reachable only via the `$CLAUDE_EFFORT` env var, session-level and live-fires-only).
 > Captured per-generation as `effort` metadata and rolled up to the session
-> `effort_level` / `effort:<level>` tag. Transcript wins over the env var — it is per-turn
-> and survives `--reprocess`; the env fallback still covers pre-2.1.220 transcripts.
+> `effort_level` / `effort:<level>` tag. It survives `--reprocess`. The `$CLAUDE_EFFORT`
+> env fallback was removed 2026-10-11: every transcript still on disk (Claude Code keeps
+> 30 days) carries the field.
 > Within a turn the **last** non-empty value wins, so a mid-turn `/effort` change is
 > attributed to the level the turn finished under.
 >
@@ -389,15 +387,32 @@ checked against aws.amazon.com/bedrock/pricing.
 > bookkeeping (current input mode, last-prompt UUID pointer) and deliberately not captured.
 >
 > New in v2.1.19x: `system/turn_duration` (per-turn wall-clock `durationMs` +
-> `messageCount`) — captured as per-turn `duration_ms` (already drove generation
-> `endTime`) and rolled up to `active_duration`; `queue-operation` (prompt-queue
+> `messageCount`) — captured as per-turn `duration_ms` when already written at send time
+> and rolled up to `active_duration`; `queue-operation` (prompt-queue
 > enqueue/dequeue/popAll/remove with prompt `content`) — captured as `queue_operations`
 > wait-time analytics (content NOT stored, PII). The `agent-setting` entry
 > (`{agentSetting: "claude"}` = the FleetView selected agent persona) is observed but
 > **not captured** — always `"claude"` on first-party installs, so no signal yet; revisit
 > if non-default agents appear (would become an `agent-setting:<slug>` tag).
 
-Each trace is enriched with:
+Each turn is its own trace, grouped by `session.id` (Langfuse **Sessions** view sums
+cost and tokens across them). A turn trace carries:
+
+- **name** — the turn's prompt (80 chars, redacted); fallback `Turn <n>`. A turn with no typed
+  prose is named by what started it (`_stub_label`): `/<command> <args>` for a slash command,
+  `Task notification: <summary>` for a background task finishing, `Skill: <name>` for a skill
+  body. Without this, 147 of 483 local turns were named by raw `<task-notification>` /
+  `<local-command-caveat>` markup or the first line of a skill body
+- **metadata** — session state as of the fire that sent it: `session_title` (see
+  precedence below), `cwd`, `repo_name`, `git_branch`, `cli_version`, `entrypoint`,
+  `custom_title`, `ai_title`, `agent_name`, `session_kind`, `permission_mode`,
+  `effort_level`, `worktree`, `remote_control`, plus `turn_index`
+- **tags** — the session's tags as of that fire (below). An early turn therefore lacks tags
+  that only appear later (e.g. `pr:<N>`); the session score's `tags` rollup has them all.
+
+Session-wide rollups are not on the traces: they ride on the session-level
+**`session_cost_usd` score** (see Hook-Level Scores), whose `metadata` holds every
+"Session Rollups" key below and which every fire overwrites.
 
 **Tags** (filterable in Langfuse UI):
 - `claude-code` — always present
@@ -418,23 +433,24 @@ Each trace is enriched with:
 - `pr:<N>` — one tag per PR linked from the session (via `pr-link` transcript entries)
 - `agent-name:{slug}` — present when `type: "agent-name"` entry exists (e.g., `agent-name:langfuse-usagedetails-fix`)
 - `session-kind:{bg|fg}` — background job vs interactive foreground session (from `sessionKind` field on transcript entries; defaults to `fg` when absent on older transcripts)
-- `effort:<level>` — effort level for the session (`low`/`medium`/`high`/`xhigh`/`max`). Sourced from the per-turn transcript `effort` field (CC 2.1.220+, last turn that carried one) and therefore present on reprocessed sessions too; falls back to `$CLAUDE_EFFORT` at Stop-fire time on older transcripts (live fires only)
+- `effort:<level>` — effort level for the session (`low`/`medium`/`high`/`xhigh`/`max`). Sourced from the per-turn transcript `effort` field (CC 2.1.220+, last turn that carried one), so it is present on reprocessed sessions too
 - `skill:<slug>` — one per distinct `attributionSkill` observed in the session (e.g., `skill:superpowers:brainstorming`)
 - `plugin:<name>` — one per distinct `attributionPlugin` observed (e.g., `plugin:superpowers`)
-- `compacted` — present when the session was context-compacted (mirrors `compaction_occurred`)
+- `compacted` — present when the session was context-compacted (a `compaction` rollup exists)
 - `compact-trigger:<trigger>` — one per distinct compaction trigger (`manual`/`auto`; `unknown` omitted)
 - `remote-control` — present when the session was bridged to claude.ai (Remote Control / `/remote-control`)
 - `permission-bypass` — present when `bypassPermissions` was active at any point in the session
 - `worktree:<name>` — present when the session ran inside a Claude Code worktree (from the last `worktree-state` entry)
 - `has-background-tasks` — present when the Stop payload carried running background tasks
+- `has-subagents`, `subagents:<count>` — present when the session dispatched subagents
 - `nested-subagents` — present when any ingested subagent was spawned by another subagent (depth ≥ 2; CC 2.1.172+)
 - `stop-reason:<reason>` — one per distinct **anomalous** terminal `stop_reason` in the session (`max_tokens`, `stop_sequence`, `refusal`, `pause_turn`, or any unknown reason). The high-frequency normal reasons `end_turn` (turn done) and `tool_use` (paused to call a tool) are **not** tagged — they'd flood every trace with no signal (`NORMAL_STOP_REASONS`). Full per-reason counts live in the `stop_reasons` metadata regardless. Filter on `stop-reason:max_tokens` to find turns whose output was truncated at the token cap.
 
-**Trace Name precedence:**
+**`session_title` precedence:**
 1. `customTitle` from `type: "custom-title"` (user-set via in-CLI title command)
 2. `aiTitle` from `type: "ai-title"` (Claude-generated short title once enough session context exists)
 3. `agentName` from `type: "agent-name"` (auto-generated mid-session slug, e.g. `langfuse-usagedetails-fix`)
-4. Truncated first non-synthetic user prompt (80 chars) — the turn's `display_prompt`: the first typed (non-`isMeta`) text that is not a `<tag>` stub or an interrupt marker
+4. Truncated first non-synthetic user prompt (80 chars) — the turn's `display_prompt`: the first typed (non-`isMeta`) text that is not a `<tag>` stub or an interrupt marker, else the stub label (`/command args`, `Skill: <name>`)
 5. `{repo_name}/{git_branch}` composite — stable fallback when prompt is empty
 6. `"Claude Code Session"` hardcoded fallback
 
@@ -444,14 +460,14 @@ own entry type, but as a `slug` field on `assistant`/`user` entries. It is delib
 **not** used for trace naming: it is a random handle (`sharded-shimmying-hummingbird`),
 whereas `agentName` is descriptive of the actual task (`context window optimization`).
 The `agent-name` entry (~30% into a session)
-provides a stable, descriptive slug once the model identifies the task. Early hook fires
-use the first prompt; once `agent-name` appears, subsequent fires update the trace name
-via Langfuse's upsert-on-id behaviour.
+provides a stable, descriptive slug once the model identifies the task. Turns sent early
+carry the first prompt as `session_title`; turns sent after `agent-name` appears carry the
+slug.
 
-**Trace Metadata** (structured key-value on trace):
-All rollups below are computed over the **whole session** on every fire. Keys
-whose value would be null are omitted rather than sent as null (a null would
-erase an earlier fire's value in Langfuse's key-by-key metadata merge).
+**Session Rollups** (`metadata` of the `session_cost_usd` score):
+All rollups below are computed over the **whole session** on every fire, and the score
+upserts, so it always shows the latest. Keys whose value would be null are omitted. It
+also repeats the session state listed above and the full `tags` list.
 - `git_branch`, `cli_version`, `entrypoint`, `repo_name`, `cwd`
 - `turn_count`, `tool_calls_total`, `total_tokens`, `total_input_tokens`, `total_output_tokens`
 - `session_cost_usd` — cost of every parent (non-subagent) turn in the session; equals `subagent_costs.parent_cost` when subagents exist
@@ -475,15 +491,15 @@ erase an earlier fire's value in Langfuse's key-by-key metadata merge).
 - `file_snapshots` — `{snapshot_count, tracked_files_count}` from `file-history-snapshot` entries (null when no snapshots)
 - `stop_hook` — `{total_hook_fires, total_duration_ms, max_duration_ms, hook_errors, prevented_continuation_count}` from `system/stop_hook_summary` entries (null when none)
 - `skill_attribution` — per-session rollup from `attributionSkill`/`attributionPlugin` on assistant entries: `{skills_used, plugins_used, top_skill, skill_turn_counts, skill_cost_breakdown}`. `skill_cost_breakdown[<skill>]` = `{turns, input_tokens, output_tokens, cache_read_tokens, cache_create_tokens, cost_usd}`. Turns lacking attribution go to a `_unattributed` bucket inside the breakdown and are excluded from `skills_used`/`top_skill`. Null when no attribution data in session.
-- `compaction_occurred` — `true`/`false`; whether the session was context-compacted (from `type: "summary"` or a `system`/`compact*` subtype entry). Demoted from a score to metadata.
 - `total_iterations` — sum of per-turn `iteration_count` across the session (server-side agentic-loop iterations from `usage.iterations`).
 - `cache_miss` — session rollup of cache misses from `message.diagnostics.cache_miss_reason`: `{total_missed_tokens, by_reason: {<type>: count}, turns_with_miss}`. Explains *why* `cache_hit_rate` is low and how many input tokens were re-sent (e.g. `tools_changed`). Null when no turn missed cache.
-- `effort_level` — session effort level (`low`/`medium`/`high`/`xhigh`/`max`), last-observed. Primary source is the per-turn transcript `effort` field (CC 2.1.220+), so this survives `--reprocess`; on older transcripts it falls back to `$CLAUDE_EFFORT` read at Stop-fire time (live fires only, null on reprocess). See per-generation `effort` for the per-turn value.
-- `compaction` — rollup of `system/compact_boundary` events: `{count, triggers: {<trigger>: n}, total_tokens_reclaimed (Σ preTokens−postTokens), total_pre_tokens, total_post_tokens, total_duration_ms, events: [{trigger, pre_tokens, post_tokens, tokens_reclaimed, duration_ms, timestamp}]}`. Surfaces context-window pressure and the token/time cost of compaction. Legacy `type:"summary"` entries (pre-`compactMetadata`) count with `trigger:"legacy"` and no token fields. Unknown triggers pass through verbatim. Null when never compacted. The bare `compaction_occurred` bool (via `detect_compaction`) is retained alongside for back-compat. From `extract_compaction()`.
+- `effort_level` — session effort level (`low`/`medium`/`high`/`xhigh`/`max`), last-observed. From the per-turn transcript `effort` field (CC 2.1.220+), so it survives `--reprocess`. See per-generation `effort` for the per-turn value.
+- `compaction` — rollup of `system/compact_boundary` events: `{count, triggers: {<trigger>: n}, total_tokens_reclaimed (Σ preTokens−postTokens), total_pre_tokens, total_post_tokens, total_duration_ms, events: [{trigger, pre_tokens, post_tokens, tokens_reclaimed, duration_ms, timestamp}]}`. Surfaces context-window pressure and the token/time cost of compaction. Legacy `type:"summary"` entries (pre-`compactMetadata`) count with `trigger:"legacy"` and no token fields. Unknown triggers pass through verbatim. Omitted when never compacted. From `extract_compaction()`.
 - `remote_control` — `{bridge_session_id, url}` from `bridge-session` + `system/bridge_status` entries (the Remote Control / phone-web bridge). Either field may be absent independently; `url` correlates with the claude.ai session. **No timestamps** on these entries. Null when the session was never bridged. From `extract_bridge()`.
 - `permission_timeline` — `{modes_used (sorted distinct), sequence (file-order, consecutive dups collapsed), transition_count, ever_bypass, ever_accept_edits}` from `permission-mode` entries. Complements the last-observed `permission_mode`/`permission:<mode>` tag with the full transition history. **No timestamps** on these entries → sequence is order-only, not timed. Null when no `permission-mode` entries. From `extract_permission_timeline()`.
 - `worktree` — `{name, branch, original_cwd, original_branch, original_head_commit}` from the last `type: "worktree-state"` entry. Null when the session never entered a worktree. From `extract_worktree_state()`.
-- `background_tasks` / `session_crons` — raw lists from the Stop hook stdin payload (v2.1.145+). Live fires only; null on reprocess.
+- `background_tasks` / `session_crons` — raw lists from the Stop hook stdin payload (v2.1.145+). Live fires only; omitted on reprocess.
+- `subagent_costs` — see Subagent Cost Tracking.
 
 Extracted from the first `type: "user"` entry in the JSONL transcript via `extract_session_metadata()`.
 API errors extracted from `type: "system"` / `subtype: "api_error"` entries via `extract_api_errors()`.
@@ -504,15 +520,15 @@ and away summaries are extracted via `extract_custom_title()`, `extract_ai_title
 - `refusal_category` — present only when the turn's terminal `stop_reason` is `refusal`: the `stop_details.category` (or `uncategorized`).
 - `iteration_count` — number of server-side iterations in the turn (length of `usage.iterations`; 0 when absent).
 - `ttft_ms` — time-to-first-token in ms (first assistant-token timestamp − turn start). Omitted when not derivable.
-- `duration_ms` — turn wall-clock in ms from the `system/turn_duration` entry that follows the turn in the transcript (turn start→end, incl. tool execution). Also drives the generation `endTime`. CC writes that entry after the Stop hook runs, so it arrives on the *next* fire, which re-sends the turn. Omitted when no `turn_duration` followed the turn (CC before ~2.1.19x). Rolled up session-wide as `active_duration`.
+- `duration_ms` — turn wall-clock in ms from the `system/turn_duration` entry that follows the turn in the transcript (turn start→end, incl. tool execution). CC writes that entry *after* the Stop hook runs, and a turn is sent once, so a live fire usually omits it; a re-ingest has it. Rolled up session-wide as `active_duration`.
+- `cost_usd` — the turn's cost (same as `costDetails.total`), for filtering.
 - `cache_miss_reason` — dominant cache-miss reason type for the turn (e.g. `tools_changed`), from `message.diagnostics`. Omitted when the turn had no cache miss.
 - `cache_missed_tokens` — total input tokens that missed cache in the turn. Omitted when no miss.
 - `cache_miss_by_reason` — `{<type>: count}` tally of miss reasons in the turn. Omitted when no miss.
 
-**OpenTelemetry GenAI semantic-convention aliases** (also on each generation):
-The hook emits standard `gen_ai.*` attributes so an OTLP collector or future
-Langfuse Claude Code mapping can consume traces without a custom transform.
-Zero behaviour change for the existing dashboard.
+**OpenTelemetry GenAI semantic-convention attributes** (raw span attributes on each generation):
+Standard `gen_ai.*` attributes next to the `langfuse.*` ones, so any OTLP backend
+(e.g. Laminar, an OTel collector) can read the spans without a custom transform.
 - `gen_ai.system = "anthropic"`, `gen_ai.provider.name = "anthropic"`
 - `gen_ai.operation.name = "chat"`
 - `gen_ai.conversation.id` — session ID
@@ -537,11 +553,13 @@ Visible model reasoning is gated by the API `thinking.display` parameter (defaul
 
 ## Langfuse API Gotchas
 
-- **Use `usageDetails` + `costDetails`, not `usage` + `totalCost`**. Top-level `totalCost` on `generation-create` is silently ignored by Langfuse v3. Cost must go in `costDetails`; token counts in `usageDetails`.
-- **Explicit costs override auto-calculation**. When both `costDetails` and a matching built-in model exist, Langfuse uses the explicit values.
-- **Built-in model pricing lags new models**. Langfuse v3.73.1 has no pricing for `claude-opus-4-6` or `claude-sonnet-4-6` — only older model IDs like `claude-opus-4-20250514`. This is why we send explicit costs.
-- **Cache tokens are invisible in `usage`**. Only `usageDetails` (flexible map) surfaces `cache_read` and `cache_create` as separate line items in the UI, with tier breakdowns in `cache_5m` and `cache_1h`.
-- **ClickHouse ingestion is async**. Observations may take 5-10s to appear after the ingestion API returns 201.
+- **Export each span once.** Langfuse v4 does not deduplicate a re-exported span ID on the read path; a re-send creates a second observation and doubles its cost. That is why turns are sent only when finished, why each fire is one request, and why a re-ingest must follow `--delete-traces`.
+- **Usage and cost are JSON strings.** `langfuse.observation.usage_details` / `langfuse.observation.cost_details` (a JSON object as a string). Our explicit cost overrides Langfuse's own model-price inference, whose built-in table lags new models by days or weeks — which is why we send explicit costs.
+- **Cache tokens only show via usage details.** `cache_read` / `cache_create` (with `cache_5m` / `cache_1h` tier breakdowns) appear as separate line items only because they are keys of `usage_details`.
+- **Metadata values are strings.** Each key is its own attribute (`langfuse.trace.metadata.<k>`, `langfuse.observation.metadata.<k>`) so it is filterable; non-string values are JSON-encoded. Any other attribute lands under `metadata.attributes`.
+- **Trace-level attributes go on the root span** (the turn's generation): `langfuse.trace.name`, `langfuse.trace.tags`, `langfuse.trace.metadata.*`. `session.id` / `user.id` go on every span so filters work on child observations too.
+- **Scores are not spans.** They go to `POST /api/public/scores` and upsert by id. The value is replaced, but **metadata merges key by key** (verified 4.48.0, 4.56.0): a key a later fire no longer writes keeps its old value. Scores belong to no trace, so a trace delete leaves them; `--delete-traces` deletes them by id (`session_score_id`).
+- **Ingestion is async.** A 200 means "queued"; observations appear a few seconds later, and malformed-but-parseable attributes are dropped silently.
 
 ## Token Anatomy
 
@@ -558,29 +576,29 @@ The `input + output` count in the Langfuse UI can be misleadingly small. Always 
 
 ## Subagent Cost Tracking
 
-When Claude Code spawns subagents via the Agent tool, the hook automatically discovers and ingests their transcripts as nested observations under the parent trace.
+When Claude Code spawns subagents via the Agent tool, the hook ingests their transcripts as nested observations under the Agent tool span, in the trace of the turn that launched them.
 
 **How it works:**
 1. Hook detects `Agent` tool_use events in parent assistant messages
 2. Discovers matching subagent transcripts at `<session>/subagents/agent-{id}.jsonl`
-3. Correlates via three passes: `.meta.json` `toolUseId` match (exact) → tool_result
-   `agentId` regex (exact) → timestamp proximity (within
-   `SUBAGENT_MATCH_WINDOW_S = 60` seconds). Per-generation
-   `subagent_correlation` records which pass matched (`meta` / `deterministic` /
-   `timestamp`).
-4. Ingests subagent turns as generations nested under the Agent tool span
-5. Rolls up per-subagent and total harness cost in trace metadata
+3. Correlates via the `.meta.json` sidecar next to each transcript, whose `toolUseId` is the
+   spawning `Agent` tool_use id (`build_subagent_meta_index`). Every subagent on disk has one
+   (147/147, 2026-10-11). The old agentId-regex and timestamp-proximity fallbacks were
+   removed — the timestamp pass also skipped any subagent whose first line has no
+   timestamp, which is how Claude Code now starts forked agents (`fork-context-ref`), so
+   those were silently dropped before.
+4. Ingests each subagent's **finished** turns as generations nested under the Agent tool span
+5. Rolls up per-subagent and total harness cost in the session rollup `subagent_costs`
 
 **Background agents and resume:** an async Agent call returns "Async agent launched" at
 once, so the parent turn ends while the subagent is still working. Each `sa_state` entry
-records the agent's transcript `path`, its `size` at last read, and the `parent_span_id` of
-its Agent tool span. Every fire re-ingests any known agent whose file has grown, even when
-its Agent call sits in a turn that is no longer re-sent. `ingest_subagent` always reads the
+records the agent's transcript `path`, its `size` at last read, the `parent_span_id` of
+its Agent tool span and the `trace_id` of the turn that launched it. Every fire re-reads any
+known agent whose file has grown and sends its newly **finished** turns into that trace (an
+unfinished last turn waits, same rule as the parent). `ingest_subagent` always reads the
 whole subagent transcript (a resumed agent is usually mid-turn, and a tail with no user
-prompt builds no turns), sends generations from its last sent turn onward, and returns the
-agent's **whole** cost; `_subagent_record` replaces the stored totals with it rather than
-adding to them. Entries written before this carry no `path`, so they are only completed by
-`--reprocess`.
+prompt builds no turns) and returns the agent's **whole** cost; `_subagent_record` replaces
+the stored totals with it rather than adding to them.
 
 **Nested sub-agents (CC 2.1.172+):** sub-agents can spawn sub-agents up to 5 levels deep.
 Transcripts stay in the flat `<session>/subagents/` dir; each `.meta.json`'s `toolUseId`
@@ -590,7 +608,7 @@ Each agent appears once in `subagent_costs.agents` with `depth` and `parent_agen
 
 **Langfuse hierarchy:**
 ```
-Trace (parent session)
+Trace (one parent turn; session.id groups the turns)
 ├── Generation (parent turn)
 │   └── Span (Agent tool call)
 │       ├── Generation (subagent turn 1)
@@ -599,44 +617,48 @@ Trace (parent session)
 │           └── Span (Agent tool call — nested dispatch)
 │               └── Generation (nested subagent turn 1)
 │                   └── Span (Bash tool)
-└── [metadata: subagent_costs summary]
 ```
+Session score `session_cost_usd` → metadata `subagent_costs` summary
 
 **Exclusions:** `aside_question` subagents are skipped (internal sidechain queries).
 
-**State:** Subagent offsets stored in `~/.claude/langfuse-state/<session_id>.subagents.json`. Both state files are saved only after a successful send — so a timeout retry re-ingests subagent events rather than skipping them. The parent's own cost is recomputed from the whole transcript each fire (`session_cost_usd`); the old `_parent` accumulator key is dropped when found.
+**State:** Subagent offsets stored in `~/.claude/langfuse-state/<session_id>.subagents.json`. Both state files are saved only after a successful send — so a timeout retry re-ingests subagent events rather than skipping them. The parent's own cost is recomputed from the whole transcript each fire (`session_cost_usd` rollup).
 
-**Tags:** Traces with subagents get `has-subagents` and `subagents:{count}` tags for dashboard filtering.
+**Tags:** Turn traces of a session with subagents get `has-subagents` and `subagents:{count}` tags.
 
 ## Important Notes
 
-- **Turn numbering changed (2026-09-26).** Generation IDs are `uuid5(session:turn:<index>)`.
-  Merging consecutive user entries into one turn shifted the index of most turns, so a
-  plain `--reprocess` would add new generations beside the old ones and double-count cost.
-  Migrate with `python3 langfuse-hook.py --delete-traces` (same host/key env as
-  `--reprocess`; deletes `trace-<id>` for every local transcript and resets its state),
-  wait until the traces are gone from the UI — Langfuse deletes asynchronously — then
-  `--reprocess`.
+- **Moved to OTLP, one trace per turn (2026-10-11).** Before, every session was one
+  `trace-<session>` trace sent through the legacy ingestion API. Migrate a stack with
+  `--delete-traces` **while the stack still runs `legacy`** (deletes every per-turn trace,
+  the old `trace-<session>` one and the session scores for each local transcript, and
+  resets hook state), wait until the traces are gone, run the one-time `dual` + historic
+  backfill so sessions older than Claude Code's 30-day transcript retention stay visible
+  (they cannot be re-sent), switch the stack to `LANGFUSE_MIGRATION_V4_WRITE_MODE=events_only`
+  (the compose default), then `--reprocess`. Exact steps: REMOTE-DEPLOY.md, "Langfuse v4". `--reprocess` keeps hook state and sends only turns it marks unsent, so it is
+  safe to repeat; a full re-send needs `--delete-traces` first, which resets that state.
+  (It used to reset state itself, and v4 keeps every export, so a reprocess without a
+  completed delete doubled cost.)
 
 - `.env` contains generated secrets - never commit it
-- Hooks never block Claude Code: `setup.sh` registers both with `"async": true`, and every error, including an unexpected crash, goes to the hook log. A hook registered without `async` runs in the foreground (measured: median 0.8s, max 23s per Stop)
+- The hook never blocks Claude Code: `setup.sh` registers it on Stop / StopFailure / SessionEnd with `"async": true`, and every error, including an unexpected crash, goes to the hook log. A hook registered without `async` runs in the foreground (measured: median 0.8s, max 23s per Stop)
 - First Langfuse login may need incognito window (stale CSRF tokens)
 - `setup.sh` backs up existing `~/.claude/settings.json` before modifying hooks
 - All ports are localhost-only by default. LAN exposure of the dashboard is opt-in via `LANGFUSE_WEB_BIND` in `.env` (bind to host LAN IP; HTTP only, no TLS) — see `REMOTE-DEPLOY.md`. All other services stay `127.0.0.1`.
 
 ## Hook-Level Scores
 
-Three heuristic scores are attached to every trace during ingestion, each computed over the whole session on every fire:
+Scores attach to the **session** (`sessionId`, not a turn trace) and are recomputed over the whole session on every fire:
 
 | Score | Type | Values | Source |
 |-------|------|--------|--------|
+| `session_cost_usd` | Numeric | USD | parent + subagent cost; `metadata` = every session rollup |
 | `cache_hit_rate` | Numeric | 0.0-1.0 | cache_read / (cache_read + cache_creation) |
 | `tool_error_rate` | Numeric | 0.0-1.0 | executed calls with `[ERROR]` output / executed calls |
 | `tool_denial_rate` | Numeric | 0.0-1.0 | denied calls / all attempted calls |
 
-All three are deterministic (no LLM calls) and run on every Stop hook invocation.
-Scores use deterministic UUIDs so re-ingestion (`--reprocess`) updates rather
-than duplicates. Each score is omitted entirely when its denominator is zero
+All are deterministic (no LLM calls). Score IDs are `uuid5(session:score:<name>)`, so
+each fire overwrites the previous value. The three rates are omitted entirely when their denominator is zero
 (no cache activity / no executed calls / no attempted calls), keeping "absent"
 distinct from a genuine 0.0.
 

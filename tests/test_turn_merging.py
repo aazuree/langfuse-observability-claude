@@ -89,6 +89,72 @@ class TestBuildTurns:
         assert turns[1]["display_prompt"] == "try again differently"
 
 
+class TestStubLabels:
+    """A turn with no typed prose is named by what started it.
+
+    Each turn is its own trace, so its display prompt is the trace name. In a
+    census of 483 local turns, 147 had no typed prose and were named by raw
+    markup (`<task-notification>`, `<local-command-caveat>`) or by the first
+    line of a skill body.
+    """
+
+    def test_slash_command_is_named_by_the_command_and_its_args(self):
+        turns = hook.build_turns([
+            _user("<command-message>kb-query</command-message>\n"
+                  "<command-name>/kb-query</command-name>\n"
+                  "<command-args>langfuse v4</command-args>", "00:00"),
+            _user("Base directory for this skill: /x/skills/kb-query\n\n# KB", "00:00",
+                  isMeta=True),
+            _reply("m1", "00:04"),
+        ])
+        assert turns[0]["display_prompt"] == "/kb-query langfuse v4"
+
+    def test_local_command_skips_the_caveat(self):
+        turns = hook.build_turns([
+            _user("<local-command-caveat>The command below was run directly in "
+                  "Claude Code.</local-command-caveat>", "00:00", isMeta=True),
+            _user("<command-name>/exit</command-name>\n"
+                  "<command-message>exit</command-message>\n"
+                  "<command-args></command-args>", "00:00"),
+            _user("<local-command-stdout>(no content)</local-command-stdout>", "00:00"),
+            _reply("m1", "00:02"),
+        ])
+        assert turns[0]["display_prompt"] == "/exit"
+
+    def test_task_notification_is_named_by_its_summary(self):
+        turns = hook.build_turns([
+            _user("<task-notification>\n<task-id>a1</task-id>\n"
+                  "<status>completed</status>\n"
+                  '<summary>Agent "KB ingest batch 1" completed</summary>\n'
+                  "<result>long result</result>\n</task-notification>", "00:00"),
+            _reply("m1", "00:02"),
+        ])
+        assert turns[0]["display_prompt"] == 'Task notification: Agent "KB ingest batch 1" completed'
+
+    def test_task_notification_without_summary(self):
+        turns = hook.build_turns([
+            _user("<task-notification>\n<task-id>a1</task-id>\n</task-notification>", "00:00"),
+            _reply("m1", "00:02"),
+        ])
+        assert turns[0]["display_prompt"] == "Task notification"
+
+    def test_skill_body_alone_is_named_by_the_skill(self):
+        turns = hook.build_turns([
+            _user("Base directory for this skill: /home/u/.claude/skills/pinchtab\n\n"
+                  "# Browser Automation", "00:00", isMeta=True),
+            _reply("m1", "00:02"),
+        ])
+        assert turns[0]["display_prompt"] == "Skill: pinchtab"
+
+    def test_typed_prose_still_wins_over_a_label(self):
+        turns = hook.build_turns([
+            _user("<command-name>/model</command-name>", "00:00"),
+            _user("fix the bug", "00:05"),
+            _reply("m1", "00:07"),
+        ])
+        assert turns[0]["display_prompt"] == "fix the bug"
+
+
 class TestProcessSessionNaming:
     def test_generation_and_trace_are_named_by_the_human_prompt(self, tmp_path, monkeypatch):
         monkeypatch.setattr(hook, "STATE_DIR", str(tmp_path / "state"))

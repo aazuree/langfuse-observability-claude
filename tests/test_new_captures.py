@@ -1,4 +1,5 @@
 """Tests for v2.1.168 new-capture extractors: compaction, bridge, permission timeline."""
+from helpers import session_rollups
 import importlib.util
 import json
 import os
@@ -199,7 +200,7 @@ class TestNewCapturesWiring:
         hook.process_session("sess", str(transcript), "/x/repo")
 
         trace = next(e for e in captured["batch"] if e["type"] == "trace-create")
-        md = trace["body"]["metadata"]
+        md = session_rollups(captured["batch"])
         tags = trace["body"]["tags"]
 
         assert md["compaction"]["count"] == 1
@@ -207,8 +208,6 @@ class TestNewCapturesWiring:
         assert md["remote_control"] == {"bridge_session_id": "cse_019X",
                                         "url": "https://claude.ai/code/session_019X"}
         assert md["permission_timeline"]["transition_count"] == 1
-        # backward-compat fields unchanged
-        assert md["compaction_occurred"] is True
         assert md["permission_mode"] == "acceptEdits"
 
         assert "compacted" in tags
@@ -240,7 +239,7 @@ class TestNewCapturesWiring:
         hook.process_session("sess-int", str(transcript), "/x/repo")
 
         trace = next(e for e in captured["batch"] if e["type"] == "trace-create")
-        assert trace["body"]["metadata"]["interrupts"] == {"count": 1}
+        assert session_rollups(captured["batch"])["interrupts"] == {"count": 1}
         assert "has-interrupts" in trace["body"]["tags"]
 
 
@@ -360,7 +359,7 @@ class TestQueueAndDurationIntegration:
         hook.process_session("sess-q", str(transcript), "/x/repo")
 
         trace = next(e for e in captured["batch"] if e["type"] == "trace-create")
-        meta = trace["body"]["metadata"]
+        meta = session_rollups(captured["batch"])
         assert meta["queue_operations"]["queued"] == 1
         assert meta["queue_operations"]["executed"] == 1
         assert meta["active_duration"] == {
@@ -423,7 +422,7 @@ class TestStopReasonIntegration:
         hook.process_session("sess-sr", str(transcript), "/x/repo")
 
         trace = next(e for e in captured["batch"] if e["type"] == "trace-create")
-        meta = trace["body"]["metadata"]
+        meta = session_rollups(captured["batch"])
         tags = trace["body"]["tags"]
         assert meta["stop_reasons"]["by_reason"] == {"end_turn": 1, "max_tokens": 1}
         assert meta["stop_reasons"]["last"] == "max_tokens"

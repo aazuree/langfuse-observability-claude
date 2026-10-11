@@ -56,100 +56,55 @@ def test_cache_hit_rate_empty_turns():
 
 # --- build_hook_score_events ---
 
-def test_build_hook_score_events_omits_both_when_no_activity():
-    """No cache activity and no tool calls -> zero score events."""
+def _turn(cache_read=0, cache_creation=0, tool_calls=()):
+    return {"usage": {"input": 100, "output": 200, "total": 300,
+                      "cache_read": cache_read, "cache_creation": cache_creation},
+            "assistant_output": "Done.", "tool_calls": list(tool_calls)}
+
+
+def _by_name(events):
+    return {e["body"]["name"]: e["body"] for e in events}
+
+
+def test_session_cost_is_always_sent_with_the_rollups():
+    """No cache activity and no tool calls -> only the session cost score."""
     events = hook.build_hook_score_events(
-        trace_id="trace-abc",
-        session_id="abc",
-        first_user_input="fix the login bug",
-        turns=[{"usage": {"input": 100, "output": 200, "total": 300,
-                          "cache_read": 0, "cache_creation": 0},
-                "assistant_output": "Done.",
-                "tool_calls": []}],
-        total_cost=0.05,
-    )
-    assert events == []
+        session_id="abc", turns=[_turn()], session_cost=0.05, rollups={"turn_count": 1})
+    scores = _by_name(events)
+    assert set(scores) == {"session_cost_usd"}
+    assert scores["session_cost_usd"]["value"] == 0.05
+    assert scores["session_cost_usd"]["metadata"] == {"turn_count": 1}
 
 
-def test_build_hook_score_events_cache_hit_only():
-    """Cache activity but no tool calls -> only cache_hit_rate."""
+def test_cache_hit_rate_when_cache_was_used():
     events = hook.build_hook_score_events(
-        trace_id="trace-abc",
-        session_id="abc",
-        first_user_input="fix the login bug",
-        turns=[{"usage": {"input": 100, "output": 200, "total": 300,
-                          "cache_read": 500, "cache_creation": 500},
-                "assistant_output": "Done.",
-                "tool_calls": []}],
-        total_cost=0.05,
-    )
-    names = {e["body"]["name"] for e in events}
-    assert names == {"cache_hit_rate"}
+        session_id="abc", turns=[_turn(500, 500)], session_cost=0.05)
+    assert set(_by_name(events)) == {"session_cost_usd", "cache_hit_rate"}
 
 
-def test_build_hook_score_events_both_scores():
-    """Cache activity + tool calls -> both scores, correct types/values."""
+def test_all_scores_attach_to_the_session():
     events = hook.build_hook_score_events(
-        trace_id="trace-xyz",
         session_id="xyz",
-        first_user_input="explain the auth module",
-        turns=[{"usage": {"input": 500, "output": 500, "total": 1000,
-                          "cache_read": 2000, "cache_creation": 3000},
-                "assistant_output": "The auth module works by...",
-                "tool_calls": [{"output": "[ERROR] x"}, {"output": "ok"}]}],
-        total_cost=0.50,
+        turns=[_turn(2000, 3000, [{"output": "[ERROR] x"}, {"output": "ok"}])],
+        session_cost=0.50,
     )
-    by_name = {e["body"]["name"]: e for e in events}
-    assert set(by_name) == {"cache_hit_rate", "tool_error_rate", "tool_denial_rate"}
-
-    chr = by_name["cache_hit_rate"]
-    assert chr["type"] == "score-create"
-    assert chr["body"]["dataType"] == "NUMERIC"
-    assert chr["body"]["value"] == 0.4  # 2000 / (2000 + 3000)
-    assert chr["body"]["traceId"] == "trace-xyz"
-
-    ter = by_name["tool_error_rate"]
-    assert ter["body"]["dataType"] == "NUMERIC"
-    assert ter["body"]["value"] == 0.5  # 1 error / 2 calls
-
-    # Calls ran and none were denied: a genuine 0.0, distinct from the score
-    # being absent because nothing was attempted.
-    tdr = by_name["tool_denial_rate"]
-    assert tdr["body"]["dataType"] == "NUMERIC"
-    assert tdr["body"]["value"] == 0.0
+    scores = _by_name(events)
+    assert set(scores) == {"session_cost_usd", "cache_hit_rate", "tool_error_rate", "tool_denial_rate"}
+    for body in scores.values():
+        assert body["sessionId"] == "xyz"
+        assert "traceId" not in body
+        assert body["dataType"] == "NUMERIC"
+    assert scores["cache_hit_rate"]["value"] == 0.4  # 2000 / (2000 + 3000)
+    assert scores["tool_error_rate"]["value"] == 0.5  # 1 error / 2 calls
+    # Calls ran and none were denied: a genuine 0.0, distinct from absent.
+    assert scores["tool_denial_rate"]["value"] == 0.0
 
 
-def test_build_hook_score_events_deterministic_ids():
-    """Same inputs should produce same event IDs (idempotent re-ingestion)."""
-    args = dict(
-        trace_id="trace-abc", session_id="abc",         first_user_input="hello",
-        turns=[{"usage": {"input": 0, "output": 100, "total": 100,
-                           "cache_read": 0, "cache_creation": 0},
-                "assistant_output": "Hi!",
-                "tool_calls": []}],
-        total_cost=0.01,
-    )
-    events_a = hook.build_hook_score_events(**args)
-    events_b = hook.build_hook_score_events(**args)
-    ids_a = [e["id"] for e in events_a]
-    ids_b = [e["id"] for e in events_b]
-    assert ids_a == ids_b
-
-
-def test_build_hook_score_events_stable_ids_across_turns():
-    """Score IDs must be the same regardless of how many turns have been processed.
-    Previously the ID included prev_offset, creating duplicate scores per turn."""
-    base = dict(
-        trace_id="trace-abc", session_id="abc",
-        first_user_input="hello",
-        turns=[{"usage": {"input": 0, "output": 100, "total": 100,
-                           "cache_read": 0, "cache_creation": 0},
-                "assistant_output": "Hi!", "tool_calls": []}],
-        total_cost=0.01,
-    )
-    events_turn1 = hook.build_hook_score_events(**base)
-    events_turn3 = hook.build_hook_score_events(**base)
-    assert [e["id"] for e in events_turn1] == [e["id"] for e in events_turn3]
+def test_score_ids_are_stable_so_every_fire_upserts():
+    """Keyed on session + name only: a later fire overwrites the same score."""
+    a = hook.build_hook_score_events(session_id="abc", turns=[_turn(1, 1)], session_cost=0.01)
+    b = hook.build_hook_score_events(session_id="abc", turns=[_turn(1, 1)] * 3, session_cost=0.09)
+    assert [e["body"]["id"] for e in a] == [e["body"]["id"] for e in b]
 
 
 # --- calculate_tool_error_rate ---

@@ -13,6 +13,8 @@ import importlib.util
 import json
 import os
 
+from helpers import session_rollups
+
 _spec = importlib.util.spec_from_file_location(
     "langfuse_hook", os.path.join(os.path.dirname(__file__), "..", "langfuse-hook.py"))
 hook = importlib.util.module_from_spec(_spec)
@@ -138,9 +140,9 @@ def test_background_agent_work_after_the_parent_turn_is_ingested(tmp_path, monke
     assert state["total_tokens"] == (10 + 100) + (10 + 900)
 
 
-def test_totals_are_not_double_counted_when_a_turn_is_resent(tmp_path, monkeypatch):
-    """The parent re-sends its last turn every fire, which re-reads its
-    subagent. Totals must be the agent's whole cost, not a running sum."""
+def test_totals_are_not_double_counted_across_fires(tmp_path, monkeypatch):
+    """Every fire that sees the agent's transcript grow re-reads all of it.
+    Totals must be the agent's whole cost, not a running sum."""
     s = _Session(tmp_path, monkeypatch)
     s.append(s.parent, _parent_turn(1, 0, agent=True))
     s.append(s.agent, [
@@ -159,8 +161,7 @@ def test_totals_are_not_double_counted_when_a_turn_is_resent(tmp_path, monkeypat
     s.fire()
 
     assert s.state()["total_tokens"] == (10 + 100) * 2
-    trace = next(e["body"] for e in s.batches[-1] if e["type"] == "trace-create")
-    agents = trace["metadata"]["subagent_costs"]["agents"]
+    agents = session_rollups(s.batches[-1])["subagent_costs"]["agents"]
     assert [a["total_tokens"] for a in agents] == [220]
 
 
@@ -183,3 +184,32 @@ def test_unchanged_agent_is_not_reread(tmp_path, monkeypatch):
                         lambda path, *a, **kw: reads.append(path) or real(path, *a, **kw))
     s.fire()
     assert str(s.agent) not in reads
+
+
+def test_a_write_landing_during_the_read_is_picked_up_next_fire(tmp_path, monkeypatch):
+    """The recorded size must be measured before the agent's transcript is
+    read. Measured after, a write that lands mid-read is counted as seen and
+    the agent's final turn is stranded until SessionEnd or a reprocess."""
+    s = _Session(tmp_path, monkeypatch)
+    s.append(s.parent, _parent_turn(1, 0, agent=True))
+    s.append(s.agent, [
+        {"type": "user", "timestamp": "2026-09-20T10:00:01+00:00", "isSidechain": True,
+         "message": {"role": "user", "content": "go"}},
+        _assistant("sm1", "2026-09-20T10:00:03+00:00", tool="tr1"),
+        _result("tr1", "2026-09-20T10:00:04+00:00"),
+    ])
+    real = hook.parse_transcript
+
+    def read_then_agent_writes(path, *a, **kw):
+        out = real(path, *a, **kw)
+        if path == str(s.agent):
+            s.append(s.agent, [_assistant("sm2", "2026-09-20T10:00:30+00:00",
+                                          text="all done", stop="end_turn")])
+        return out
+    monkeypatch.setattr(hook, "parse_transcript", read_then_agent_writes)
+    s.fire()
+    monkeypatch.setattr(hook, "parse_transcript", real)
+
+    s.append(s.parent, _parent_turn(2, 1))
+    gens = _agent_gens(s.fire())
+    assert gens and gens[-1]["output"] == "all done"
