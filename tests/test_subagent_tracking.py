@@ -1,5 +1,6 @@
 # tests/test_subagent_tracking.py
 """Tests for subagent cost tracking in langfuse-hook.py"""
+from helpers import session_rollups
 import importlib.util
 import json
 import os
@@ -96,94 +97,35 @@ def _make_meta_json(directory, agent_id, agent_type="general-purpose", descripti
 
 # --- discover_subagents tests ---
 
-def test_discover_subagents_no_directory(tmp_path):
-    """Returns empty list when no subagents directory exists."""
-    transcript = tmp_path / "session123.jsonl"
-    transcript.write_text("")
-    tool_uses = [("desc", "general-purpose", "2026-03-29T10:00:00+00:00", 0)]
-    result = langfuse_hook.discover_subagents(str(transcript), tool_uses)
-    assert result == []
 
 
-def test_discover_subagents_excludes_aside_question(tmp_path):
-    """aside_question subagents are excluded."""
-    transcript = tmp_path / "session123.jsonl"
-    transcript.write_text("")
-    subagents_dir = tmp_path / "session123" / "subagents"
-    subagents_dir.mkdir(parents=True)
+def test_meta_index_excludes_aside_question(tmp_path):
+    """aside_question agents are internal sidechain queries, never ingested."""
+    subagents_dir = tmp_path / "subagents"
+    subagents_dir.mkdir()
     _make_subagent_jsonl(subagents_dir, "aside_question-abc123", "2026-03-29T10:00:01+00:00")
-    tool_uses = [("desc", "general-purpose", "2026-03-29T10:00:00+00:00", 0)]
-    result = langfuse_hook.discover_subagents(str(transcript), tool_uses)
-    assert result == []
+    _make_meta_json(subagents_dir, "aside_question-abc123", tool_use_id="toolu_A")
+    assert langfuse_hook.build_subagent_meta_index([str(subagents_dir)]) == {}
 
 
-def test_discover_subagents_single_match(tmp_path):
-    """Matches a single subagent by timestamp proximity."""
-    transcript = tmp_path / "session123.jsonl"
-    transcript.write_text("")
-    subagents_dir = tmp_path / "session123" / "subagents"
-    subagents_dir.mkdir(parents=True)
-    _make_subagent_jsonl(subagents_dir, "abc123", "2026-03-29T10:00:02+00:00")
-    _make_meta_json(subagents_dir, "abc123", description="Explore codebase")
-    tool_uses = [("Explore codebase", "Explore", "2026-03-29T10:00:00+00:00", 0)]
-    result = langfuse_hook.discover_subagents(str(transcript), tool_uses)
-    assert len(result) == 1
-    assert result[0][0] == "abc123"
-    assert result[0][2] == "Explore codebase"
-    assert result[0][3] == "Explore"
-    assert result[0][4] == 0  # original tool_use content_index
-    assert result[0][5] == "timestamp"  # no agentId link → proximity fallback
 
 
-def test_discover_subagents_rejects_outside_window(tmp_path):
-    """Rejects subagent if timestamp gap exceeds SUBAGENT_MATCH_WINDOW_S."""
-    transcript = tmp_path / "session123.jsonl"
-    transcript.write_text("")
-    subagents_dir = tmp_path / "session123" / "subagents"
-    subagents_dir.mkdir(parents=True)
-    _make_subagent_jsonl(subagents_dir, "abc123", "2026-03-29T10:02:00+00:00")
-    tool_uses = [("desc", "general-purpose", "2026-03-29T10:00:00+00:00", 0)]
-    result = langfuse_hook.discover_subagents(str(transcript), tool_uses)
-    assert result == []
 
 
-def test_discover_subagents_multiple_ordered(tmp_path):
-    """Multiple Agent tool_uses in same entry match by index order."""
-    transcript = tmp_path / "session123.jsonl"
-    transcript.write_text("")
-    subagents_dir = tmp_path / "session123" / "subagents"
-    subagents_dir.mkdir(parents=True)
-    _make_subagent_jsonl(subagents_dir, "first", "2026-03-29T10:00:01+00:00")
-    _make_subagent_jsonl(subagents_dir, "second", "2026-03-29T10:00:03+00:00")
-    tool_uses = [
-        ("Implement feature", "general-purpose", "2026-03-29T10:00:00+00:00", 0),
-        ("Review spec", "general-purpose", "2026-03-29T10:00:00+00:00", 1),
-    ]
-    result = langfuse_hook.discover_subagents(str(transcript), tool_uses)
-    assert len(result) == 2
-    assert result[0][0] == "first"
-    assert result[1][0] == "second"
 
 
-def test_discover_subagents_no_meta_json(tmp_path):
-    """Works without .meta.json — uses tool_use description/type."""
-    transcript = tmp_path / "session123.jsonl"
-    transcript.write_text("")
-    subagents_dir = tmp_path / "session123" / "subagents"
-    subagents_dir.mkdir(parents=True)
-    _make_subagent_jsonl(subagents_dir, "abc123", "2026-03-29T10:00:01+00:00")
-    tool_uses = [("Run tests", "general-purpose", "2026-03-29T10:00:00+00:00", 0)]
-    result = langfuse_hook.discover_subagents(str(transcript), tool_uses)
-    assert len(result) == 1
-    assert result[0][0] == "abc123"
-    assert result[0][2] == "Run tests"
-    assert result[0][3] == "general-purpose"
 
 
 # --- ingest_subagent tests ---
 
-def _make_full_subagent_jsonl(directory, agent_id, start_ts="2026-03-29T10:00:01+00:00"):
-    """Helper: create a realistic subagent JSONL with turns, tool calls, and usage."""
+def _make_full_subagent_jsonl(directory, agent_id, start_ts="2026-03-29T10:00:01+00:00",
+                              tool_use_id=None):
+    """Helper: create a realistic subagent JSONL with turns, tool calls, and usage.
+
+    With `tool_use_id`, also writes the .meta.json that links it to that Agent call.
+    """
+    if tool_use_id:
+        _make_meta_json(directory, agent_id, description="task", tool_use_id=tool_use_id)
     entries = [
         {
             "type": "user",
@@ -198,7 +140,7 @@ def _make_full_subagent_jsonl(directory, agent_id, start_ts="2026-03-29T10:00:01
             "timestamp": "2026-03-29T10:00:05+00:00",
             "message": {
                 "id": f"msg-{agent_id}-1",
-                "role": "assistant",
+                "role": "assistant", "stop_reason": "end_turn",
                 "model": "claude-sonnet-4-6",
                 "content": [
                     {"type": "text", "text": "I'll read the file first."},
@@ -231,7 +173,7 @@ def _make_full_subagent_jsonl(directory, agent_id, start_ts="2026-03-29T10:00:01
             # the entry's top level.
             "message": {
                 "id": f"msg-{agent_id}-2",
-                "role": "assistant",
+                "role": "assistant", "stop_reason": "end_turn",
                 "model": "claude-sonnet-4-6",
                 "stop_reason": "end_turn",
                 "content": [{"type": "text", "text": "Done implementing."}],
@@ -303,7 +245,7 @@ def test_ingest_subagent_partial(tmp_path):
         {
             "type": "assistant", "timestamp": "2026-03-29T10:00:05+00:00",
             "message": {
-                "id": "msg-partial-1", "role": "assistant", "model": "claude-sonnet-4-6",
+                "id": "msg-partial-1", "role": "assistant", "stop_reason": "tool_use", "model": "claude-sonnet-4-6",
                 "content": [{"type": "text", "text": "Working on it..."}],
                 "usage": {"input_tokens": 50, "output_tokens": 20,
                           "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
@@ -379,7 +321,7 @@ def test_process_session_with_subagent(tmp_path, monkeypatch):
         {
             "type": "assistant", "uuid": "a1", "timestamp": "2026-03-29T10:00:02+00:00",
             "message": {
-                "id": "msg-parent-1", "role": "assistant", "model": "claude-opus-4-6",
+                "id": "msg-parent-1", "role": "assistant", "stop_reason": "end_turn", "model": "claude-opus-4-6",
                 "content": [
                     {"type": "text", "text": "I'll dispatch a subagent."},
                     {
@@ -410,7 +352,7 @@ def test_process_session_with_subagent(tmp_path, monkeypatch):
 
     subagent_dir = session_dir / "test-session" / "subagents"
     subagent_dir.mkdir(parents=True)
-    _make_full_subagent_jsonl(subagent_dir, "impl-agent", "2026-03-29T10:00:03+00:00")
+    _make_full_subagent_jsonl(subagent_dir, "impl-agent", tool_use_id="tool-agent-1", start_ts="2026-03-29T10:00:03+00:00")
 
     langfuse_hook.process_session("test-session", str(transcript_path), "/home/test/project")
 
@@ -424,10 +366,9 @@ def test_process_session_with_subagent(tmp_path, monkeypatch):
     assert len(gen_events) >= 2  # parent turn + subagent turns
 
     trace_body = trace_events[0]["body"]
-    assert "subagent_costs" in trace_body["metadata"]
     assert "has-subagents" in trace_body["tags"]
 
-    costs = trace_body["metadata"]["subagent_costs"]
+    costs = session_rollups(all_events)["subagent_costs"]
     assert costs["total_subagent_cost"] > 0
     assert costs["harness_total_cost"] > 0
     assert len(costs["agents"]) == 1
@@ -462,7 +403,7 @@ def test_harness_cost_accumulates_across_hook_fires(tmp_path, monkeypatch):
         {
             "type": "assistant", "uuid": "a1", "timestamp": "2026-04-25T10:00:02+00:00",
             "message": {
-                "id": "msg-fire-1", "role": "assistant", "model": "claude-sonnet-4-6",
+                "id": "msg-fire-1", "role": "assistant", "stop_reason": "end_turn", "model": "claude-sonnet-4-6",
                 "content": [
                     {"type": "text", "text": "Dispatching subagent."},
                     {
@@ -491,14 +432,13 @@ def test_harness_cost_accumulates_across_hook_fires(tmp_path, monkeypatch):
 
     subagent_dir = session_dir / "fire-session" / "subagents"
     subagent_dir.mkdir(parents=True)
-    _make_full_subagent_jsonl(subagent_dir, "run-agent", "2026-04-25T10:00:03+00:00")
+    _make_full_subagent_jsonl(subagent_dir, "run-agent", tool_use_id="tool-agent-1", start_ts="2026-04-25T10:00:03+00:00")
 
     # First hook fire
     langfuse_hook.process_session("fire-session", str(transcript_path), "/home/test/project")
     assert len(sent_batches) == 1, "Expected exactly 1 batch after fire 1"
 
-    fire1_trace = next(e for e in sent_batches[0] if e["type"] == "trace-create")
-    fire1_costs = fire1_trace["body"]["metadata"]["subagent_costs"]
+    fire1_costs = session_rollups(sent_batches[0])["subagent_costs"]
     fire1_harness = fire1_costs["harness_total_cost"]
     fire1_parent = fire1_costs["parent_cost"]
     fire1_subagent = fire1_costs["total_subagent_cost"]
@@ -516,7 +456,7 @@ def test_harness_cost_accumulates_across_hook_fires(tmp_path, monkeypatch):
         f.write(json.dumps({
             "type": "assistant", "uuid": "a2", "timestamp": "2026-04-25T10:02:05+00:00",
             "message": {
-                "id": "msg-fire-2", "role": "assistant", "model": "claude-sonnet-4-6",
+                "id": "msg-fire-2", "role": "assistant", "stop_reason": "end_turn", "model": "claude-sonnet-4-6",
                 "content": [{"type": "text", "text": "Answer."}],
                 "usage": {
                     "input_tokens": 60, "output_tokens": 30,
@@ -529,8 +469,7 @@ def test_harness_cost_accumulates_across_hook_fires(tmp_path, monkeypatch):
     langfuse_hook.process_session("fire-session", str(transcript_path), "/home/test/project")
     assert len(sent_batches) == 2, "Expected exactly 2 batches after fire 2"
 
-    fire2_trace = next(e for e in sent_batches[1] if e["type"] == "trace-create")
-    fire2_costs = fire2_trace["body"]["metadata"]["subagent_costs"]
+    fire2_costs = session_rollups(sent_batches[1])["subagent_costs"]
     fire2_harness = fire2_costs["harness_total_cost"]
     fire2_parent = fire2_costs["parent_cost"]
     fire2_subagent = fire2_costs["total_subagent_cost"]
@@ -548,19 +487,13 @@ def test_harness_cost_accumulates_across_hook_fires(tmp_path, monkeypatch):
 
 
 def test_parent_cost_comes_from_the_whole_transcript(tmp_path, monkeypatch):
-    """parent_cost is priced from every parent turn on each fire.
-
-    It used to accumulate in sa_state["_parent"], which only started once a
-    subagent existed, so parent cost from earlier fires was lost. The key is
-    no longer written, and a stale one is dropped.
-    """
+    """parent_cost is priced from every parent turn on each fire."""
     state_dir = tmp_path / "state"
     state_dir.mkdir()
     monkeypatch.setattr(langfuse_hook, "STATE_DIR", str(state_dir))
     sent = []
     monkeypatch.setattr(langfuse_hook, "send_to_langfuse",
                         lambda batch: sent.append(batch) or True)
-    langfuse_hook.save_subagent_state("parent-cost-session", {"_parent": {"total_cost": 99.0}})
 
     session_dir = tmp_path / "projects" / "test-project"
     session_dir.mkdir(parents=True)
@@ -576,7 +509,7 @@ def test_parent_cost_comes_from_the_whole_transcript(tmp_path, monkeypatch):
         {
             "type": "assistant", "uuid": "a1", "timestamp": "2026-04-25T10:00:02+00:00",
             "message": {
-                "id": "msg-pc-1", "role": "assistant", "model": "claude-sonnet-4-6",
+                "id": "msg-pc-1", "role": "assistant", "stop_reason": "end_turn", "model": "claude-sonnet-4-6",
                 "content": [
                     {"type": "text", "text": "Dispatching."},
                     {
@@ -605,18 +538,15 @@ def test_parent_cost_comes_from_the_whole_transcript(tmp_path, monkeypatch):
 
     subagent_dir = session_dir / "parent-cost-session" / "subagents"
     subagent_dir.mkdir(parents=True)
-    _make_full_subagent_jsonl(subagent_dir, "pc-agent", "2026-04-25T10:00:03+00:00")
+    _make_full_subagent_jsonl(subagent_dir, "pc-agent", tool_use_id="tool-agent-1", start_ts="2026-04-25T10:00:03+00:00")
 
     langfuse_hook.process_session(
         "parent-cost-session", str(transcript_path), "/home/test/project"
     )
 
-    sa_state = langfuse_hook.load_subagent_state("parent-cost-session")
-    assert "_parent" not in sa_state
-    trace = next(e["body"] for e in sent[0] if e["type"] == "trace-create")
-    costs = trace["metadata"]["subagent_costs"]
-    assert costs["parent_cost"] == trace["metadata"]["session_cost_usd"] > 0
-    assert costs["parent_cost"] < 99.0
+    rollups = session_rollups(sent[0])
+    costs = rollups["subagent_costs"]
+    assert costs["parent_cost"] == rollups["session_cost_usd"] > 0
 
 
 def test_subagent_state_not_saved_on_send_failure(tmp_path, monkeypatch):
@@ -652,7 +582,7 @@ def test_subagent_state_not_saved_on_send_failure(tmp_path, monkeypatch):
         {
             "type": "assistant", "uuid": "a1", "timestamp": "2026-03-29T10:00:02+00:00",
             "message": {
-                "id": "msg-retry-1", "role": "assistant", "model": "claude-sonnet-4-6",
+                "id": "msg-retry-1", "role": "assistant", "stop_reason": "end_turn", "model": "claude-sonnet-4-6",
                 "content": [
                     {"type": "text", "text": "Dispatching subagent."},
                     {
@@ -682,7 +612,7 @@ def test_subagent_state_not_saved_on_send_failure(tmp_path, monkeypatch):
 
     subagent_dir = session_dir / "retry-session" / "subagents"
     subagent_dir.mkdir(parents=True)
-    _make_full_subagent_jsonl(subagent_dir, "retry-agent", "2026-03-29T10:00:03+00:00")
+    _make_full_subagent_jsonl(subagent_dir, "retry-agent", tool_use_id="tool-agent-retry", start_ts="2026-03-29T10:00:03+00:00")
 
     # Fire 1: send fails — sa_state must NOT be written
     langfuse_hook.process_session("retry-session", str(transcript_path), "/home/test/project")
@@ -734,9 +664,9 @@ def test_project_dir_from_cwd_worktree_path():
     assert langfuse_hook._project_dir_from_cwd(cwd) == expected
 
 
-def test_discover_subagents_finds_cwd_derived_dir(tmp_path, monkeypatch):
+def test_meta_index_finds_cwd_derived_dir(tmp_path, monkeypatch):
     """When the parent transcript's project dir has no subagents/ but
-    the cwd-derived project dir does, subagents are still discovered."""
+    the cwd-derived project dir does, subagents are still found."""
     # Layout: parent transcript at projects/parent-proj/SESSION.jsonl,
     # subagents at projects/worktree-proj/SESSION/subagents/
     projects = tmp_path / "projects"
@@ -750,18 +680,17 @@ def test_discover_subagents_finds_cwd_derived_dir(tmp_path, monkeypatch):
     worktree_proj = projects / encoded / "session123" / "subagents"
     worktree_proj.mkdir(parents=True)
     _make_subagent_jsonl(worktree_proj, "abc123", "2026-03-29T10:00:02+00:00")
-    _make_meta_json(worktree_proj, "abc123", description="Explore codebase")
+    _make_meta_json(worktree_proj, "abc123", description="Explore codebase", tool_use_id="toolu_1")
 
     monkeypatch.setattr(langfuse_hook, "PROJECTS_DIR", str(projects))
 
-    tool_uses = [("Explore codebase", "Explore", "2026-03-29T10:00:00+00:00", 0)]
-    result = langfuse_hook.discover_subagents(str(transcript), tool_uses, cwd=worktree_cwd)
-    assert len(result) == 1
-    assert result[0][0] == "abc123"
+    dirs = langfuse_hook._subagent_search_dirs(str(transcript), worktree_cwd)
+    index = langfuse_hook.build_subagent_meta_index(dirs)
+    assert index["toolu_1"]["agent_id"] == "abc123"
 
 
-def test_discover_subagents_dedupes_when_both_dirs_have_same_id(tmp_path, monkeypatch):
-    """Same agent_id present in primary + cwd-derived dirs: primary wins, one match."""
+def test_meta_index_primary_dir_wins_over_cwd_dir(tmp_path, monkeypatch):
+    """Same toolUseId in primary + cwd-derived dirs: primary wins."""
     projects = tmp_path / "projects"
     parent_proj = projects / "parent-proj"
     parent_proj.mkdir(parents=True)
@@ -770,194 +699,48 @@ def test_discover_subagents_dedupes_when_both_dirs_have_same_id(tmp_path, monkey
     primary = parent_proj / "session123" / "subagents"
     primary.mkdir(parents=True)
     primary_jsonl = _make_subagent_jsonl(primary, "abc123", "2026-03-29T10:00:02+00:00")
+    _make_meta_json(primary, "abc123", tool_use_id="toolu_1")
 
     worktree_cwd = "/home/u/repo/.claude/worktrees/foo"
-    encoded = langfuse_hook._project_dir_from_cwd(worktree_cwd)
-    alt = projects / encoded / "session123" / "subagents"
+    alt = projects / langfuse_hook._project_dir_from_cwd(worktree_cwd) / "session123" / "subagents"
     alt.mkdir(parents=True)
     _make_subagent_jsonl(alt, "abc123", "2026-03-29T10:00:05+00:00")
+    _make_meta_json(alt, "abc123", tool_use_id="toolu_1")
 
     monkeypatch.setattr(langfuse_hook, "PROJECTS_DIR", str(projects))
-
-    tool_uses = [("Explore", "Explore", "2026-03-29T10:00:00+00:00", 0)]
-    result = langfuse_hook.discover_subagents(str(transcript), tool_uses, cwd=worktree_cwd)
-    assert len(result) == 1
-    # Primary path won (its jsonl is the one returned)
-    assert result[0][1] == str(primary_jsonl)
+    dirs = langfuse_hook._subagent_search_dirs(str(transcript), worktree_cwd)
+    index = langfuse_hook.build_subagent_meta_index(dirs)
+    assert index["toolu_1"]["path"] == str(primary_jsonl)
 
 
-def test_discover_subagents_no_cwd_keeps_old_behavior(tmp_path):
-    """cwd="" (default) falls back to primary-only search; pre-existing semantics."""
-    transcript = tmp_path / "session123.jsonl"
-    transcript.write_text("")
-    primary = tmp_path / "session123" / "subagents"
-    primary.mkdir(parents=True)
-    _make_subagent_jsonl(primary, "abc123", "2026-03-29T10:00:02+00:00")
-
-    tool_uses = [("Explore", "Explore", "2026-03-29T10:00:00+00:00", 0)]
-    result = langfuse_hook.discover_subagents(str(transcript), tool_uses)
-    assert len(result) == 1
-    assert result[0][0] == "abc123"
 
 
 # --- extract_agent_id_from_result tests ---
 
-def test_extract_agent_id_sync():
-    """Synchronous Agent tool_result embeds 'agentId: <id> (use SendMessage ...)'."""
-    out = '{"type": "text", "text": "agentId: a2b537af4a71ab023 (use SendMessage to reply)"}'
-    assert langfuse_hook.extract_agent_id_from_result(out) == "a2b537af4a71ab023"
 
 
-def test_extract_agent_id_async():
-    """Background Agent tool_result embeds 'Async agent launched...\\nagentId: <id>'."""
-    out = "Async agent launched successfully.\nagentId: a631e03755422d8ec"
-    assert langfuse_hook.extract_agent_id_from_result(out) == "a631e03755422d8ec"
 
 
-def test_extract_agent_id_absent():
-    """Returns None when no agentId token is present."""
-    assert langfuse_hook.extract_agent_id_from_result("some unrelated tool output") is None
 
 
-def test_extract_agent_id_empty():
-    """Returns None for empty/falsy input."""
-    assert langfuse_hook.extract_agent_id_from_result("") is None
-    assert langfuse_hook.extract_agent_id_from_result(None) is None
 
 
 # --- discover_subagents deterministic tests ---
 
-def test_discover_deterministic_match_ignores_timestamp(tmp_path):
-    """agentId link matches even when the timestamp is far outside the window."""
-    transcript = tmp_path / "session123.jsonl"
-    transcript.write_text("")
-    subagents_dir = tmp_path / "session123" / "subagents"
-    subagents_dir.mkdir(parents=True)
-    # subagent file timestamp is 2 minutes off — would FAIL timestamp matching
-    _make_subagent_jsonl(subagents_dir, "abc123", "2026-03-29T10:02:00+00:00")
-    tool_uses = [("desc", "general-purpose", "2026-03-29T10:00:00+00:00", 0, "abc123")]
-    result = langfuse_hook.discover_subagents(str(transcript), tool_uses)
-    assert len(result) == 1
-    assert result[0][0] == "abc123"
-    assert result[0][5] == "deterministic"
 
 
-def test_discover_deterministic_swapped_timestamps(tmp_path):
-    """Two parallel agents whose file timestamps are SWAPPED vs dispatch order.
-
-    Pure timestamp matching would pair tool_use[0] with the earliest file
-    ('second'); the agentId link must pair them correctly instead.
-    """
-    transcript = tmp_path / "session123.jsonl"
-    transcript.write_text("")
-    subagents_dir = tmp_path / "session123" / "subagents"
-    subagents_dir.mkdir(parents=True)
-    _make_subagent_jsonl(subagents_dir, "first", "2026-03-29T10:00:03+00:00")
-    _make_subagent_jsonl(subagents_dir, "second", "2026-03-29T10:00:01+00:00")
-    tool_uses = [
-        ("Build", "general-purpose", "2026-03-29T10:00:00+00:00", 0, "first"),
-        ("Review", "general-purpose", "2026-03-29T10:00:00+00:00", 1, "second"),
-    ]
-    result = langfuse_hook.discover_subagents(str(transcript), tool_uses)
-    by_idx = {r[4]: r for r in result}
-    assert by_idx[0][0] == "first"
-    assert by_idx[1][0] == "second"
-    assert all(r[5] == "deterministic" for r in result)
 
 
-def test_discover_mixed_link_and_fallback(tmp_path):
-    """One tool_use has an agentId link, one does not — fallback for the latter."""
-    transcript = tmp_path / "session123.jsonl"
-    transcript.write_text("")
-    subagents_dir = tmp_path / "session123" / "subagents"
-    subagents_dir.mkdir(parents=True)
-    _make_subagent_jsonl(subagents_dir, "linked", "2026-03-29T10:00:05+00:00")
-    _make_subagent_jsonl(subagents_dir, "unlinked", "2026-03-29T10:00:01+00:00")
-    tool_uses = [
-        ("Has link", "general-purpose", "2026-03-29T10:00:00+00:00", 0, "linked"),
-        ("No link", "general-purpose", "2026-03-29T10:00:00+00:00", 1, None),
-    ]
-    result = langfuse_hook.discover_subagents(str(transcript), tool_uses)
-    by_idx = {r[4]: r for r in result}
-    assert by_idx[0][0] == "linked"
-    assert by_idx[0][5] == "deterministic"
-    assert by_idx[1][0] == "unlinked"
-    assert by_idx[1][5] == "timestamp"
 
 
-def test_discover_agentid_missing_file_falls_back(tmp_path):
-    """agentId given but no matching file — falls back to timestamp matching."""
-    transcript = tmp_path / "session123.jsonl"
-    transcript.write_text("")
-    subagents_dir = tmp_path / "session123" / "subagents"
-    subagents_dir.mkdir(parents=True)
-    _make_subagent_jsonl(subagents_dir, "realfile", "2026-03-29T10:00:01+00:00")
-    tool_uses = [("desc", "general-purpose", "2026-03-29T10:00:00+00:00", 0, "ghost-id")]
-    result = langfuse_hook.discover_subagents(str(transcript), tool_uses)
-    assert len(result) == 1
-    assert result[0][0] == "realfile"
-    assert result[0][5] == "timestamp"
 
 
-def test_discover_backcompat_4tuple(tmp_path):
-    """Legacy 4-element tool_use tuples (no agentId) still work, marked timestamp."""
-    transcript = tmp_path / "session123.jsonl"
-    transcript.write_text("")
-    subagents_dir = tmp_path / "session123" / "subagents"
-    subagents_dir.mkdir(parents=True)
-    _make_subagent_jsonl(subagents_dir, "abc123", "2026-03-29T10:00:01+00:00")
-    tool_uses = [("desc", "general-purpose", "2026-03-29T10:00:00+00:00", 0)]
-    result = langfuse_hook.discover_subagents(str(transcript), tool_uses)
-    assert len(result) == 1
-    assert result[0][0] == "abc123"
-    assert result[0][5] == "timestamp"
 
 
 # --- ingest_subagent correlation metadata tests ---
 
-def test_ingest_subagent_records_correlation(tmp_path):
-    """ingest_subagent stamps the correlation method + agent_id on the generation."""
-    sub_dir = tmp_path / "subagents"
-    sub_dir.mkdir(parents=True)
-    _make_full_subagent_jsonl(sub_dir, "abc123")
-    jsonl = sub_dir / "agent-abc123.jsonl"
-
-    events, cost, offset, turns, status = langfuse_hook.ingest_subagent(
-        agent_id="abc123",
-        transcript_path=str(jsonl),
-        parent_span_id="span-parent",
-        trace_id="trace-1",
-        session_id="parent-session",
-        subagent_offset=0,
-        prior_turn_count=0,
-        correlation="deterministic",
-    )
-
-    gens = [e for e in events if e["type"] == "generation-create"]
-    assert gens, "expected at least one subagent generation event"
-    meta = gens[0]["body"]["metadata"]
-    assert meta["subagent_correlation"] == "deterministic"
-    assert meta["agent_id"] == "abc123"
 
 
-def test_ingest_subagent_correlation_defaults_to_timestamp(tmp_path):
-    """correlation defaults to 'timestamp' when not supplied (back-compat)."""
-    sub_dir = tmp_path / "subagents"
-    sub_dir.mkdir(parents=True)
-    _make_full_subagent_jsonl(sub_dir, "def456")
-    jsonl = sub_dir / "agent-def456.jsonl"
-
-    events, *_ = langfuse_hook.ingest_subagent(
-        agent_id="def456",
-        transcript_path=str(jsonl),
-        parent_span_id="span-parent",
-        trace_id="trace-1",
-        session_id="parent-session",
-        subagent_offset=0,
-        prior_turn_count=0,
-    )
-    gens = [e for e in events if e["type"] == "generation-create"]
-    assert gens[0]["body"]["metadata"]["subagent_correlation"] == "timestamp"
 
 
 # --- build_subagent_meta_index tests ---
@@ -992,22 +775,6 @@ def test_build_meta_index_missing_dir(tmp_path):
     assert langfuse_hook.build_subagent_meta_index([str(tmp_path / "nope")]) == {}
 
 
-def test_discover_meta_index_match_beats_regex_and_timestamp(tmp_path):
-    sa_dir = tmp_path / "session" / "subagents"
-    sa_dir.mkdir(parents=True)
-    transcript = tmp_path / "session.jsonl"
-    transcript.write_text("")
-    _make_subagent_jsonl(sa_dir, "metakid", "2026-06-10T10:59:00+00:00")  # far outside 60s window
-    _make_meta_json(sa_dir, "metakid", agent_type="Explore",
-                    description="meta match", tool_use_id="toolu_M")
-    meta_index = langfuse_hook.build_subagent_meta_index([str(sa_dir)])
-    # 6-tuple: (description, type, timestamp, content_index, agent_id_from_result, tool_use_id)
-    tool_uses = [("meta match", "Explore", "2026-06-10T10:00:00+00:00", 0, None, "toolu_M")]
-    matches = langfuse_hook.discover_subagents(str(transcript), tool_uses, meta_index=meta_index)
-    assert len(matches) == 1
-    agent_id, path, desc, sa_type, idx, corr = matches[0]
-    assert agent_id == "metakid"
-    assert corr == "meta"
 
 
 # --- recursive ingest_subagent tests ---
@@ -1019,7 +786,7 @@ def _make_agent_spawning_jsonl(directory, agent_id, child_tool_use_id,
         {"type": "user", "agentId": agent_id, "timestamp": start_ts,
          "message": {"role": "user", "content": "spawn child"}},
         {"type": "assistant", "timestamp": "2026-06-10T10:00:02+00:00",
-         "message": {"id": f"m-{agent_id}", "role": "assistant",
+         "message": {"id": f"m-{agent_id}", "role": "assistant", "stop_reason": "end_turn",
                      "model": "claude-opus-4-8",
                      "content": [{"type": "tool_use", "id": child_tool_use_id,
                                   "name": "Agent",
@@ -1034,7 +801,7 @@ def _make_agent_spawning_jsonl(directory, agent_id, child_tool_use_id,
              {"type": "tool_result", "tool_use_id": child_tool_use_id,
               "content": "done"}]}},
         {"type": "assistant", "timestamp": "2026-06-10T10:00:10+00:00",
-         "message": {"stop_reason": "end_turn", "id": f"m2-{agent_id}", "role": "assistant",
+         "message": {"stop_reason": "end_turn", "id": f"m2-{agent_id}", "role": "assistant", "stop_reason": "end_turn",
                      "model": "claude-opus-4-8",
                      "content": [{"type": "text", "text": "child done"}],
                      "usage": {"input_tokens": 5, "output_tokens": 5,
@@ -1121,7 +888,7 @@ def test_process_session_nested_subagents_tag_and_rollup(tmp_path, monkeypatch):
         {"type": "user", "timestamp": "2026-06-10T10:00:00+00:00",
          "message": {"role": "user", "content": "dispatch"}},
         {"type": "assistant", "timestamp": "2026-06-10T10:00:01+00:00",
-         "message": {"id": "mm1", "role": "assistant", "model": "claude-opus-4-8",
+         "message": {"id": "mm1", "role": "assistant", "stop_reason": "end_turn", "model": "claude-opus-4-8",
                      "content": [{"type": "tool_use", "id": "toolu_P1", "name": "Agent",
                                   "input": {"description": "parent agent",
                                             "subagent_type": "general-purpose",
@@ -1133,7 +900,7 @@ def test_process_session_nested_subagents_tag_and_rollup(tmp_path, monkeypatch):
          "message": {"role": "user", "content": [
              {"type": "tool_result", "tool_use_id": "toolu_P1", "content": "done"}]}},
         {"type": "assistant", "timestamp": "2026-06-10T10:00:21+00:00",
-         "message": {"stop_reason": "end_turn", "id": "mm2", "role": "assistant", "model": "claude-opus-4-8",
+         "message": {"id": "mm2", "role": "assistant", "stop_reason": "end_turn", "model": "claude-opus-4-8",
                      "content": [{"type": "text", "text": "all done"}],
                      "usage": {"input_tokens": 5, "output_tokens": 5,
                                "cache_read_input_tokens": 0,
@@ -1145,10 +912,10 @@ def test_process_session_nested_subagents_tag_and_rollup(tmp_path, monkeypatch):
     langfuse_hook.process_session("sess-nested", str(transcript), "/test")
     trace = [e for e in sent[0] if e["type"] == "trace-create"][0]
     assert "nested-subagents" in trace["body"]["tags"]
-    agents = trace["body"]["metadata"]["subagent_costs"]["agents"]
+    agents = session_rollups(sent[0])["subagent_costs"]["agents"]
     by_id = {a["agent_id"]: a for a in agents}
     assert by_id["c1"]["parent_agent_id"] == "p1"
     assert by_id["c1"]["depth"] == 2
     # No double counting: total = exact sum of per-agent costs
-    total = trace["body"]["metadata"]["subagent_costs"]["total_subagent_cost"]
+    total = session_rollups(sent[0])["subagent_costs"]["total_subagent_cost"]
     assert abs(total - sum(a["total_cost"] for a in agents)) < 1e-9

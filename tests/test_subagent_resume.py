@@ -13,6 +13,8 @@ import importlib.util
 import json
 import os
 
+from helpers import session_rollups
+
 _spec = importlib.util.spec_from_file_location(
     "langfuse_hook", os.path.join(os.path.dirname(__file__), "..", "langfuse-hook.py"))
 hook = importlib.util.module_from_spec(_spec)
@@ -138,9 +140,9 @@ def test_background_agent_work_after_the_parent_turn_is_ingested(tmp_path, monke
     assert state["total_tokens"] == (10 + 100) + (10 + 900)
 
 
-def test_totals_are_not_double_counted_when_a_turn_is_resent(tmp_path, monkeypatch):
-    """The parent re-sends its last turn every fire, which re-reads its
-    subagent. Totals must be the agent's whole cost, not a running sum."""
+def test_totals_are_not_double_counted_across_fires(tmp_path, monkeypatch):
+    """Every fire that sees the agent's transcript grow re-reads all of it.
+    Totals must be the agent's whole cost, not a running sum."""
     s = _Session(tmp_path, monkeypatch)
     s.append(s.parent, _parent_turn(1, 0, agent=True))
     s.append(s.agent, [
@@ -159,8 +161,7 @@ def test_totals_are_not_double_counted_when_a_turn_is_resent(tmp_path, monkeypat
     s.fire()
 
     assert s.state()["total_tokens"] == (10 + 100) * 2
-    trace = next(e["body"] for e in s.batches[-1] if e["type"] == "trace-create")
-    agents = trace["metadata"]["subagent_costs"]["agents"]
+    agents = session_rollups(s.batches[-1])["subagent_costs"]["agents"]
     assert [a["total_tokens"] for a in agents] == [220]
 
 

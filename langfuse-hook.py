@@ -25,7 +25,7 @@ import sys
 import time
 import traceback
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -68,12 +68,9 @@ _SYNTHETIC_PROMPT_RE = re.compile(r"^<[a-z][a-z0-9-]*>")
 # Longer than a worst-case send (15s timeout per 50-event chunk).
 SESSION_LOCK_TIMEOUT_S = 120
 
-SUBAGENT_MATCH_WINDOW_S = 60  # Max seconds between Agent tool_use and subagent start
 MAX_SUBAGENT_DEPTH = 5  # CC 2.1.172: sub-agents can spawn sub-agents up to 5 levels
 
 
-# Pro subscription: $0 marginal cost. Set to True to report equivalent API cost instead.
-REPORT_API_EQUIVALENT_COST = True
 
 
 def log(msg: str) -> None:
@@ -131,6 +128,25 @@ def _post(url: str, data: bytes, headers: dict) -> str:
         return "transient"
     except (URLError, TimeoutError, OSError) as e:
         log(f"Failed to send to Langfuse: {e}")
+        return "transient"
+
+
+def _post_json(method: str, url: str, payload: dict) -> str:
+    """JSON request with the same outcome classification as _post."""
+    req = Request(url, data=json.dumps(payload).encode(), method=method, headers={
+        "Content-Type": "application/json",
+        "Authorization": make_auth_header(),
+    })
+    try:
+        with urlopen(req, timeout=30) as resp:
+            resp.read()
+        return "ok"
+    except HTTPError as e:
+        log(f"[ERROR] Langfuse {method} {url.rsplit('/api/public/', 1)[-1]} failed: "
+            f"HTTP {e.code} {e.reason}")
+        return "permanent" if e.code in PERMANENT_HTTP_STATUSES else "transient"
+    except (URLError, TimeoutError, OSError) as e:
+        log(f"[ERROR] Langfuse {method} failed: {e}")
         return "transient"
 
 
@@ -283,169 +299,6 @@ def build_subagent_meta_index(search_dirs: list) -> dict:
     return index
 
 
-def discover_subagents(
-    transcript_path: str,
-    agent_tool_uses: list,
-    cwd: str = "",
-    meta_index: dict = None,
-) -> list:
-    """Match Agent tool_uses to subagent transcripts by timestamp proximity.
-
-    Args:
-        transcript_path: Path to parent session JSONL (e.g., .../session.jsonl)
-        agent_tool_uses: List of (description, subagent_type, timestamp, content_index)
-            tuples; may carry a 5th element agent_id (from tool_result text) and a
-            6th element tool_use_id (for meta.json correlation).
-        cwd: Session cwd. When the session moved into a worktree mid-run,
-            new subagent transcripts land under a cwd-derived project dir
-            that differs from the parent transcript's project dir. Both
-            locations are searched; agent_ids seen in the primary location
-            win on duplicates.
-        meta_index: Optional {toolUseId: {...}} map from build_subagent_meta_index.
-
-    Returns:
-        List of (agent_id, subagent_transcript_path, description, subagent_type,
-        tool_use_content_index, correlation) where correlation is "meta"
-        (.meta.json toolUseId link), "deterministic" (agentId link from
-        tool_result) or "timestamp" (proximity fallback).
-        Unmatched entries are omitted.
-    """
-    if not agent_tool_uses:
-        return []
-
-    search_dirs = _subagent_search_dirs(transcript_path, cwd)
-    if not search_dirs:
-        return []
-
-    # List candidate subagent JSONL files, excluding aside_question.
-    # Earlier search_dirs win — primary takes precedence over the cwd fallback.
-    candidates = []
-    seen_ids = set()
-    for sdir in search_dirs:
-        for fname in os.listdir(sdir):
-            if not fname.startswith("agent-") or not fname.endswith(".jsonl"):
-                continue
-            if fname.startswith("agent-aside_question-"):
-                continue
-            agent_id = fname[len("agent-"):-len(".jsonl")]
-            if agent_id in seen_ids:
-                continue
-            jsonl_path = os.path.join(sdir, fname)
-
-            # Read first entry timestamp
-            first_ts = None
-            try:
-                with open(jsonl_path) as f:
-                    first_line = f.readline().strip()
-                    if first_line:
-                        entry = json.loads(first_line)
-                        first_ts = parse_ts(entry.get("timestamp", ""))
-            except (IOError, OSError, json.JSONDecodeError):
-                # Can't open file, read it, or parse JSON; skip this subagent
-                continue
-
-            if first_ts is None:
-                continue
-
-            seen_ids.add(agent_id)
-            candidates.append((agent_id, jsonl_path, first_ts))
-
-    if not candidates:
-        return []
-
-    # Sort candidates by start timestamp; index them by agent_id for direct lookup.
-    candidates.sort(key=lambda c: c[2])
-    by_id = {aid: (path, ts) for (aid, path, ts) in candidates}
-
-    # Sort tool_uses by content_index to preserve dispatch order.
-    sorted_tool_uses = sorted(agent_tool_uses, key=lambda t: t[3])
-
-    matched = []
-    used_candidates = set()  # indices into `candidates` consumed by timestamp matching
-    used_ids = set()         # agent_ids consumed by meta/deterministic matching
-    pending_deterministic = []
-    pending_timestamp = []   # tool_uses with no usable link at all
-    meta_index = meta_index or {}
-
-    # Pass 0: .meta.json toolUseId match (exact; the only link that works for
-    # nested agent→agent dispatches, whose tool_results carry no agentId text).
-    for tu in sorted_tool_uses:
-        desc, sa_type, tu_ts_str, content_idx = tu[0], tu[1], tu[2], tu[3]
-        tool_use_id = tu[5] if len(tu) > 5 else None
-        m = meta_index.get(tool_use_id)
-        if m and m["agent_id"] not in used_ids:
-            used_ids.add(m["agent_id"])
-            log(f"Matched subagent {m['agent_id']} via meta.json toolUseId")
-            matched.append((m["agent_id"], m["path"], desc, sa_type, content_idx, "meta"))
-        else:
-            pending_deterministic.append(tu)
-
-    # Pass 1: deterministic agentId match (exact, ignores timestamps).
-    for tu in pending_deterministic:
-        desc, sa_type, tu_ts_str, content_idx = tu[0], tu[1], tu[2], tu[3]
-        agent_id = tu[4] if len(tu) > 4 else None
-        if agent_id and agent_id in by_id and agent_id not in used_ids:
-            path, _ = by_id[agent_id]
-            used_ids.add(agent_id)
-            log(f"Matched subagent {agent_id} deterministically via tool_result agentId")
-            matched.append((agent_id, path, desc, sa_type, content_idx, "deterministic"))
-        else:
-            if agent_id and agent_id not in by_id:
-                log(f"[WARN] tool_result agentId {agent_id} has no matching transcript; "
-                    "falling back to timestamp matching")
-            pending_timestamp.append(tu)
-
-    # Reserve deterministically-claimed candidates so the timestamp pass skips them.
-    for i, (aid, _p, _t) in enumerate(candidates):
-        if aid in used_ids:
-            used_candidates.add(i)
-
-    # Pass 2: timestamp proximity fallback for the remainder.
-    for tu in pending_timestamp:
-        desc, sa_type, tu_ts_str, content_idx = tu[0], tu[1], tu[2], tu[3]
-        tu_ts = parse_ts(tu_ts_str)
-        if tu_ts is None:
-            continue
-
-        best = None
-        best_diff = None
-        for i, (agent_id, jsonl_path, sa_ts) in enumerate(candidates):
-            if i in used_candidates:
-                continue
-            diff = (sa_ts - tu_ts).total_seconds()
-            if diff < -1:  # Allow 1s clock skew
-                continue
-            if abs(diff) > SUBAGENT_MATCH_WINDOW_S:
-                continue
-            if best_diff is None or diff < best_diff:
-                best = i
-                best_diff = diff
-
-        if best is not None:
-            agent_id, jsonl_path, _ = candidates[best]
-            used_candidates.add(best)
-
-            # Log meta.json info for debugging (not required for matching).
-            # meta.json sits alongside the jsonl in whichever subagents dir won.
-            meta_path = os.path.join(os.path.dirname(jsonl_path), f"agent-{agent_id}.meta.json")
-            try:
-                meta = json.loads(Path(meta_path).read_text())
-                meta_desc = meta.get("description", "")
-                meta_type = meta.get("agentType", "")
-                if meta_desc and meta_desc != desc:
-                    log(f"Subagent {agent_id}: meta description '{meta_desc}' != tool_use '{desc}'")
-                log(f"Matched subagent {agent_id} via timestamp (meta: type={meta_type}, desc={meta_desc})")
-            except (IOError, OSError, json.JSONDecodeError):
-                # .meta.json doesn't exist, can't be read, or contains invalid JSON
-                log(f"Matched subagent {agent_id} via timestamp (no .meta.json)")
-
-            matched.append((agent_id, jsonl_path, desc, sa_type, content_idx, "timestamp"))
-
-    # Stable dispatch order regardless of which pass produced each match.
-    matched.sort(key=lambda m: m[4])
-    return matched
-
-
 def _file_size(path: str) -> int | None:
     try:
         return os.path.getsize(path)
@@ -455,7 +308,7 @@ def _file_size(path: str) -> int | None:
 
 # sa_state bookkeeping that is not reported in trace metadata (a path would
 # also leak the local username).
-_SA_STATE_ONLY_KEYS = frozenset({"path", "size", "parent_span_id", "offset", "correlation"})
+_SA_STATE_ONLY_KEYS = frozenset({"path", "size", "parent_span_id", "trace_id", "offset", "correlation"})
 
 
 def _subagent_record(prev: dict, events: list, cost: dict, offset: int,
@@ -485,6 +338,40 @@ def _subagent_record(prev: dict, events: list, cost: dict, offset: int,
     }
 
 
+def _usage_details(turn: dict) -> dict:
+    usage = turn["usage"]
+    return {
+        "input": usage["input"],
+        "output": usage["output"],
+        "total": usage["total"],
+        "cache_read": usage["cache_read"],
+        "cache_create": usage["cache_creation"],
+        "cache_5m": turn.get("cache_ephemeral_5m", 0),
+        "cache_1h": turn.get("cache_ephemeral_1h", 0),
+        # Subset of `output` (billed at the output rate), reported
+        # alongside it the same way cache_5m/cache_1h break down cache_create.
+        "output_thinking": turn.get("thinking_tokens", 0),
+    }
+
+
+def _tool_input(raw):
+    """Redacted tool input; parsed back to JSON when it fits, else a preview."""
+    text = redact_secrets(raw if isinstance(raw, str) else json.dumps(raw))
+    if len(text) > MAX_TOOL_IO:
+        return {"_truncated": True, "preview": text[:MAX_TOOL_IO]}
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return text
+
+
+def _tool_output(raw: str) -> str:
+    text = redact_secrets(raw)
+    if len(text) > MAX_TOOL_IO:
+        text = text[:MAX_TOOL_IO] + "...[truncated]"
+    return text
+
+
 def ingest_subagent(
     agent_id: str,
     transcript_path: str,
@@ -493,23 +380,22 @@ def ingest_subagent(
     session_id: str,
     subagent_offset: int,
     prior_turn_count: int = 0,
-    correlation: str = "timestamp",
     meta_index: dict = None,
     depth: int = 1,
     visited: set = None,
     sa_state: dict = None,
+    final: bool = False,
 ) -> tuple:
-    """Parse a subagent transcript and build Langfuse events.
+    """Parse a subagent transcript and build events for its finished turns.
 
-    Reads the whole transcript every time, like the parent: a background
-    agent is usually mid-turn when a fire reads it, and the lines after a
-    saved offset carry no user prompt to start a turn from, so parsing only
-    the tail dropped them. Generations are sent from the last turn a previous
-    call sent (`prior_turn_count - 1`) onward, and `cost_summary` is the
+    Reads the whole transcript every time: a background agent is usually
+    mid-turn when a fire reads it. Turns are sent once, from
+    `prior_turn_count` up to the last finished one (`complete_turn_count`);
+    an unfinished last turn waits for a later fire. `cost_summary` is the
     agent's *whole* cost — callers replace their totals with it.
 
     Returns nothing new (empty events) when the transcript has not grown
-    since `subagent_offset`.
+    since `subagent_offset` and `final` is not set.
 
     Recurses into nested Agent dispatches (CC 2.1.172+) resolved via
     meta_index, up to MAX_SUBAGENT_DEPTH levels; `visited` guards cycles.
@@ -530,12 +416,13 @@ def ingest_subagent(
     if not read_ok:
         # Preserve the prior offset on read failure so the next fire retries.
         return [], empty_cost, subagent_offset, prior_turn_count, "partial"
-    if not entries or (subagent_offset and total_lines == subagent_offset):
+    if not entries or (subagent_offset and total_lines == subagent_offset and not final):
         return [], empty_cost, total_lines, prior_turn_count, "partial"
 
     turns = build_turns(entries)
     if not turns:
         return [], empty_cost, total_lines, prior_turn_count, "partial"
+    sendable = complete_turn_count(turns, final)
 
     # Complete when the last assistant entry ended its turn. stop_reason lives
     # inside `message`; reading it off the entry itself never matched, so
@@ -547,22 +434,16 @@ def ingest_subagent(
                 status = "complete"
             break
 
-    now = datetime.now(timezone.utc).isoformat()
+    user_id = _user_id()
     events = []
     total_cost = 0.0
     total_tokens = 0
     cost_breakdown = {"input": 0.0, "output": 0.0, "cache_read": 0.0, "cache_creation": 0.0}
 
-    emit_from = max(0, min(prior_turn_count, len(turns)) - 1)
     for turn_idx, turn in enumerate(turns):
-        gen_id = f"gen-subagent-{agent_id}-{turn_idx}"
-        start_time = turn["start_time"]
-        end_time = turn["end_time"]
-        usage = turn["usage"]
         model = turn.get("model") or ""
-
-        turn_cost, input_cost, output_cost, cost_details = calculate_turn_cost(
-            usage,
+        turn_cost, _in, _out, cost_details = calculate_turn_cost(
+            turn["usage"],
             model,
             turn.get("cache_ephemeral_5m", 0),
             turn.get("cache_ephemeral_1h", 0),
@@ -572,150 +453,114 @@ def ingest_subagent(
             turn_start_time=turn.get("start_time", ""),
             long_context_usage=turn.get("usage_long"),
         )
-
         total_cost += turn_cost
-        total_tokens += usage["total"]
+        total_tokens += turn["usage"]["total"]
         if cost_details:
             cost_breakdown["input"] += cost_details.get("input", 0)
             cost_breakdown["output"] += cost_details.get("output", 0)
             cost_breakdown["cache_read"] += cost_details.get("cache_read_input_tokens", 0)
             cost_breakdown["cache_creation"] += cost_details.get("cache_creation_input_tokens", 0)
-        if turn_idx < emit_from:
-            continue  # already sent; counted in the totals only
+        if not prior_turn_count <= turn_idx < sendable:
+            continue  # already sent, or not finished yet; counted in the totals only
 
-        usage_details = {
-            "input": usage["input"], "output": usage["output"], "total": usage["total"],
-            "cache_read": usage["cache_read"],
-            "cache_create": usage["cache_creation"],
-            "cache_5m": turn.get("cache_ephemeral_5m", 0),
-            "cache_1h": turn.get("cache_ephemeral_1h", 0),
-            # Subset of `output` (billed at the output rate), reported
-            # alongside it the same way cache_5m/cache_1h break down cache_create.
-            "output_thinking": turn.get("thinking_tokens", 0),
-        }
-
-        sa_metadata = {
-            "subagent_id": agent_id,
-            "agent_id": agent_id,
-            "subagent_correlation": correlation,
-            "subagent_depth": depth,
-            "tools_used": [tc["name"] for tc in turn["tool_calls"]],
-            "tool_count": len(turn["tool_calls"]),
-            "speed": turn.get("speed", ""),
-            "service_tier": turn.get("service_tier", ""),
-            "inference_geo": turn.get("inference_geo", ""),
-            "request_ids": list(dict.fromkeys(turn.get("request_ids", []))),
-            "web_search_requests": turn.get("web_search_requests", 0),
-            "web_fetch_requests": turn.get("web_fetch_requests", 0),
-            **_otel_genai_attrs(
+        gen_id = f"gen-subagent-{agent_id}-{turn_idx}"
+        start_time = turn["start_time"]
+        events.append({"type": "generation-create", "body": {
+            "id": gen_id,
+            "traceId": trace_id,
+            "parentObservationId": parent_span_id,
+            "sessionId": session_id,
+            "userId": user_id,
+            "name": f"Subagent Turn {turn_idx + 1}: {redact_secrets(truncate(turn['display_prompt'], 80))}",
+            "model": model,
+            "input": redact_secrets(truncate(turn["user_input"], MAX_TEXT)) or None,
+            "output": redact_secrets(truncate(turn["assistant_output"], MAX_TEXT)) or None,
+            "startTime": start_time,
+            "endTime": turn["end_time"],
+            "usageDetails": _usage_details(turn),
+            "costDetails": cost_details if cost_details else None,
+            "metadata": {
+                "subagent_id": agent_id,
+                "agent_id": agent_id,
+                "subagent_depth": depth,
+                "tools_used": [tc["name"] for tc in turn["tool_calls"]],
+                "tool_count": len(turn["tool_calls"]),
+                "speed": turn.get("speed", ""),
+                "service_tier": turn.get("service_tier", ""),
+                "inference_geo": turn.get("inference_geo", ""),
+                "request_ids": list(dict.fromkeys(turn.get("request_ids", []))),
+                "web_search_requests": turn.get("web_search_requests", 0),
+                "web_fetch_requests": turn.get("web_fetch_requests", 0),
+                "cost_usd": round(turn_cost, 6),
+                **gen_metadata_turn_signals(turn),
+            },
+            "attributes": _otel_genai_attrs(
                 session_id=session_id,
                 model=model,
-                usage=usage,
+                usage=turn["usage"],
                 request_ids=turn.get("request_ids", []),
                 stop_reason=turn.get("stop_reason", ""),
             ),
-            **gen_metadata_turn_signals(turn),
-        }
-
-        events.append({
-            "id": f"evt-{gen_id}",
-            "timestamp": start_time or now,
-            "type": "generation-create",
-            "body": {
-                "id": gen_id,
-                "traceId": trace_id,
-                "parentObservationId": parent_span_id,
-                "name": f"Subagent Turn {turn_idx + 1}: {redact_secrets(truncate(turn['display_prompt'], 80))}",
-                "model": model,
-                "input": redact_secrets(truncate(turn["user_input"], MAX_TEXT)) or None,
-                "output": redact_secrets(truncate(turn["assistant_output"], MAX_TEXT)) or None,
-                "startTime": start_time,
-                "endTime": end_time,
-                "usageDetails": usage_details,
-                "costDetails": cost_details if cost_details else None,
-                "metadata": sa_metadata,
-            },
-        })
+        }})
 
         for tc_idx, tc in enumerate(turn["tool_calls"]):
             span_id = f"span-subagent-{agent_id}-{turn_idx}-{tc_idx}"
-            tool_input = tc["input"]
-            tool_input_str = json.dumps(tool_input) if not isinstance(tool_input, str) else tool_input
-            tool_input_str = redact_secrets(tool_input_str)
-            if len(tool_input_str) > MAX_TOOL_IO:
-                tool_input = {"_truncated": True, "preview": tool_input_str[:MAX_TOOL_IO]}
-            else:
-                try:
-                    tool_input = json.loads(tool_input_str)
-                except (json.JSONDecodeError, TypeError):
-                    tool_input = tool_input_str
-            tool_output = redact_secrets(tc["output"])
-            if len(tool_output) > MAX_TOOL_IO:
-                tool_output = tool_output[:MAX_TOOL_IO] + "...[truncated]"
             span_start = tc.get("start_time", start_time)
-            span_end = tc.get("end_time", span_start)
+            events.append({"type": "span-create", "body": {
+                "id": span_id,
+                "traceId": trace_id,
+                "parentObservationId": gen_id,
+                "sessionId": session_id,
+                "userId": user_id,
+                "name": tc["name"],
+                "startTime": span_start,
+                "endTime": tc.get("end_time", span_start),
+                "input": _tool_input(tc["input"]),
+                "output": _tool_output(tc["output"]) or None,
+                "metadata": {"tool_use_id": tc["id"], "subagent_id": agent_id},
+            }})
 
-            events.append({
-                "id": f"evt-{span_id}",
-                "timestamp": span_start or now,
-                "type": "span-create",
-                "body": {
-                    "id": span_id,
-                    "traceId": trace_id,
-                    "parentObservationId": gen_id,
-                    "name": tc["name"],
-                    "startTime": span_start,
-                    "endTime": span_end,
-                    "input": tool_input,
-                    "output": tool_output or None,
-                    "metadata": {"tool_use_id": tc["id"], "subagent_id": agent_id},
-                },
-            })
-
-            if (tc["name"] == "Agent" and depth < MAX_SUBAGENT_DEPTH
-                    and tc["id"] in meta_index):
-                child = meta_index[tc["id"]]
+            child = meta_index.get(tc["id"]) if tc["name"] == "Agent" else None
+            if child and depth < MAX_SUBAGENT_DEPTH and child["agent_id"] not in visited:
                 child_id = child["agent_id"]
-                if child_id not in visited:
-                    child_prev = (sa_state or {}).get(child_id, {})
-                    c_size = _file_size(child["path"])
-                    c_events, c_cost, c_offset, c_tc, c_status = ingest_subagent(
-                        agent_id=child_id,
-                        transcript_path=child["path"],
-                        parent_span_id=span_id,
-                        trace_id=trace_id,
-                        session_id=session_id,
-                        subagent_offset=child_prev.get("offset", 0),
-                        prior_turn_count=child_prev.get("turn_count", 0),
-                        correlation="meta",
-                        meta_index=meta_index,
-                        depth=depth + 1,
-                        visited=visited,
-                        sa_state=sa_state,
+                child_prev = (sa_state or {}).get(child_id, {})
+                c_size = _file_size(child["path"])
+                c_events, c_cost, c_offset, c_tc, c_status = ingest_subagent(
+                    agent_id=child_id,
+                    transcript_path=child["path"],
+                    parent_span_id=span_id,
+                    trace_id=trace_id,
+                    session_id=session_id,
+                    subagent_offset=child_prev.get("offset", 0),
+                    prior_turn_count=child_prev.get("turn_count", 0),
+                    meta_index=meta_index,
+                    depth=depth + 1,
+                    visited=visited,
+                    sa_state=sa_state,
+                    final=final,
+                )
+                events.extend(c_events)
+                # Nested-child cost stays out of this agent's own cost_summary;
+                # the session subagent_costs rollup sums all agents flat.
+                if sa_state is not None:
+                    sa_state[child_id] = _subagent_record(
+                        child_prev, c_events, c_cost, c_offset, c_tc, c_status,
+                        description=child["description"],
+                        subagent_type=child["agent_type"],
+                        path=child["path"], size=c_size,
+                        parent_span_id=span_id, trace_id=trace_id,
+                        depth=depth + 1, parent_agent_id=agent_id,
                     )
-                    events.extend(c_events)
-                    # Nested-child cost stays out of this agent's own cost_summary;
-                    # the trace-level subagent_costs rollup sums all agents flat.
-                    if sa_state is not None:
-                        sa_state[child_id] = _subagent_record(
-                            child_prev, c_events, c_cost, c_offset, c_tc, c_status,
-                            description=child["description"],
-                            subagent_type=child["agent_type"],
-                            path=child["path"], size=c_size,
-                            parent_span_id=span_id, correlation="meta",
-                            depth=depth + 1, parent_agent_id=agent_id,
-                        )
 
-    new_turn_count = len(turns)
     cost_summary = {
         "agent_id": agent_id,
         "total_cost": round(total_cost, 6),
         "total_tokens": total_tokens,
-        "turns": new_turn_count,
+        "turns": len(turns),
         "status": status,
         "cost_breakdown": {k: round(v, 6) for k, v in cost_breakdown.items()},
     }
-    return events, cost_summary, total_lines, new_turn_count, status
+    return events, cost_summary, total_lines, max(prior_turn_count, sendable), status
 
 
 def extract_slug(transcript_path) -> str:
@@ -778,23 +623,6 @@ def extract_worktree_state(transcript_path: str) -> dict | None:
                     "original_head_commit": ws.get("originalHeadCommit", ""),
                 }
     return worktree
-
-
-_AGENT_ID_RE = re.compile(r"agentId:\s*([0-9a-f]+)")
-
-
-def extract_agent_id_from_result(tool_output) -> str | None:
-    """Extract the subagent agentId from an Agent tool_result.
-
-    Both synchronous results ("agentId: <id> (use SendMessage ...)") and
-    asynchronous ("Async agent launched successfully.\\nagentId: <id>") embed
-    the id as a literal `agentId: <hex>` token. Returns the id, or None when
-    the output is empty or carries no agentId.
-    """
-    if not tool_output:
-        return None
-    m = _AGENT_ID_RE.search(tool_output)
-    return m.group(1) if m else None
 
 
 def extract_ai_title(transcript_path: str) -> str:
@@ -1754,6 +1582,7 @@ def extract_api_errors(entries: list[dict]) -> dict:
     by_status: dict[str, int] = {}
     first_error_at = ""
     last_error_at = ""
+    last_error = None
 
     for entry in entries:
         if entry.get("type") != "system" or entry.get("subtype") != "api_error":
@@ -1768,12 +1597,15 @@ def extract_api_errors(entries: list[dict]) -> dict:
         error = entry.get("error", {})
         status = str(error.get("status", "unknown"))
         by_status[status] = by_status.get(status, 0) + 1
+        last_error = {"status": error.get("status"),
+                      "message": redact_secrets(str(error.get("message", "")))[:500]}
 
     return {
         "total_count": total_count,
         "by_status": by_status,
         "first_error_at": first_error_at,
         "last_error_at": last_error_at,
+        "last_error": last_error,
     }
 
 
@@ -2064,9 +1896,6 @@ def calculate_turn_cost(
 
     Returns: (turn_cost, input_cost, output_cost, cost_details)
     """
-    if not REPORT_API_EQUIVALENT_COST:
-        return 0.0, 0.0, 0.0, {}
-
     m = model.lower()
     if not m:
         # No model on the turn. Do NOT fabricate a default — report $0 so the
@@ -2259,22 +2088,6 @@ def calculate_tool_denial_rate(turns: list[dict]) -> float | None:
     if total == 0:
         return None
     return round(denied / total, 4)
-
-
-def detect_compaction(transcript_path: str) -> bool:
-    """Return True if the transcript contains a compaction event.
-
-    Matches: type=="summary" OR (type=="system" AND "compact" in subtype.lower()).
-    Returns False when transcript_path is empty or the file does not exist.
-    """
-    for entry in _entries(transcript_path):
-        etype = entry.get("type", "")
-        subtype = entry.get("subtype") or ""
-        if etype == "summary":
-            return True
-        if etype == "system" and "compact" in subtype.lower():
-            return True
-    return False
 
 
 def _turn_cost_usd(turn: dict, model: str | None = None) -> float:
@@ -2604,58 +2417,42 @@ def build_attribution_tags(summary: dict | None) -> list[str]:
 
 
 def build_hook_score_events(
-    trace_id: str,
     session_id: str,
-    first_user_input: str,
     turns: list[dict],
-    total_cost: float,
-    transcript_path: str = "",
-    last_assistant_message: str = "",
+    session_cost: float,
+    rollups: dict | None = None,
 ) -> list[dict]:
-    """Build score-create events for the ingestion batch.
+    """Build the session-level score-create events.
 
-    Emits up to three NUMERIC scores: cache_hit_rate, tool_error_rate and
-    tool_denial_rate. Each is omitted when its classifier returns None (no cache
-    activity / no executed calls / no attempted calls) so "absent" stays
-    distinct from a genuine 0.0. Unused params are kept for caller
-    compatibility.
+    Scores attach to the session, not to a turn trace, and upsert on a stable
+    id keyed on session + name, so every fire overwrites the previous value.
+
+    - `session_cost_usd`: parent + subagent cost; its metadata carries every
+      session-wide rollup (cost_by_model, subagent_costs, compaction, ...).
+    - `cache_hit_rate`, `tool_error_rate`, `tool_denial_rate`: omitted when
+      their classifier returns None (no cache activity / no executed calls /
+      no attempted calls), so "absent" stays distinct from a genuine 0.0.
     """
-    now = datetime.now(timezone.utc).isoformat()
-
-    cache_hit = compute_cache_hit_rate(turns)
-    tool_err = calculate_tool_error_rate(turns)
-    tool_denial = calculate_tool_denial_rate(turns)
-
-    scores = []
-    if cache_hit is not None:
-        scores.append({"name": "cache_hit_rate", "dataType": "NUMERIC", "value": cache_hit})
-    if tool_err is not None:
-        scores.append({"name": "tool_error_rate", "dataType": "NUMERIC", "value": tool_err})
-    if tool_denial is not None:
-        scores.append({"name": "tool_denial_rate", "dataType": "NUMERIC", "value": tool_denial})
+    scores = [{"name": "session_cost_usd", "value": round(session_cost, 6),
+               "metadata": rollups or {}}]
+    for name, value in (
+        ("cache_hit_rate", compute_cache_hit_rate(turns)),
+        ("tool_error_rate", calculate_tool_error_rate(turns)),
+        ("tool_denial_rate", calculate_tool_denial_rate(turns)),
+    ):
+        if value is not None:
+            scores.append({"name": name, "value": value})
 
     events = []
     for score in scores:
-        # Stable ID keyed only on session+name so each run upserts the same
-        # score rather than accumulating one per turn.
-        score_id = str(uuid.uuid5(
-            uuid.NAMESPACE_URL,
-            f"{session_id}:score:{score['name']}",
-        ))
-        events.append({
-            "id": f"evt-{score_id}",
-            "timestamp": now,
-            "type": "score-create",
-            "body": {
-                "id": f"score-{score_id}",
-                "traceId": trace_id,
-                "name": score["name"],
-                "dataType": score["dataType"],
-                "value": score["value"],
-                "source": "API",
-            },
-        })
-
+        score_id = uuid.uuid5(uuid.NAMESPACE_URL, f"{session_id}:score:{score['name']}")
+        events.append({"type": "score-create", "body": {
+            "id": f"score-{score_id}",
+            "sessionId": session_id,
+            "dataType": "NUMERIC",
+            "source": "API",
+            **score,
+        }})
     return events
 
 
@@ -2772,7 +2569,7 @@ def _session_lock(session_id: str):
         os.close(fd)
 
 
-def process_session(session_id: str, transcript_path: str, cwd: str, last_assistant_message: str = "", live: bool = True, background_tasks: list = None, session_crons: list = None) -> None:
+def process_session(session_id: str, transcript_path: str, cwd: str, last_assistant_message: str = "", final: bool = False, background_tasks: list = None, session_crons: list = None) -> None:
     """Process one session transcript, one fire per session at a time."""
     with _session_lock(session_id) as acquired:
         if not acquired:
@@ -2780,43 +2577,70 @@ def process_session(session_id: str, transcript_path: str, cwd: str, last_assist
                 f"{SESSION_LOCK_TIMEOUT_S}s; skipping — the next fire picks up these lines")
             return
         _process_session_locked(session_id, transcript_path, cwd, last_assistant_message,
-                                live, background_tasks, session_crons)
+                                final, background_tasks, session_crons)
 
 
-def _process_session_locked(session_id: str, transcript_path: str, cwd: str, last_assistant_message: str = "", live: bool = True, background_tasks: list = None, session_crons: list = None) -> None:
-    """Core processing logic for a single session transcript. Caller holds the session lock."""
-    # Session-level effort fallback from the live hook environment
-    # ($CLAUDE_EFFORT, v2.1.133+). Not recoverable on reprocess, so it is
-    # omitted then and Langfuse's upsert preserves any prior value.
-    # CC 2.1.220+ also writes a per-turn `effort` field into the transcript;
-    # where present that is preferred below (it is per-turn, and it survives
-    # --reprocess). This env fallback still covers older transcripts.
-    effort_env = os.environ.get("CLAUDE_EFFORT", "").strip() if live else ""
+# A turn whose last reply ended for one of these reasons is finished. Anything
+# else (tool_use, pause_turn, nothing yet) may still be running.
+TERMINAL_STOP_REASONS = frozenset({"end_turn", "stop_sequence", "max_tokens", "refusal"})
+
+
+def complete_turn_count(turns: list[dict], final: bool) -> int:
+    """How many leading turns are finished and safe to export.
+
+    Langfuse v4 keeps the first export of a span, so a turn is sent once, when
+    it is complete. Every turn but the last is complete: a later turn started
+    after it. The last one is complete when its reply ended for a terminal
+    reason — on a Stop fire the turn that just finished has one. It is held
+    back otherwise: an async fire can read the transcript after a queued
+    prompt has already opened the next turn. `final` (SessionEnd, reprocess of
+    an idle transcript) sends everything.
+    """
+    if not turns:
+        return 0
+    if final or (turns[-1].get("stop_reason") or "") in TERMINAL_STOP_REASONS:
+        return len(turns)
+    return len(turns) - 1
+
+
+def _user_id() -> str:
+    return os.environ.get("USER", "unknown")
+
+
+def _process_session_locked(session_id: str, transcript_path: str, cwd: str, last_assistant_message: str = "", final: bool = False, background_tasks: list = None, session_crons: list = None) -> None:
+    """Export a session's finished turns, one trace per turn.
+
+    Each turn is sent once, as its own trace grouped by `session.id`.
+    Session-wide rollups are recomputed over the whole transcript on every
+    fire and sent as session scores, which upsert by id.
+    """
     prev_line_offset, prev_turn_count = load_state(session_id)
 
-    # One read per fire. Every rollup below is computed over the whole
-    # session, because each fire upserts the same trace: rollups built from
-    # only the new lines overwrote the session's numbers with one turn's worth.
     entries, total_lines, read_ok = parse_transcript(
         transcript_path, warn_after=prev_line_offset)
 
     if not read_ok:
         # Transient read failure (file moved, permission denied, etc.).
         # Do NOT call save_state — that would clobber the existing offset
-        # with 0 and force a full re-ingest (potentially racing with the
-        # async delete pipeline). Bail and retry on the next fire.
+        # with 0 and force a full re-ingest. Bail and retry on the next fire.
         log(f"Skipping state save for {session_id} due to transcript read failure")
         return
 
-    if total_lines == prev_line_offset:
+    if total_lines == prev_line_offset and not final:
         log(f"No new entries for session {session_id} (offset {prev_line_offset}, total {total_lines})")
         return
+
+    turns = build_turns(entries)
+    if not turns:
+        log(f"No turns found in {len(entries)} entries")
+        save_state(session_id, total_lines, 0)
+        return
+    sendable = complete_turn_count(turns, final)
 
     custom_title = extract_custom_title(entries)
     permission_mode = extract_permission_mode(entries)
     permission_timeline = extract_permission_timeline(entries)
     compaction = extract_compaction(entries)
-    compaction_occurred = detect_compaction(entries)
     remote_control = extract_bridge(entries)
     pr_links = extract_pr_links(entries)
     away_summaries = extract_away_summaries(entries)
@@ -2833,23 +2657,9 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
     api_error_messages = extract_api_error_messages(entries)
     interrupts = extract_interrupts(entries)
     queue_operations = extract_queue_operations(entries)
-
-    now = datetime.now(timezone.utc).isoformat()
-    trace_id = f"trace-{session_id}"
-    batch = []
-
     session_meta = extract_session_metadata(entries)
-
-    turns = build_turns(entries)
-    if not turns:
-        log(f"No turns found in {len(entries)} entries")
-        save_state(session_id, total_lines, 0)
-        return
-
-    # Generations are sent from the last turn a previous fire already sent.
-    # Re-sending it (same deterministic ID, so an upsert) is what lets the
-    # turn_duration Claude Code writes *after* the Stop hook reach its turn.
-    emit_from = max(0, min(prev_turn_count, len(turns)) - 1)
+    api_errors = extract_api_errors(entries)
+    has_errors = api_errors["total_count"] > 0
 
     # Price each turn once; every rollup below reads this.
     for t in turns:
@@ -2866,26 +2676,13 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
         )
     session_cost = sum(t["_cost"][0] for t in turns)
 
-    api_errors = extract_api_errors(entries)
-    has_errors = api_errors["total_count"] > 0
-
-    # Derive repo name from cwd
     repo_name = os.path.basename(cwd.rstrip("/")) if cwd else ""
-
-    # Check if any turn used fast inference
+    user_id = _user_id()
     has_fast = any(t.get("speed") == "fast" for t in turns)
     turn_signals = build_turn_signal_summary(turns)
+    # Last turn that carried a per-turn `effort` (transcript field, CC 2.1.220+).
+    effort = next((t["effort"] for t in reversed(turns) if t.get("effort")), "")
 
-    # Session-level effort: last turn in this batch that carried one (CC 2.1.220+
-    # transcript field), else the live $CLAUDE_EFFORT fallback. Transcript wins
-    # because it is per-turn and survives --reprocess, whereas the env var
-    # reflects only the level active at Stop-fire time on a live fire.
-    effort = next(
-        (t["effort"] for t in reversed(turns) if t.get("effort")),
-        effort_env,
-    )
-
-    # Collect unique model families used across all turns
     model_families = set()
     for t in turns:
         m = (t.get("model") or "").lower()
@@ -2897,45 +2694,26 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
             model_families.add("sonnet")
 
     # A turn with billable tokens but no model would otherwise be silently
-    # mispriced (was: defaulted to Opus). Surface it as a filterable trace tag.
+    # mispriced (was: defaulted to Opus). Surface it as a filterable tag.
     has_missing_model = any(
         not (t.get("model") or "") and _has_billable_tokens(t.get("usage") or {})
         for t in turns
     )
 
-    # Aggregate totals for the trace
-    total_tokens = sum(t["usage"]["total"] for t in turns)
-    total_input = sum(t["usage"]["input"] for t in turns)
-    total_output = sum(t["usage"]["output"] for t in turns)
-    total_tool_calls = sum(len(t["tool_calls"]) for t in turns)
     skill_attribution = build_skill_attribution_summary(turns)
     attribution_tags = build_attribution_tags(skill_attribution)
-    subagent_cost_summaries = []
     sa_state = load_subagent_state(session_id)
 
-    first_user_input = turns[0]["user_input"] if turns else ""
-    last_assistant_output = last_assistant_message
-    if not last_assistant_output:
-        for t in reversed(turns):
-            if t["assistant_output"]:
-                last_assistant_output = t["assistant_output"]
-                break
-
-    # For trace naming, skip synthetic stubs (slash commands, local-command
-    # output, system reminders, prompt-submit hooks) which all start with an
-    # XML-like wrapper tag. Real user prompts are plain text. Falls back to
-    # repo/branch when every turn is a stub.
+    # Session title: custom title > ai title > agent name > first real prompt
+    # > repo/branch. Synthetic stubs (slash commands, reminders) start with an
+    # XML-like wrapper tag and are skipped.
     first_real_prompt = ""
     for t in turns:
         ui = (t.get("display_prompt") or "").strip()
         if ui and not _is_synthetic_prompt(ui):
             first_real_prompt = ui
             break
-
-    trace_ts = turns[0].get("start_time") or now
-
-    # Trace name precedence: custom title > ai title > agent name > first prompt > repo/branch
-    trace_name = (
+    session_title = (
         custom_title
         or ai_title
         or agent_name
@@ -2962,120 +2740,84 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
     # sessions can be filtered apart.
     model_tags = sorted({f"model:{t['model']}" for t in turns if t.get("model")})
 
-    # 1. Trace
-    batch.append({
-        "id": f"evt-{uuid.uuid4()}-trace",
-        "timestamp": trace_ts,
-        "type": "trace-create",
-        "body": {
-            "id": trace_id,
-            "timestamp": trace_ts,
-            "name": trace_name,
-            "sessionId": session_id,
-            "userId": os.environ.get("USER", "unknown"),
-            "input": redact_secrets(truncate(first_user_input, MAX_TEXT)) or None,
-            "output": redact_secrets(truncate(last_assistant_output, MAX_TEXT)) or None,
-            "metadata": {
-                "cwd": cwd,
-                "turn_count": len(turns),
-                "tool_calls_total": total_tool_calls,
-                "total_tokens": total_tokens,
-                "total_input_tokens": total_input,
-                "total_output_tokens": total_output,
-                "git_branch": session_meta.get("gitBranch", ""),
-                "cli_version": session_meta.get("version", ""),
-                "entrypoint": session_meta.get("entrypoint", ""),
-                "repo_name": repo_name,
-                "api_errors": api_errors if has_errors else None,
-                "custom_title": custom_title or None,
-                "permission_mode": permission_mode or None,
-                "pr_links": pr_links or None,
-                "away_summaries": away_summaries or None,
-                "agent_name": agent_name or None,
-                "ai_title": ai_title or None,
-                "session_kind": session_kind or None,
-                "attachments": attachments or None,
-                "prompt_provenance": prompt_provenance or None,
-                "tool_denials": tool_denials or None,
-                "local_commands": local_commands or None,
-                "file_snapshots": file_history_stats if file_history_stats["snapshot_count"] > 0 else None,
-                "stop_hook": stop_hook_stats if stop_hook_stats["total_hook_fires"] > 0 else None,
-                "skill_attribution": skill_attribution,
-                "compaction": compaction,
-                "compaction_occurred": compaction_occurred,
-                "session_cost_usd": round(session_cost, 6),
-                "remote_control": remote_control,
-                "permission_timeline": permission_timeline,
-                "total_iterations": sum(t.get("iteration_count", 0) for t in turns),
-                "active_duration": build_active_duration_summary(turns),
-                "stop_reasons": stop_reasons,
-                "cost_by_model": build_model_cost_breakdown(turns),
-                "opus_5_5_savings": build_opus_5_5_savings(turns),
-                "cache_miss": build_cache_miss_summary(turns),
-                "thinking": build_thinking_summary(turns),
-                "turn_signals": turn_signals,
-                "effort_level": effort or None,
-                "worktree": worktree_state,
-                "background_tasks": background_tasks or None,
-                "session_crons": session_crons or None,
-                "api_error_messages": api_error_messages,
-                "interrupts": interrupts,
-                "queue_operations": queue_operations,
-            },
-            "tags": [t for t in [
-                "claude-code",
-                repo_name or None,
-                *sorted(model_families),
-                *model_tags,
-                session_meta.get("entrypoint") or None,
-                "fast" if has_fast else None,
-                "has-errors" if has_errors else None,
-                "has-api-error-messages" if api_error_messages else None,
-                "has-interrupts" if interrupts else None,
-                "model-fallback" if (turn_signals or {}).get("model_fallback_turns") else None,
-                "has-truncated-output" if (turn_signals or {}).get("truncated_turns") else None,
-                "has-queued-prompts" if queue_operations else None,
-                "has-background-tasks" if background_tasks else None,
-                "model-missing" if has_missing_model else None,
-                f"permission:{permission_mode}" if permission_mode else None,
-                f"agent-name:{agent_name}" if agent_name else None,
-                f"session-kind:{session_kind}" if session_kind else None,
-                f"worktree:{worktree_state['name']}" if worktree_state and worktree_state.get("name") else None,
-                f"effort:{effort}" if effort else None,
-                "compacted" if compaction_occurred else None,
-                "remote-control" if remote_control else None,
-                "permission-bypass" if (permission_timeline or {}).get("ever_bypass") else None,
-                *compact_trigger_tags,
-                *stop_reason_tags,
-                *refusal_tags,
-                *attribution_tags,
-                *pr_tags,
-            ] if t],
-        },
-    })
+    # Session state as of this fire, repeated on every turn trace so each one
+    # filters on its own. Tags reflect the session so far.
+    session_tags = [t for t in [
+        "claude-code",
+        repo_name or None,
+        *sorted(model_families),
+        *model_tags,
+        session_meta.get("entrypoint") or None,
+        "fast" if has_fast else None,
+        "has-errors" if has_errors else None,
+        "has-api-error-messages" if api_error_messages else None,
+        "has-interrupts" if interrupts else None,
+        "model-fallback" if (turn_signals or {}).get("model_fallback_turns") else None,
+        "has-truncated-output" if (turn_signals or {}).get("truncated_turns") else None,
+        "has-queued-prompts" if queue_operations else None,
+        "has-background-tasks" if background_tasks else None,
+        "model-missing" if has_missing_model else None,
+        f"permission:{permission_mode}" if permission_mode else None,
+        f"agent-name:{agent_name}" if agent_name else None,
+        f"session-kind:{session_kind}" if session_kind else None,
+        f"worktree:{worktree_state['name']}" if worktree_state and worktree_state.get("name") else None,
+        f"effort:{effort}" if effort else None,
+        "compacted" if compaction else None,
+        "remote-control" if remote_control else None,
+        "permission-bypass" if (permission_timeline or {}).get("ever_bypass") else None,
+        *compact_trigger_tags,
+        *stop_reason_tags,
+        *refusal_tags,
+        *attribution_tags,
+        *pr_tags,
+    ] if t]
+    session_state = {
+        "session_title": session_title,
+        "cwd": cwd,
+        "repo_name": repo_name,
+        "git_branch": session_meta.get("gitBranch", ""),
+        "cli_version": session_meta.get("version", ""),
+        "entrypoint": session_meta.get("entrypoint", ""),
+        "custom_title": custom_title or None,
+        "ai_title": ai_title or None,
+        "agent_name": agent_name or None,
+        "session_kind": session_kind or None,
+        "permission_mode": permission_mode or None,
+        "effort_level": effort or None,
+        "worktree": worktree_state,
+        "remote_control": remote_control,
+    }
 
-    # 2. Generation + spans per turn
-    # Meta index rebuilt on every fire — subagent dirs appear mid-session.
-    sa_search_dirs = _subagent_search_dirs(transcript_path, cwd)
-    sa_meta_index = build_subagent_meta_index(sa_search_dirs)
+    batch = []
+    sa_meta_index = build_subagent_meta_index(_subagent_search_dirs(transcript_path, cwd))
     sa_visited = set()
-    for turn_idx in range(emit_from, len(turns)):
+    for turn_idx in range(min(prev_turn_count, sendable), sendable):
         turn = turns[turn_idx]
-        # Deterministic IDs keyed on the turn's index in the whole transcript,
-        # so a live fire and --reprocess produce the same ID for the same turn.
+        # Keyed on the turn's index in the whole transcript, so a live fire
+        # and a re-ingest after --delete-traces produce the same IDs.
         turn_id = uuid.uuid5(uuid.NAMESPACE_URL, f"{session_id}:turn:{turn_idx}")
+        trace_id = turn_id.hex
         gen_id = f"gen-{turn_id}"
+        prompt = redact_secrets(truncate(turn["display_prompt"], 80))
+
+        batch.append({
+            "type": "trace-create",
+            "body": {
+                "id": trace_id,
+                "name": prompt.strip() or f"Turn {turn_idx + 1}",
+                "sessionId": session_id,
+                "userId": user_id,
+                "tags": session_tags,
+                "metadata": {**session_state, "turn_index": turn_idx + 1},
+            },
+        })
 
         start_time = turn["start_time"]
-        end_time = turn["end_time"]
         first_token_time = turn.get("first_token_time")
-        duration_ms = turn.get("duration_ms")
         usage = turn["usage"]
         model = turn.get("model") or ""
-
         tool_names = [tc["name"] for tc in turn["tool_calls"]]
 
-        # Compute TTFT in ms
         ttft_ms = None
         if first_token_time and start_time:
             st = parse_ts(start_time)
@@ -3083,39 +2825,18 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
             if st and ft and ft > st:
                 ttft_ms = round((ft - st).total_seconds() * 1000)
 
-        # If we have duration_ms from turn_duration, compute a proper endTime
-        if duration_ms and start_time:
-            st = parse_ts(start_time)
-            if st:
-                computed_end = st + timedelta(milliseconds=duration_ms)
-                end_time = computed_end.isoformat()
-
         cost_details = turn["_cost"][3]
-
-        usage_details = {
-            "input": usage["input"],
-            "output": usage["output"],
-            "total": usage["total"],
-            "cache_read": usage["cache_read"],
-            "cache_create": usage["cache_creation"],
-            "cache_5m": turn.get("cache_ephemeral_5m", 0),
-            "cache_1h": turn.get("cache_ephemeral_1h", 0),
-            # Subset of `output` (billed at the output rate), reported
-            # alongside it the same way cache_5m/cache_1h break down cache_create.
-            "output_thinking": turn.get("thinking_tokens", 0),
-        }
-
         gen_body = {
             "id": gen_id,
             "traceId": trace_id,
-            "name": f"Turn {turn_idx + 1}: {redact_secrets(truncate(turn['display_prompt'], 80))}",
+            "name": f"Turn {turn_idx + 1}: {prompt}",
             "model": model,
             "input": redact_secrets(truncate(turn["user_input"], MAX_TEXT)) or None,
             "output": redact_secrets(truncate(turn["assistant_output"], MAX_TEXT)) or None,
             "startTime": start_time,
-            "endTime": end_time,
+            "endTime": turn["end_time"],
             "completionStartTime": first_token_time,
-            "usageDetails": usage_details,
+            "usageDetails": _usage_details(turn),
             "costDetails": cost_details if cost_details else None,
             "metadata": {
                 "tools_used": tool_names,
@@ -3128,266 +2849,219 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
                 "web_search_requests": turn.get("web_search_requests", 0),
                 "web_fetch_requests": turn.get("web_fetch_requests", 0),
                 "iteration_count": turn.get("iteration_count", 0),
-                # OpenTelemetry GenAI semantic-convention aliases. Zero behaviour
-                # change for Langfuse, but lets an OTLP collector (or future
-                # Langfuse mapping) consume the trace without a transform step.
-                # See: opentelemetry.io/docs/specs/semconv/gen-ai/
-                **_otel_genai_attrs(
-                    session_id=session_id,
-                    model=model,
-                    usage=usage,
-                    request_ids=turn.get("request_ids", []),
-                    stop_reason=turn.get("stop_reason", ""),
-                ),
+                "cost_usd": round(turn["_cost"][0], 6),
                 **gen_metadata_attribution(turn),
                 **gen_metadata_turn_signals(turn),
                 **gen_metadata_cache_miss(turn),
             },
+            "attributes": _otel_genai_attrs(
+                session_id=session_id,
+                model=model,
+                usage=usage,
+                request_ids=turn.get("request_ids", []),
+                stop_reason=turn.get("stop_reason", ""),
+            ),
         }
-
         if ttft_ms is not None:
             gen_body["metadata"]["ttft_ms"] = ttft_ms
-        if duration_ms:
-            gen_body["metadata"]["duration_ms"] = duration_ms
+        if turn.get("duration_ms"):
+            gen_body["metadata"]["duration_ms"] = turn["duration_ms"]
+        batch.append({"type": "generation-create", "body": gen_body})
 
-        batch.append({
-            "id": f"evt-{turn_id}-gen",
-            "timestamp": start_time or now,
-            "type": "generation-create",
-            "body": gen_body,
-        })
-
-        # 3. Span per tool call
-        agent_tool_uses_this_turn = []
+        agent_calls = []
         for tc_idx, tc in enumerate(turn["tool_calls"]):
             span_id = f"span-{turn_id}-{tc_idx}"
+            batch.append({"type": "span-create", "body": {
+                "id": span_id,
+                "traceId": trace_id,
+                "parentObservationId": gen_id,
+                "name": tc["name"],
+                "startTime": tc.get("start_time", start_time),
+                "endTime": tc.get("end_time", tc.get("start_time", start_time)),
+                "input": _tool_input(tc["input"]),
+                "output": _tool_output(tc["output"]) or None,
+                "metadata": {"tool_use_id": tc["id"]},
+            }})
+            # Each subagent's .meta.json names the Agent tool_use that spawned it.
+            if tc["name"] == "Agent" and tc["id"] in sa_meta_index:
+                agent_calls.append((tc_idx, sa_meta_index[tc["id"]]))
 
-            tool_input = tc["input"]
-            tool_input_str = json.dumps(tool_input) if not isinstance(tool_input, str) else tool_input
-            tool_input_str = redact_secrets(tool_input_str)
-            if len(tool_input_str) > MAX_TOOL_IO:
-                tool_input = {"_truncated": True, "preview": tool_input_str[:MAX_TOOL_IO]}
-            else:
-                try:
-                    tool_input = json.loads(tool_input_str)
-                except (json.JSONDecodeError, TypeError):
-                    tool_input = tool_input_str
+        for sa_tc_idx, meta in agent_calls:
+            sa_id, sa_path = meta["agent_id"], meta["path"]
+            sa_desc, sa_type = meta["description"], meta["agent_type"]
+            if sa_id in sa_visited:
+                continue
+            sa_parent_span = f"span-{turn_id}-{sa_tc_idx}"
+            prev = sa_state.get(sa_id, {})
+            sa_events, sa_cost, sa_offset, sa_tc, sa_status = ingest_subagent(
+                agent_id=sa_id,
+                transcript_path=sa_path,
+                parent_span_id=sa_parent_span,
+                trace_id=trace_id,
+                session_id=session_id,
+                subagent_offset=prev.get("offset", 0),
+                prior_turn_count=prev.get("turn_count", 0),
+                meta_index=sa_meta_index,
+                visited=sa_visited,
+                sa_state=sa_state,
+                final=final,
+            )
+            batch.extend(sa_events)
+            sa_state[sa_id] = _subagent_record(
+                prev, sa_events, sa_cost, sa_offset, sa_tc, sa_status,
+                description=sa_desc, subagent_type=sa_type,
+                path=sa_path, size=_file_size(sa_path), parent_span_id=sa_parent_span,
+                trace_id=trace_id, depth=1,
+            )
+            for evt in batch:
+                if evt["type"] == "span-create" and evt["body"]["id"] == sa_parent_span:
+                    evt["body"]["metadata"].update({
+                        "subagent_id": sa_id,
+                        "subagent_type": sa_type,
+                        "subagent_description": sa_desc,
+                    })
+                    break
 
-            tool_output = redact_secrets(tc["output"])
-            if len(tool_output) > MAX_TOOL_IO:
-                tool_output = tool_output[:MAX_TOOL_IO] + "...[truncated]"
-
-            span_start = tc.get("start_time", start_time)
-            span_end = tc.get("end_time", span_start)
-
-            batch.append({
-                "id": f"evt-{turn_id}-span-{tc_idx}",
-                "timestamp": span_start or now,
-                "type": "span-create",
-                "body": {
-                    "id": span_id,
-                    "traceId": trace_id,
-                    "parentObservationId": gen_id,
-                    "name": tc["name"],
-                    "startTime": span_start,
-                    "endTime": span_end,
-                    "input": tool_input,
-                    "output": tool_output or None,
-                    "metadata": {
-                        "tool_use_id": tc["id"],
-                    },
-                },
-            })
-
-            # Track Agent tool_uses for subagent correlation
-            if tc["name"] == "Agent":
-                tc_input = tc.get("input", {})
-                if isinstance(tc_input, dict):
-                    agent_tool_uses_this_turn.append((
-                        tc_input.get("description", "unknown"),
-                        tc_input.get("subagent_type", "unknown"),
-                        tc.get("start_time", start_time),
-                        tc_idx,
-                        extract_agent_id_from_result(tc.get("output", "")),
-                        tc["id"],
-                    ))
-
-        # Discover and ingest subagents for this turn
-        if agent_tool_uses_this_turn:
-            matches = discover_subagents(transcript_path, agent_tool_uses_this_turn,
-                                         cwd=cwd, meta_index=sa_meta_index)
-            for sa_id, sa_path, sa_desc, sa_type, sa_tc_idx, sa_corr in matches:
-                sa_prev_offset = sa_state.get(sa_id, {}).get("offset", 0)
-                sa_prior_turns = sa_state.get(sa_id, {}).get("turn_count", 0)
-                sa_parent_span = f"span-{turn_id}-{sa_tc_idx}"
-                sa_size = _file_size(sa_path)
-
-                sa_events, sa_cost, sa_new_offset, sa_new_tc, sa_status = ingest_subagent(
-                    agent_id=sa_id,
-                    transcript_path=sa_path,
-                    parent_span_id=sa_parent_span,
-                    trace_id=trace_id,
-                    session_id=session_id,
-                    subagent_offset=sa_prev_offset,
-                    prior_turn_count=sa_prior_turns,
-                    correlation=sa_corr,
-                    meta_index=sa_meta_index,
-                    visited=sa_visited,
-                    sa_state=sa_state,
-                )
-                batch.extend(sa_events)
-                sa_state[sa_id] = _subagent_record(
-                    sa_state.get(sa_id, {}), sa_events, sa_cost,
-                    sa_new_offset, sa_new_tc, sa_status,
-                    description=sa_desc, subagent_type=sa_type,
-                    path=sa_path, size=sa_size, parent_span_id=sa_parent_span,
-                    correlation=sa_corr, depth=1,
-                )
-
-                # Enrich Agent tool span metadata
-                for evt in batch:
-                    if evt["type"] == "span-create" and evt["body"]["id"] == sa_parent_span:
-                        evt["body"].setdefault("metadata", {}).update({
-                            "subagent_id": sa_id,
-                            "subagent_type": sa_type,
-                            "subagent_description": sa_desc,
-                            "subagent_cost": sa_state[sa_id]["total_cost"],
-                            "subagent_tokens": sa_state[sa_id]["total_tokens"],
-                            "subagent_status": sa_state[sa_id]["status"],
-                        })
-                        break
-
-    # Resume agents whose Agent call is in a turn this fire did not re-send.
-    # A background agent keeps writing after the parent turn that launched it
-    # ends; its recorded parent span lets it be picked up again here.
+    # Agents whose Agent call is in a turn sent by an earlier fire. A background
+    # agent keeps writing after the parent turn that launched it ended; its
+    # recorded trace and parent span let its new turns join that trace.
     for sa_id, prev in list(sa_state.items()):
         if sa_id in sa_visited or not isinstance(prev, dict):
             continue
-        sa_path, sa_parent_span = prev.get("path"), prev.get("parent_span_id")
-        if not sa_path or not sa_parent_span:
-            continue  # recorded before resume support; --reprocess fills it in
-        sa_size = _file_size(sa_path)
-        if sa_size is None or sa_size == prev.get("size"):
+        sa_path, sa_parent_span, sa_trace = prev.get("path"), prev.get("parent_span_id"), prev.get("trace_id")
+        if not (sa_path and sa_parent_span and sa_trace):
             continue
-        sa_events, sa_cost, sa_new_offset, sa_new_tc, sa_status = ingest_subagent(
+        sa_size = _file_size(sa_path)
+        if sa_size is None or (sa_size == prev.get("size") and not final):
+            continue
+        sa_events, sa_cost, sa_offset, sa_tc, sa_status = ingest_subagent(
             agent_id=sa_id,
             transcript_path=sa_path,
             parent_span_id=sa_parent_span,
-            trace_id=trace_id,
+            trace_id=sa_trace,
             session_id=session_id,
             subagent_offset=prev.get("offset", 0),
             prior_turn_count=prev.get("turn_count", 0),
-            correlation=prev.get("correlation", "meta"),
             meta_index=sa_meta_index,
             depth=prev.get("depth", 1),
             visited=sa_visited,
             sa_state=sa_state,
+            final=final,
         )
         batch.extend(sa_events)
         sa_state[sa_id] = _subagent_record(
-            prev, sa_events, sa_cost, sa_new_offset, sa_new_tc, sa_status, size=sa_size)
+            prev, sa_events, sa_cost, sa_offset, sa_tc, sa_status, size=sa_size)
         if sa_events:
             log(f"Resumed background subagent {sa_id}: {len(sa_events)} events")
 
-    # Rebuild subagent_cost_summaries from all known agents (cumulative across
-    # fires). The parent's own cost is session_cost, computed over every turn;
-    # the old sa_state["_parent"] accumulator is ignored and dropped.
-    sa_state.pop("_parent", None)
-    _known_agents = {k: v for k, v in sa_state.items() if isinstance(v, dict)}
-    if _known_agents:
-        subagent_cost_summaries = [
-            {"agent_id": aid,
-             **{k: v for k, v in state.items() if k not in _SA_STATE_ONLY_KEYS}}
-            for aid, state in _known_agents.items()
-        ]
+    agents = {k: v for k, v in sa_state.items() if isinstance(v, dict)}
+    subagent_costs = None
+    if agents:
+        summaries = [{"agent_id": aid, **{k: v for k, v in s.items() if k not in _SA_STATE_ONLY_KEYS}}
+                     for aid, s in agents.items()]
+        total_subagent_cost = sum(s.get("total_cost", 0) for s in summaries)
+        subagent_costs = {
+            "agents": summaries,
+            "total_subagent_cost": round(total_subagent_cost, 6),
+            "parent_cost": round(session_cost, 6),
+            "harness_total_cost": round(session_cost + total_subagent_cost, 6),
+        }
+        # In place: every turn trace in this batch holds this same list.
+        session_tags += ["has-subagents", f"subagents:{len(summaries)}"]
+        if any(s.get("depth", 1) >= 2 for s in summaries):
+            session_tags.append("nested-subagents")
 
-    # Add subagent cost summary to trace
-    if subagent_cost_summaries:
-        total_subagent_cost = sum(s["total_cost"] for s in subagent_cost_summaries)
-        for evt in batch:
-            if evt["type"] == "trace-create":
-                evt["body"]["metadata"]["subagent_costs"] = {
-                    "agents": subagent_cost_summaries,
-                    "total_subagent_cost": round(total_subagent_cost, 6),
-                    "parent_cost": round(session_cost, 6),
-                    "harness_total_cost": round(session_cost + total_subagent_cost, 6),
-                }
-                evt["body"]["tags"].append("has-subagents")
-                evt["body"]["tags"].append(f"subagents:{len(subagent_cost_summaries)}")
-                if any(s.get("depth", 1) >= 2 for s in subagent_cost_summaries):
-                    evt["body"]["tags"].append("nested-subagents")
-                break
-
-    # Hook-level scores (trace-level)
-    score_events = build_hook_score_events(
-        trace_id=trace_id,
+    session_rollups = {
+        **{k: v for k, v in session_state.items()},
+        "turn_count": len(turns),
+        "tool_calls_total": sum(len(t["tool_calls"]) for t in turns),
+        "total_tokens": sum(t["usage"]["total"] for t in turns),
+        "total_input_tokens": sum(t["usage"]["input"] for t in turns),
+        "total_output_tokens": sum(t["usage"]["output"] for t in turns),
+        "session_cost_usd": round(session_cost, 6),
+        "subagent_costs": subagent_costs,
+        "api_errors": api_errors if has_errors else None,
+        "pr_links": pr_links or None,
+        "away_summaries": away_summaries or None,
+        "attachments": attachments or None,
+        "prompt_provenance": prompt_provenance or None,
+        "tool_denials": tool_denials or None,
+        "local_commands": local_commands or None,
+        "file_snapshots": file_history_stats if file_history_stats["snapshot_count"] > 0 else None,
+        "stop_hook": stop_hook_stats if stop_hook_stats["total_hook_fires"] > 0 else None,
+        "skill_attribution": skill_attribution,
+        "compaction": compaction,
+        "permission_timeline": permission_timeline,
+        "total_iterations": sum(t.get("iteration_count", 0) for t in turns),
+        "active_duration": build_active_duration_summary(turns),
+        "stop_reasons": stop_reasons,
+        "cost_by_model": build_model_cost_breakdown(turns),
+        "opus_5_5_savings": build_opus_5_5_savings(turns),
+        "cache_miss": build_cache_miss_summary(turns),
+        "thinking": build_thinking_summary(turns),
+        "turn_signals": turn_signals,
+        "background_tasks": background_tasks or None,
+        "session_crons": session_crons or None,
+        "api_error_messages": api_error_messages,
+        "interrupts": interrupts,
+        "queue_operations": queue_operations,
+        "tags": session_tags,
+    }
+    batch.extend(build_hook_score_events(
         session_id=session_id,
-        first_user_input=first_user_input,
         turns=turns,
-        total_cost=session_cost,
-        transcript_path=transcript_path,
-        last_assistant_message=last_assistant_message,
-    )
-    batch.extend(score_events)
+        session_cost=session_cost + (subagent_costs or {}).get("total_subagent_cost", 0),
+        rollups={k: v for k, v in session_rollups.items() if v is not None},
+    ))
 
-    # A null metadata value is not "unknown": Langfuse merges trace metadata
-    # key by key, so a null erases what an earlier fire wrote. Omit instead.
-    for evt in batch:
-        if evt["type"] == "trace-create":
-            body = evt["body"]
-            body["metadata"] = {k: v for k, v in body["metadata"].items() if v is not None}
-            evt["body"] = {k: v for k, v in body.items() if v is not None}
-            break
-
-    new_turn_count = len(turns)
-    emitted = turns[emit_from:]
-    tool_span_count = sum(len(t["tool_calls"]) for t in emitted)
+    sent_turns = sendable - min(prev_turn_count, sendable)
     summary = (
-        f"{len(batch)} events for session {session_id}: "
-        f"{len(emitted)} turns, {tool_span_count} tool spans, "
-        f"{sum(t['usage']['total'] for t in emitted)} tokens "
-        f"(lines {prev_line_offset+1}-{total_lines})"
+        f"session {session_id}: {sent_turns} turn trace(s), "
+        f"{sum(1 for e in batch if e['type'] == 'span-create')} spans "
+        f"(lines {prev_line_offset + 1}-{total_lines}"
+        f"{', last turn held until complete' if sendable < len(turns) else ''})"
     )
     if send_to_langfuse(batch):
-        save_state(session_id, total_lines, new_turn_count)
+        save_state(session_id, total_lines, max(prev_turn_count, sendable))
         save_subagent_state(session_id, sa_state)
         log(f"Sent {summary}")
     else:
         log(f"[WARN] Send failed — {summary}; state not advanced, will retry next fire")
 
 
-def delete_trace(trace_id: str) -> bool:
-    """Delete a trace and all its observations. True when it is gone.
+def delete_traces(trace_ids: list[str]) -> bool:
+    """Delete traces and all their observations. True when the call succeeded.
 
-    Langfuse deletes asynchronously: the call returns before the cascade
-    finishes, which is why reprocess_all never calls this (a late cascade
-    would wipe freshly ingested observations). A 404 means already gone.
+    Langfuse deletes asynchronously (typically within 15 minutes) and does
+    not confirm, so wait before re-ingesting: a cascade arriving after the
+    new inserts would wipe them. Sent in groups of 30, the documented limit.
     """
-    url = f"{LANGFUSE_HOST}/api/public/traces/{trace_id}"
-    req = Request(
-        url,
-        headers={"Authorization": make_auth_header()},
-        method="DELETE",
-    )
-    try:
-        with urlopen(req, timeout=15):
-            return True
-    except HTTPError as e:
-        if e.code == 404:
-            return True
-        log(f"[ERROR] Failed to delete {trace_id}: HTTP {e.code} {e.reason}")
-    except (URLError, TimeoutError, OSError) as e:
-        log(f"[ERROR] Failed to delete {trace_id}: {e}")
-    return False
+    for i in range(0, len(trace_ids), 30):
+        result = _post_json("DELETE", f"{LANGFUSE_HOST}/api/public/traces",
+                            {"traceIds": trace_ids[i:i + 30]})
+        if result != "ok":
+            return False
+    return True
+
+
+def session_trace_ids(session_id: str, transcript_path: str) -> list[str]:
+    """Every trace this hook can have written for a session.
+
+    One per turn (current layout), plus the single `trace-<session>` trace
+    written before the move to one trace per turn.
+    """
+    entries, _, _ = parse_transcript(transcript_path)
+    ids = [uuid.uuid5(uuid.NAMESPACE_URL, f"{session_id}:turn:{i}").hex
+           for i in range(len(build_turns(entries)))]
+    return ids + [f"trace-{session_id}"]
 
 
 def delete_all_traces() -> int:
-    """Delete the trace of every local session and reset its hook state.
+    """Delete the traces of every local session and reset its hook state.
 
-    For migrations that renumber turns (generation IDs are keyed on the turn
-    index): without this, --reprocess writes new generations beside the old
-    ones. State is reset too, so the next live fire re-sends the whole
-    session instead of only its new lines. Returns the number of failures.
+    Langfuse v4 keeps every export of a span, so re-ingesting a session
+    without deleting it first doubles its cost. State is reset too, so the
+    next fire re-sends the whole session. Returns the number of failures.
 
     Run --reprocess only after Langfuse has finished the deletes.
     """
@@ -3398,21 +3072,30 @@ def delete_all_traces() -> int:
     failures = 0
     for idx, transcript in enumerate(transcripts, 1):
         session_id = sanitize_id(transcript.stem)
-        ok = delete_trace(f"trace-{session_id}")
+        ok = delete_traces(session_trace_ids(session_id, str(transcript)))
         failures += not ok
         for suffix in (".offset", ".subagents.json"):
             state_file = Path(STATE_DIR) / f"{session_id}{suffix}"
             if state_file.exists():
                 state_file.unlink()
-        print(f"[{idx}/{len(transcripts)}] {'deleted' if ok else 'FAILED '} trace-{session_id}")
+        print(f"[{idx}/{len(transcripts)}] {'deleted' if ok else 'FAILED '} {session_id}")
     print(f"\nDone: {len(transcripts) - failures} deleted, {failures} failed. "
           "Langfuse deletes asynchronously — wait until the traces are gone "
           "from the UI before running --reprocess.")
     return failures
 
 
+# A transcript untouched this long belongs to a session that has ended, so
+# --reprocess sends its last turn even when that turn never finished.
+REPROCESS_IDLE_S = 3600
+
+
 def reprocess_all() -> None:
-    """Find all transcript files and reprocess them from scratch."""
+    """Re-send every local transcript from scratch.
+
+    Run --delete-traces first and wait for Langfuse to finish: v4 keeps every
+    export of a span, so re-sending a session that is still there doubles it.
+    """
     if not LANGFUSE_PUBLIC_KEY or not LANGFUSE_SECRET_KEY:
         print("Error: LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY must be set")
         return
@@ -3432,25 +3115,19 @@ def reprocess_all() -> None:
         slug = extract_slug(str(transcript)) or extract_custom_title(str(transcript))
         cwd = extract_cwd(str(transcript))
 
-        # Reset state so process_session rebuilds the full turn list. We do NOT
-        # call delete_trace here: Langfuse processes deletes asynchronously and
-        # a cascade-delete arriving AFTER the new inserts wipes a subset of the
-        # freshly ingested observations. Re-ingestion with deterministic
-        # UUID5 event/observation IDs upserts existing rows cleanly.
-        state_file = Path(STATE_DIR) / f"{session_id}.offset"
-        if state_file.exists():
-            state_file.unlink()
-        sa_state_file = Path(STATE_DIR) / f"{session_id}.subagents.json"
-        if sa_state_file.exists():
-            sa_state_file.unlink()
+        for suffix in (".offset", ".subagents.json"):
+            state_file = Path(STATE_DIR) / f"{session_id}{suffix}"
+            if state_file.exists():
+                state_file.unlink()
 
         label = f"{session_id}"
         if slug:
             label += f" ({slug})"
         print(f"[{idx}/{total}] {label}")
 
+        idle = time.time() - transcript.stat().st_mtime > REPROCESS_IDLE_S
         try:
-            process_session(session_id, str(transcript), cwd, live=False)
+            process_session(session_id, str(transcript), cwd, final=idle)
         except Exception as e:
             # One bad transcript must not abort every session after it.
             print(f"  Error: {type(e).__name__}: {e}")
@@ -3488,7 +3165,12 @@ def main() -> None:
 
 
 def run_stop_hook(hook_input: dict) -> None:
-    """Handle one Stop event payload. Exceptions propagate to main()."""
+    """Handle one Stop / StopFailure / SessionEnd payload.
+
+    All three run the same export. StopFailure covers a turn that ended in an
+    API error (Stop does not fire for it); SessionEnd is the last chance to
+    send a final turn that never finished. Exceptions propagate to main().
+    """
     if not LANGFUSE_PUBLIC_KEY or not LANGFUSE_SECRET_KEY:
         log("LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY must be set")
         return
@@ -3506,6 +3188,7 @@ def run_stop_hook(hook_input: dict) -> None:
         return
 
     process_session(session_id, transcript_path, cwd, last_assistant_message,
+                    final=hook_input.get("hook_event_name") == "SessionEnd",
                     background_tasks=hook_input.get("background_tasks"),
                     session_crons=hook_input.get("session_crons"))
 

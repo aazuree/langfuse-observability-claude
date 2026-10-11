@@ -2,6 +2,7 @@
 """Comprehensive tests for langfuse-hook.py core functions."""
 import importlib.util
 import json
+import uuid
 import os
 import tempfile
 import unittest.mock as mock
@@ -21,6 +22,7 @@ _spec.loader.exec_module(hook)
 import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import langfuse_common
+from helpers import session_rollups
 
 
 # ---------------------------------------------------------------------------
@@ -300,7 +302,7 @@ class TestParseTranscript:
         f = tmp_path / "test.jsonl"
         entries = [
             {"type": "user", "message": {"role": "user", "content": "hello"}},
-            {"type": "assistant", "message": {"role": "assistant", "content": "hi"}},
+            {"type": "assistant", "message": {"role": "assistant", "stop_reason": "end_turn", "content": "hi"}},
         ]
         f.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
         result, total, read_ok = hook.parse_transcript(str(f))
@@ -1235,12 +1237,6 @@ class TestCalculateTurnCost:
         cost, inp_cost, out_cost, details = hook.calculate_turn_cost(usage, "claude-sonnet-4-6")
         assert cost == 0.0
 
-    def test_cost_disabled(self, monkeypatch):
-        monkeypatch.setattr(hook, "REPORT_API_EQUIVALENT_COST", False)
-        usage = self._usage(inp=1000, out=1000)
-        cost, inp_cost, out_cost, details = hook.calculate_turn_cost(usage, "claude-sonnet-4-6")
-        assert cost == 0.0
-        assert details == {}
 
     def test_unknown_model_returns_zero_and_warns(self, monkeypatch):
         warnings = []
@@ -1495,7 +1491,7 @@ class TestBuildTurns:
                 "timestamp": "2026-03-29T10:00:02+00:00",
                 "message": {
                     "id": "msg-1",
-                    "role": "assistant",
+                    "role": "assistant", "stop_reason": "end_turn",
                     "model": "claude-sonnet-4-6",
                     "content": [{"type": "text", "text": "The answer is 4."}],
                     "usage": {"input_tokens": 100, "output_tokens": 50,
@@ -1533,7 +1529,7 @@ class TestBuildTurns:
                 "timestamp": "2026-03-29T10:00:01+00:00",
                 "message": {
                     "id": "msg-1",
-                    "role": "assistant",
+                    "role": "assistant", "stop_reason": "end_turn",
                     "model": "claude-sonnet-4-6",
                     "content": [
                         {"type": "text", "text": "I'll list the files."},
@@ -1573,7 +1569,7 @@ class TestBuildTurns:
                 "type": "assistant",
                 "timestamp": "2026-03-29T10:00:01+00:00",
                 "message": {
-                    "id": "msg-1", "role": "assistant", "model": "claude-sonnet-4-6",
+                    "id": "msg-1", "role": "assistant", "stop_reason": "end_turn", "model": "claude-sonnet-4-6",
                     "content": [{"type": "text", "text": "First answer"}],
                     "usage": {"input_tokens": 10, "output_tokens": 10,
                               "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
@@ -1588,7 +1584,7 @@ class TestBuildTurns:
                 "type": "assistant",
                 "timestamp": "2026-03-29T10:00:06+00:00",
                 "message": {
-                    "id": "msg-2", "role": "assistant", "model": "claude-sonnet-4-6",
+                    "id": "msg-2", "role": "assistant", "stop_reason": "end_turn", "model": "claude-sonnet-4-6",
                     "content": [{"type": "text", "text": "Second answer"}],
                     "usage": {"input_tokens": 20, "output_tokens": 20,
                               "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
@@ -1613,7 +1609,7 @@ class TestBuildTurns:
                 "timestamp": "2026-03-29T10:00:01+00:00",
                 "message": {
                     "id": "msg-stream",
-                    "role": "assistant",
+                    "role": "assistant", "stop_reason": "end_turn",
                     "model": "claude-sonnet-4-6",
                     "content": [{"type": "text", "text": "H"}],
                     "usage": {"input_tokens": 10, "output_tokens": 5,
@@ -1625,7 +1621,7 @@ class TestBuildTurns:
                 "timestamp": "2026-03-29T10:00:02+00:00",
                 "message": {
                     "id": "msg-stream",
-                    "role": "assistant",
+                    "role": "assistant", "stop_reason": "end_turn",
                     "model": "claude-sonnet-4-6",
                     "content": [{"type": "text", "text": "Hello there!"}],
                     "usage": {"input_tokens": 10, "output_tokens": 5,
@@ -1653,7 +1649,7 @@ class TestBuildTurns:
                 "type": "assistant",
                 "timestamp": "2026-03-29T10:00:01+00:00",
                 "message": {
-                    "id": "msg-1", "role": "assistant", "model": "claude-sonnet-4-6",
+                    "id": "msg-1", "role": "assistant", "stop_reason": "end_turn", "model": "claude-sonnet-4-6",
                     "content": [{"type": "text", "text": "Hi"}],
                     "usage": {"input_tokens": 10, "output_tokens": 5,
                               "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
@@ -1663,7 +1659,7 @@ class TestBuildTurns:
                 "type": "assistant",
                 "timestamp": "2026-03-29T10:00:02+00:00",
                 "message": {
-                    "id": "msg-2", "role": "assistant", "model": "<synthetic>",
+                    "id": "msg-2", "role": "assistant", "stop_reason": "end_turn", "model": "<synthetic>",
                     "content": [{"type": "text", "text": "Synthetic"}],
                     "usage": {},
                 },
@@ -1688,7 +1684,7 @@ class TestBuildTurns:
                 "type": "assistant",
                 "timestamp": "2026-03-29T10:00:01+00:00",
                 "message": {
-                    "id": "msg-1", "role": "assistant", "model": "claude-sonnet-4-6",
+                    "id": "msg-1", "role": "assistant", "stop_reason": "end_turn", "model": "claude-sonnet-4-6",
                     "content": [{"type": "text", "text": "Hi"}],
                     "usage": {"input_tokens": 100, "output_tokens": 50,
                               "cache_read_input_tokens": 5000, "cache_creation_input_tokens": 200},
@@ -1710,7 +1706,7 @@ class TestBuildTurns:
                 "type": "assistant",
                 "timestamp": "2026-03-29T10:00:05+00:00",
                 "message": {
-                    "id": "msg-1", "role": "assistant", "model": "claude-sonnet-4-6",
+                    "id": "msg-1", "role": "assistant", "stop_reason": "end_turn", "model": "claude-sonnet-4-6",
                     "content": [{"type": "text", "text": "Hi"}],
                     "usage": {"input_tokens": 10, "output_tokens": 5,
                               "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
@@ -1737,7 +1733,7 @@ class TestBuildTurns:
                 "type": "assistant",
                 "timestamp": "2026-03-29T10:00:01+00:00",
                 "message": {
-                    "id": "msg-1", "role": "assistant", "model": "claude-sonnet-4-6",
+                    "id": "msg-1", "role": "assistant", "stop_reason": "end_turn", "model": "claude-sonnet-4-6",
                     "content": [
                         {"type": "tool_use", "id": "t1", "name": "Bash",
                          "input": {"command": "bad_cmd"}},
@@ -1843,7 +1839,7 @@ class TestBuildTurnsNewFields:
             "timestamp": "2026-03-29T10:00:01+00:00",
             "message": {
                 "id": "msg-1",
-                "role": "assistant",
+                "role": "assistant", "stop_reason": "end_turn",
                 "model": "claude-sonnet-4-6",
                 "content": [{"type": "text", "text": "Answer"}],
                 "usage": assistant_usage,
@@ -1901,7 +1897,7 @@ class TestBuildTurnsNewFields:
                 "timestamp": "2026-03-29T10:00:01+00:00",
                 "message": {
                     "id": "msg-1",
-                    "role": "assistant",
+                    "role": "assistant", "stop_reason": "end_turn",
                     "model": "claude-sonnet-4-6",
                     "content": [{"type": "text", "text": "Answer 1"}],
                     "usage": {
@@ -1916,7 +1912,7 @@ class TestBuildTurnsNewFields:
                 "timestamp": "2026-03-29T10:00:02+00:00",
                 "message": {
                     "id": "msg-2",
-                    "role": "assistant",
+                    "role": "assistant", "stop_reason": "end_turn",
                     "model": "claude-sonnet-4-6",
                     "content": [{"type": "text", "text": "Answer 2"}],
                     "usage": {
@@ -1943,7 +1939,7 @@ class TestBuildTurnsNewFields:
                 "timestamp": "2026-03-29T10:00:01+00:00",
                 "message": {
                     "id": "msg-1",
-                    "role": "assistant",
+                    "role": "assistant", "stop_reason": "end_turn",
                     "model": "claude-sonnet-4-6",
                     "content": [{"type": "text", "text": "Answer 1"}],
                     "usage": {
@@ -1958,7 +1954,7 @@ class TestBuildTurnsNewFields:
                 "timestamp": "2026-03-29T10:00:02+00:00",
                 "message": {
                     "id": "msg-2",
-                    "role": "assistant",
+                    "role": "assistant", "stop_reason": "end_turn",
                     "model": "claude-sonnet-4-6",
                     "content": [{"type": "text", "text": "Answer 2"}],
                     "usage": {
@@ -1986,7 +1982,7 @@ class TestBuildTurnsNewFields:
                 "requestId": "req-aaa",
                 "message": {
                     "id": "msg-1",
-                    "role": "assistant",
+                    "role": "assistant", "stop_reason": "end_turn",
                     "model": "claude-sonnet-4-6",
                     "content": [{"type": "text", "text": "Answer 1"}],
                     "usage": {"input_tokens": 10, "output_tokens": 5},
@@ -1998,7 +1994,7 @@ class TestBuildTurnsNewFields:
                 "requestId": "req-bbb",
                 "message": {
                     "id": "msg-2",
-                    "role": "assistant",
+                    "role": "assistant", "stop_reason": "end_turn",
                     "model": "claude-sonnet-4-6",
                     "content": [{"type": "text", "text": "Answer 2"}],
                     "usage": {"input_tokens": 10, "output_tokens": 5},
@@ -2025,7 +2021,7 @@ class TestBuildTurnsNewFields:
                 "timestamp": "2026-03-29T10:00:01+00:00",
                 "message": {
                     "id": "msg-1",
-                    "role": "assistant",
+                    "role": "assistant", "stop_reason": "end_turn",
                     "model": "claude-sonnet-4-6",
                     "content": [{"type": "text", "text": "Answer 1"}],
                     "usage": {
@@ -2042,7 +2038,7 @@ class TestBuildTurnsNewFields:
                 "timestamp": "2026-03-29T10:00:02+00:00",
                 "message": {
                     "id": "msg-2",
-                    "role": "assistant",
+                    "role": "assistant", "stop_reason": "end_turn",
                     "model": "claude-sonnet-4-6",
                     "content": [{"type": "text", "text": "Answer 2"}],
                     "usage": {
@@ -2130,7 +2126,7 @@ class TestProcessSession:
                 "type": "assistant", "uuid": "a1",
                 "timestamp": "2026-03-29T10:00:02+00:00",
                 "message": {
-                    "id": "msg-1", "role": "assistant", "model": "claude-sonnet-4-6",
+                    "id": "msg-1", "role": "assistant", "stop_reason": "end_turn", "model": "claude-sonnet-4-6",
                     "content": [{"type": "text", "text": "I've fixed the login bug."}],
                     "usage": {"input_tokens": 100, "output_tokens": 50,
                               "cache_read_input_tokens": 5000, "cache_creation_input_tokens": 200},
@@ -2143,19 +2139,23 @@ class TestProcessSession:
         assert len(sent_batches) == 1
         batch = sent_batches[0]
 
-        # Should have: 1 trace + 1 generation + 1 score (cache_hit_rate only, no tool calls)
+        # 1 turn trace + 1 generation + 2 session scores (session_cost_usd, cache_hit_rate)
         trace_events = [e for e in batch if e["type"] == "trace-create"]
         gen_events = [e for e in batch if e["type"] == "generation-create"]
         score_events = [e for e in batch if e["type"] == "score-create"]
         assert len(trace_events) == 1
         assert len(gen_events) == 1
-        assert len(score_events) == 1
+        assert len(score_events) == 2
 
-        # Trace metadata
+        # One trace per turn, keyed on the turn's index, grouped by session.
         trace = trace_events[0]["body"]
-        assert trace["id"] == "trace-test-session"
+        assert trace["id"] == uuid.uuid5(uuid.NAMESPACE_URL, "test-session:turn:0").hex
+        assert trace["sessionId"] == "test-session"
+        assert trace["name"] == "Fix the login bug"
         assert "claude-code" in trace["tags"]
-        assert trace["metadata"]["turn_count"] == 1
+        assert trace["metadata"]["turn_index"] == 1
+        assert gen_events[0]["body"]["traceId"] == trace["id"]
+        assert session_rollups(batch)["turn_count"] == 1
 
         # Score: only cache_hit_rate (cache activity present, no tool calls)
         score_by_name = {e["body"]["name"]: e["body"] for e in score_events}
@@ -2177,7 +2177,7 @@ class TestProcessSession:
             {
                 "type": "assistant", "timestamp": "2026-03-29T10:00:01+00:00",
                 "message": {
-                    "id": "msg-1", "role": "assistant", "model": "claude-sonnet-4-6",
+                    "id": "msg-1", "role": "assistant", "stop_reason": "end_turn", "model": "claude-sonnet-4-6",
                     "content": [{"type": "text", "text": "Hi"}],
                     "usage": {"input_tokens": 10, "output_tokens": 5,
                               "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
@@ -2213,7 +2213,7 @@ class TestProcessSession:
             {
                 "type": "assistant", "timestamp": "2026-03-29T10:00:01+00:00",
                 "message": {
-                    "id": "msg-1", "role": "assistant", "model": "claude-sonnet-4-6",
+                    "id": "msg-1", "role": "assistant", "stop_reason": "end_turn", "model": "claude-sonnet-4-6",
                     "content": [{"type": "text", "text": "First answer"}],
                     "usage": {"input_tokens": 10, "output_tokens": 5,
                               "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
@@ -2233,7 +2233,7 @@ class TestProcessSession:
             {
                 "type": "assistant", "timestamp": "2026-03-29T10:01:01+00:00",
                 "message": {
-                    "id": "msg-2", "role": "assistant", "model": "claude-sonnet-4-6",
+                    "id": "msg-2", "role": "assistant", "stop_reason": "end_turn", "model": "claude-sonnet-4-6",
                     "content": [{"type": "text", "text": "Second answer"}],
                     "usage": {"input_tokens": 20, "output_tokens": 10,
                               "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
@@ -2275,7 +2275,7 @@ class TestProcessSession:
                  "message": {"role": "user", "content": user_text}},
                 {"type": "assistant", "timestamp": f"{ts_base}:01+00:00",
                  "message": {
-                     "id": msg_id, "role": "assistant", "model": "claude-sonnet-4-6",
+                     "id": msg_id, "role": "assistant", "stop_reason": "end_turn", "model": "claude-sonnet-4-6",
                      "content": [{"type": "text", "text": assistant_text}],
                      "usage": {"input_tokens": 10, "output_tokens": 5,
                                "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
@@ -2329,7 +2329,7 @@ class TestProcessSession:
             {
                 "type": "assistant", "timestamp": "2026-03-29T10:00:01+00:00",
                 "message": {
-                    "id": "msg-1", "role": "assistant", "model": "claude-sonnet-4-6",
+                    "id": "msg-1", "role": "assistant", "stop_reason": "end_turn", "model": "claude-sonnet-4-6",
                     "content": [
                         {"type": "text", "text": "I'll list the files."},
                         {"type": "tool_use", "id": "t1", "name": "Bash",
@@ -2374,7 +2374,7 @@ class TestProcessSession:
             {
                 "type": "assistant", "timestamp": "2026-03-29T10:00:01+00:00",
                 "message": {
-                    "id": "msg-1", "role": "assistant", "model": "claude-sonnet-4-6",
+                    "id": "msg-1", "role": "assistant", "stop_reason": "end_turn", "model": "claude-sonnet-4-6",
                     "content": [{"type": "text", "text": "Found the key."}],
                     "usage": {"input_tokens": 10, "output_tokens": 5,
                               "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
@@ -2404,7 +2404,7 @@ class TestProcessSession:
             {
                 "type": "assistant", "timestamp": "2026-03-29T10:00:01+00:00",
                 "message": {
-                    "id": "msg-1", "role": "assistant", "model": "claude-opus-4-6",
+                    "id": "msg-1", "role": "assistant", "stop_reason": "end_turn", "model": "claude-opus-4-6",
                     "content": [{"type": "text", "text": "Hi"}],
                     "usage": {"input_tokens": 10, "output_tokens": 5,
                               "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0},
@@ -2427,7 +2427,7 @@ class TestProcessSession:
             {"type": "user", "timestamp": "2026-03-29T10:00:00+00:00",
              "message": {"role": "user", "content": "go"}},
             {"type": "assistant", "timestamp": "2026-03-29T10:00:01+00:00",
-             "message": {"id": "m1", "role": "assistant", "model": "claude-opus-4-8",
+             "message": {"id": "m1", "role": "assistant", "stop_reason": "end_turn", "model": "claude-opus-4-8",
                          "content": [{"type": "text", "text": "ok"}],
                          "usage": {"input_tokens": 5, "output_tokens": 5,
                                    "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}},
@@ -2437,8 +2437,8 @@ class TestProcessSession:
                              background_tasks=[{"id": "t1"}], session_crons=[{"id": "c1"}])
         trace = [e for e in sent[0] if e["type"] == "trace-create"][0]
         assert "has-background-tasks" in trace["body"]["tags"]
-        assert trace["body"]["metadata"]["background_tasks"] == [{"id": "t1"}]
-        assert trace["body"]["metadata"]["session_crons"] == [{"id": "c1"}]
+        assert session_rollups(sent[0])["background_tasks"] == [{"id": "t1"}]
+        assert session_rollups(sent[0])["session_crons"] == [{"id": "c1"}]
 
     def test_worktree_metadata_and_tag(self, tmp_path, monkeypatch):
         state_dir = tmp_path / "state"
@@ -2454,7 +2454,7 @@ class TestProcessSession:
             {"type": "user", "timestamp": "2026-03-29T10:00:00+00:00",
              "message": {"role": "user", "content": "go"}},
             {"type": "assistant", "timestamp": "2026-03-29T10:00:01+00:00",
-             "message": {"id": "m1", "role": "assistant", "model": "claude-opus-4-8",
+             "message": {"id": "m1", "role": "assistant", "stop_reason": "end_turn", "model": "claude-opus-4-8",
                          "content": [{"type": "text", "text": "ok"}],
                          "usage": {"input_tokens": 5, "output_tokens": 5,
                                    "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}},
@@ -2477,7 +2477,7 @@ class TestProcessSession:
              "message": {"role": "user", "content": "Hello"}},
             {"type": "assistant", "timestamp": "2026-03-29T10:00:01+00:00",
              "message": {  # NOTE: no "model" key, but real usage -> billable
-                 "id": "msg-1", "role": "assistant",
+                 "id": "msg-1", "role": "assistant", "stop_reason": "end_turn",
                  "content": [{"type": "text", "text": "Hi"}],
                  "usage": {"input_tokens": 1000, "output_tokens": 500,
                            "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}},
@@ -2501,7 +2501,7 @@ class TestProcessSession:
             {"type": "user", "timestamp": "2026-03-29T10:00:00+00:00",
              "message": {"role": "user", "content": "Hello"}},
             {"type": "assistant", "timestamp": "2026-03-29T10:00:01+00:00",
-             "message": {"id": "msg-1", "role": "assistant", "model": "claude-opus-4-6",
+             "message": {"id": "msg-1", "role": "assistant", "stop_reason": "end_turn", "model": "claude-opus-4-6",
                          "content": [{"type": "text", "text": "Hi"}],
                          "usage": {"input_tokens": 10, "output_tokens": 5,
                                    "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}},
@@ -2523,7 +2523,7 @@ class TestProcessSession:
              "message": {"role": "user", "content": "Hello"}},
             {"type": "assistant", "timestamp": "2026-03-29T10:00:01+00:00",
              "message": {  # no model, zero usage -> not billable -> no tag
-                 "id": "msg-1", "role": "assistant",
+                 "id": "msg-1", "role": "assistant", "stop_reason": "end_turn",
                  "content": [{"type": "text", "text": "Hi"}],
                  "usage": {"input_tokens": 0, "output_tokens": 0,
                            "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0}}},
@@ -2549,9 +2549,9 @@ class TestMain:
 
 class TestReprocessAll:
     def test_does_not_call_delete_trace(self, tmp_path, monkeypatch):
-        """delete_trace races with the new ingestion batch because Langfuse
-        processes deletes asynchronously. Reprocessing must rely on
-        deterministic UUID5 IDs to upsert in place instead."""
+        """Deleting is a separate step (--delete-traces): Langfuse deletes
+        asynchronously, so a delete issued right before the re-send would
+        cascade over the freshly ingested spans."""
         # Fake a single transcript under ~/.claude/projects/
         projects = tmp_path / "claude" / "projects" / "fake-proj"
         projects.mkdir(parents=True)
@@ -2565,13 +2565,13 @@ class TestReprocessAll:
         monkeypatch.setattr(hook, "STATE_DIR", str(tmp_path / "state"))
 
         delete_calls = []
-        monkeypatch.setattr(hook, "delete_trace", lambda tid: delete_calls.append(tid))
+        monkeypatch.setattr(hook, "delete_traces", lambda ids: delete_calls.append(ids))
         monkeypatch.setattr(hook, "process_session", lambda *a, **kw: None)
 
         hook.reprocess_all()
 
         assert delete_calls == [], (
-            "reprocess_all must not call delete_trace — the async cascade-delete "
+            "reprocess_all must not delete — the async cascade-delete "
             "drops observations from the new ingest batch (see bug context)"
         )
 
@@ -2656,7 +2656,7 @@ class TestProcessSessionNewFields:
                 "timestamp": "2026-03-29T10:00:01+00:00",
                 "message": {
                     "id": "msg-1",
-                    "role": "assistant",
+                    "role": "assistant", "stop_reason": "end_turn",
                     "model": "claude-sonnet-4-6",
                     "content": [{"type": "text", "text": "Answer"}],
                     "usage": {
@@ -2715,7 +2715,7 @@ class TestProcessSessionNewFields:
                 "timestamp": "2026-03-29T10:00:01+00:00",
                 "message": {
                     "id": "msg-1",
-                    "role": "assistant",
+                    "role": "assistant", "stop_reason": "end_turn",
                     "model": "claude-sonnet-4-6",
                     "content": [{"type": "text", "text": "Answer"}],
                     "usage": {
@@ -2747,7 +2747,7 @@ class TestExtractApiErrors:
     def test_no_errors(self):
         entries = [
             {"type": "user", "message": {"role": "user", "content": "hello"}},
-            {"type": "assistant", "message": {"role": "assistant", "content": "hi"}},
+            {"type": "assistant", "message": {"role": "assistant", "stop_reason": "end_turn", "content": "hi"}},
         ]
         result = hook.extract_api_errors(entries)
         assert result["total_count"] == 0
@@ -2848,7 +2848,7 @@ class TestExtractApiErrorMessages:
         e = {
             "type": "assistant", "timestamp": ts,
             "isApiErrorMessage": True, "apiErrorStatus": status, "error": error,
-            "message": {"id": "msg-err", "role": "assistant", "model": "<synthetic>",
+            "message": {"id": "msg-err", "role": "assistant", "stop_reason": "end_turn", "model": "<synthetic>",
                         "content": [{"type": "text", "text": "err"}],
                         "usage": {"input_tokens": 0, "output_tokens": 0}},
         }
@@ -2857,7 +2857,7 @@ class TestExtractApiErrorMessages:
 
     def test_none_when_no_error_messages(self, tmp_path):
         entries = [{"type": "assistant", "timestamp": "2026-03-29T10:00:00+00:00",
-                    "message": {"id": "m", "role": "assistant", "model": "claude-sonnet-4-6",
+                    "message": {"id": "m", "role": "assistant", "stop_reason": "end_turn", "model": "claude-sonnet-4-6",
                                 "content": [{"type": "text", "text": "hi"}], "usage": {}}}]
         assert hook.extract_api_error_messages(self._write(tmp_path, entries)) is None
 
@@ -2889,7 +2889,7 @@ class TestExtractApiErrorMessages:
     def test_ignores_normal_assistant_entries(self, tmp_path):
         entries = [
             {"type": "assistant", "timestamp": "2026-03-29T10:00:00+00:00",
-             "message": {"id": "m", "role": "assistant", "model": "claude-sonnet-4-6",
+             "message": {"id": "m", "role": "assistant", "stop_reason": "end_turn", "model": "claude-sonnet-4-6",
                          "content": [{"type": "text", "text": "real"}], "usage": {}}},
             self._err(429, "rate_limit", "2026-03-29T10:00:05+00:00"),
         ]
@@ -2942,7 +2942,7 @@ class TestProcessSessionApiErrors:
                 "timestamp": "2026-03-29T10:00:02+00:00",
                 "message": {
                     "id": "msg-1",
-                    "role": "assistant",
+                    "role": "assistant", "stop_reason": "end_turn",
                     "model": "claude-sonnet-4-6",
                     "content": [{"type": "text", "text": "Answer"}],
                     "usage": {"input_tokens": 10, "output_tokens": 5},
@@ -2959,7 +2959,7 @@ class TestProcessSessionApiErrors:
         assert len(trace_events) == 1
 
         trace_body = trace_events[0]["body"]
-        metadata = trace_body["metadata"]
+        metadata = session_rollups(batch)
         tags = trace_body["tags"]
 
         assert "api_errors" in metadata
@@ -2988,7 +2988,7 @@ class TestProcessSessionApiErrors:
                 "timestamp": "2026-03-29T10:00:01+00:00",
                 "message": {
                     "id": "msg-1",
-                    "role": "assistant",
+                    "role": "assistant", "stop_reason": "end_turn",
                     "model": "claude-sonnet-4-6",
                     "content": [{"type": "text", "text": "Answer"}],
                     "usage": {"input_tokens": 10, "output_tokens": 5},
@@ -3019,12 +3019,12 @@ class TestProcessSessionApiErrors:
             {"type": "user", "timestamp": "2026-03-29T10:00:00+00:00",
              "message": {"role": "user", "content": "Hello"}},
             {"type": "assistant", "timestamp": "2026-03-29T10:00:01+00:00",
-             "message": {"id": "msg-1", "role": "assistant", "model": "claude-sonnet-4-6",
+             "message": {"id": "msg-1", "role": "assistant", "stop_reason": "end_turn", "model": "claude-sonnet-4-6",
                          "content": [{"type": "text", "text": "Answer"}],
                          "usage": {"input_tokens": 10, "output_tokens": 5}}},
             {"type": "assistant", "timestamp": "2026-03-29T10:00:02+00:00",
              "isApiErrorMessage": True, "apiErrorStatus": 429, "error": "rate_limit",
-             "message": {"id": "msg-err", "role": "assistant", "model": "<synthetic>",
+             "message": {"id": "msg-err", "role": "assistant", "stop_reason": "end_turn", "model": "<synthetic>",
                          "content": [{"type": "text", "text": "You've hit your session limit"}],
                          "usage": {"input_tokens": 0, "output_tokens": 0}}},
         ]
@@ -3033,11 +3033,12 @@ class TestProcessSessionApiErrors:
 
         batch = sent_batches[0]
         trace = [e for e in batch if e["type"] == "trace-create"][0]["body"]
-        assert trace["metadata"]["api_error_messages"]["count"] == 1
-        assert trace["metadata"]["api_error_messages"]["by_status"] == {"429": 1}
+        assert session_rollups(batch)["api_error_messages"]["count"] == 1
+        assert session_rollups(batch)["api_error_messages"]["by_status"] == {"429": 1}
         assert "has-api-error-messages" in trace["tags"]
-        # P1 integration: the error stub must NOT become the trace output.
-        assert trace["output"] == "Answer"
+        # P1 integration: the error stub must NOT become the turn's output.
+        gen = [e for e in batch if e["type"] == "generation-create"][0]["body"]
+        assert gen["output"] == "Answer"
 
 
 # ---------------------------------------------------------------------------
@@ -3052,7 +3053,7 @@ class TestSubagentNewFields:
             {"type": "assistant", "timestamp": "2026-04-03T10:00:02+00:00",
              "requestId": "req_sub001",
              "message": {
-                 "id": "msg-s1", "role": "assistant", "model": "claude-sonnet-4-6",
+                 "id": "msg-s1", "role": "assistant", "stop_reason": "end_turn", "model": "claude-sonnet-4-6",
                  "content": [{"type": "text", "text": "Found it."}],
                  "usage": {
                      "input_tokens": 50, "output_tokens": 20,
@@ -3197,6 +3198,7 @@ class TestTraceNamePrecedence:
         captured = []
         monkeypatch.setattr(hook, "send_to_langfuse", lambda b: captured.extend(b) or True)
         hook.process_session("test-session-001", path, cwd)
+        self.batch = captured
         return next((e for e in captured if e.get("type") == "trace-create"), None)
 
     def _base_entries(self):
@@ -3213,7 +3215,7 @@ class TestTraceNamePrecedence:
             {
                 "type": "assistant",
                 "message": {
-                    "role": "assistant",
+                    "role": "assistant", "stop_reason": "end_turn",
                     "content": "I can help with that.",
                     "model": "claude-sonnet-4-6",
                     "usage": {"input_tokens": 10, "output_tokens": 5},
@@ -3227,7 +3229,8 @@ class TestTraceNamePrecedence:
             {"type": "agent-name", "agentName": "my-stable-task-name"},
         ]
         evt = self._get_trace_event(tmp_path, monkeypatch, entries, cwd="/repo")
-        assert evt["body"]["name"] == "my-stable-task-name"
+        assert evt["body"]["metadata"]["session_title"] == "my-stable-task-name"
+        assert evt["body"]["name"] == "hello world prompt"
 
     def test_custom_title_beats_agent_name(self, tmp_path, monkeypatch):
         entries = self._base_entries() + [
@@ -3235,7 +3238,7 @@ class TestTraceNamePrecedence:
             {"type": "agent-name", "agentName": "auto-generated-name"},
         ]
         evt = self._get_trace_event(tmp_path, monkeypatch, entries, cwd="/repo")
-        assert evt["body"]["name"] == "user-set-title"
+        assert evt["body"]["metadata"]["session_title"] == "user-set-title"
 
     def test_first_prompt_when_no_agent_name(self, tmp_path, monkeypatch):
         entries = self._base_entries()
@@ -3258,7 +3261,7 @@ class TestTraceNamePrecedence:
             {
                 "type": "assistant",
                 "message": {
-                    "role": "assistant",
+                    "role": "assistant", "stop_reason": "end_turn",
                     "content": "Done.",
                     "model": "claude-sonnet-4-6",
                     "usage": {"input_tokens": 10, "output_tokens": 5},
@@ -3267,7 +3270,7 @@ class TestTraceNamePrecedence:
             },
         ]
         evt = self._get_trace_event(tmp_path, monkeypatch, entries, cwd="/home/user/myrepo")
-        assert evt["body"]["name"] == "myrepo/feat/improve-search"
+        assert evt["body"]["metadata"]["session_title"] == "myrepo/feat/improve-search"
 
     def test_agent_name_tag_added_when_present(self, tmp_path, monkeypatch):
         entries = self._base_entries() + [
@@ -3289,8 +3292,8 @@ class TestTraceNamePrecedence:
                 "isSnapshotUpdate": False,
             },
         ]
-        evt = self._get_trace_event(tmp_path, monkeypatch, entries, cwd="/repo")
-        fs = evt["body"]["metadata"]["file_snapshots"]
+        self._get_trace_event(tmp_path, monkeypatch, entries, cwd="/repo")
+        fs = session_rollups(self.batch)["file_snapshots"]
         assert fs is not None
         assert fs["snapshot_count"] == 1
         assert fs["tracked_files_count"] == 1
@@ -3305,79 +3308,8 @@ class TestTraceNamePrecedence:
 # detect_compaction
 # ---------------------------------------------------------------------------
 
-class TestDetectCompaction:
-    def _write_transcript(self, entries, tmp_path):
-        p = tmp_path / "session.jsonl"
-        p.write_text("\n".join(json.dumps(e) for e in entries))
-        return str(p)
-
-    def test_no_compaction(self, tmp_path):
-        entries = [{"type": "user", "message": {"role": "user", "content": "hi"}}]
-        path = self._write_transcript(entries, tmp_path)
-        assert hook.detect_compaction(path) is False
-
-    def test_compact_subtype(self, tmp_path):
-        entries = [{"type": "system", "subtype": "compact"}]
-        path = self._write_transcript(entries, tmp_path)
-        assert hook.detect_compaction(path) is True
-
-    def test_compaction_subtype(self, tmp_path):
-        entries = [{"type": "system", "subtype": "compaction"}]
-        path = self._write_transcript(entries, tmp_path)
-        assert hook.detect_compaction(path) is True
-
-    def test_summary_type(self, tmp_path):
-        entries = [{"type": "summary", "summary": "..."}]
-        path = self._write_transcript(entries, tmp_path)
-        assert hook.detect_compaction(path) is True
-
-    def test_missing_file(self):
-        assert hook.detect_compaction("/nonexistent/path.jsonl") is False
-
-    def test_empty_path_returns_false(self):
-        assert hook.detect_compaction("") is False
 
 
-class TestBuildHookScoreEventsNewScores:
-    def _turns(self, tool_names_per_turn):
-        return [
-            {"tool_calls": [{"name": n} for n in names],
-             "usage": {"input": 0, "output": 0, "total": 0, "cache_read": 0, "cache_creation": 0}}
-            for names in tool_names_per_turn
-        ]
-
-    def test_tool_error_rate_score_present(self, tmp_path):
-        transcript = tmp_path / "s.jsonl"
-        transcript.write_text("")
-        turns = self._turns([["Bash", "Read"]])
-        # No cache activity, but tool calls present → only tool_error_rate
-        events = hook.build_hook_score_events("t1", "s1", "fix bug", turns, 0.05, str(transcript))
-        names = {e["body"]["name"] for e in events}
-        assert "tool_error_rate" in names
-        assert "tool_diversity" not in names
-        assert "compaction_occurred" not in names
-
-    def test_tool_error_rate_not_emitted_when_no_tool_calls(self, tmp_path):
-        transcript = tmp_path / "s.jsonl"
-        transcript.write_text(json.dumps({"type": "system", "subtype": "compact"}))
-        turns = [{"tool_calls": [], "usage": {"input": 0, "output": 0, "total": 0, "cache_read": 0, "cache_creation": 0}}]
-        # No cache activity, no tool calls → zero events
-        events = hook.build_hook_score_events("t1", "s1", "fix bug", turns, 0.05, str(transcript))
-        names = {e["body"]["name"] for e in events}
-        assert "compaction_occurred" not in names
-        assert "tool_error_rate" not in names
-        assert events == []
-
-    def test_tool_error_rate_zero_for_clean_tools(self, tmp_path):
-        transcript = tmp_path / "s.jsonl"
-        transcript.write_text("")
-        turns = self._turns([["Bash"]])
-        # Tool calls present, all clean → tool_error_rate = 0.0 (not None)
-        # _turns helper builds tool_calls without "output" key; output defaults to ""
-        # which does not start with "[ERROR]", so error rate is 0.0
-        events = hook.build_hook_score_events("t1", "s1", "hi", turns, 0.0, str(transcript))
-        ter_event = next(e for e in events if e["body"]["name"] == "tool_error_rate")
-        assert ter_event["body"]["value"] == 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -3400,7 +3332,7 @@ class TestAttributionThreading:
                 "attributionPlugin": plugin,
                 "message": {
                     "id": "msg-1",
-                    "role": "assistant",
+                    "role": "assistant", "stop_reason": "end_turn",
                     "model": "claude-sonnet-4-6",
                     "content": [{"type": "text", "text": "ok"}],
                     "usage": {"input_tokens": 10, "output_tokens": 5,
@@ -3426,7 +3358,7 @@ class TestAttributionThreading:
                 "type": "assistant",
                 "timestamp": "2026-05-21T10:00:01+00:00",
                 "message": {
-                    "id": "msg-1", "role": "assistant",
+                    "id": "msg-1", "role": "assistant", "stop_reason": "end_turn",
                     "model": "claude-sonnet-4-6",
                     "content": [{"type": "text", "text": "hello"}],
                     "usage": {"input_tokens": 1, "output_tokens": 1,
@@ -3454,7 +3386,7 @@ class TestAttributionThreading:
                 "type": "assistant",
                 "timestamp": f"2026-08-01T10:00:0{i + 1}+00:00",
                 "message": {
-                    "id": f"msg-{i}", "role": "assistant",
+                    "id": f"msg-{i}", "role": "assistant", "stop_reason": "end_turn",
                     "model": "claude-opus-5",
                     "content": [{"type": "text", "text": "ok"}],
                     "usage": {"input_tokens": 1, "output_tokens": 1,
@@ -3508,7 +3440,7 @@ class TestAttributionThreading:
                 "attributionSkill": "superpowers:brainstorming",
                 "attributionPlugin": "superpowers",
                 "message": {
-                    "id": "msg-1", "role": "assistant",
+                    "id": "msg-1", "role": "assistant", "stop_reason": "end_turn",
                     "model": "claude-sonnet-4-6",
                     "content": [{"type": "text", "text": "thinking..."}],
                     "usage": {"input_tokens": 5, "output_tokens": 5,
@@ -3522,7 +3454,7 @@ class TestAttributionThreading:
                 "attributionSkill": "superpowers:writing-plans",
                 "attributionPlugin": "superpowers",
                 "message": {
-                    "id": "msg-2", "role": "assistant",
+                    "id": "msg-2", "role": "assistant", "stop_reason": "end_turn",
                     "model": "claude-sonnet-4-6",
                     "content": [{"type": "text", "text": "plan."}],
                     "usage": {"input_tokens": 5, "output_tokens": 5,
@@ -3699,7 +3631,7 @@ def test_build_turns_sums_iteration_count():
         {"type": "user", "timestamp": "2026-05-25T10:00:00Z",
          "message": {"role": "user", "content": "hi"}},
         {"type": "assistant", "timestamp": "2026-05-25T10:00:01Z",
-         "message": {"role": "assistant", "id": "m1",
+         "message": {"role": "assistant", "stop_reason": "end_turn", "id": "m1",
                      "model": "claude-opus-4-7",
                      "content": [{"type": "text", "text": "hello"}],
                      "usage": {"input_tokens": 1, "output_tokens": 2,
@@ -3715,7 +3647,7 @@ def test_build_turns_iteration_count_defaults_zero():
         {"type": "user", "timestamp": "2026-05-25T10:00:00Z",
          "message": {"role": "user", "content": "hi"}},
         {"type": "assistant", "timestamp": "2026-05-25T10:00:01Z",
-         "message": {"role": "assistant", "id": "m1",
+         "message": {"role": "assistant", "stop_reason": "end_turn", "id": "m1",
                      "model": "claude-opus-4-7",
                      "content": [{"type": "text", "text": "hello"}],
                      "usage": {"input_tokens": 1, "output_tokens": 2}}},
@@ -3748,9 +3680,8 @@ def test_process_session_trace_metadata_has_compaction_and_iterations(tmp_path, 
 
     hook.process_session("sess", str(transcript), "/x/repo")
 
-    trace = next(e for e in captured["batch"] if e["type"] == "trace-create")
-    meta = trace["body"]["metadata"]
-    assert meta["compaction_occurred"] is False
+    meta = session_rollups(captured["batch"])
+    assert "compaction" not in meta  # never compacted: omitted, not null
     assert meta["total_iterations"] == 2
 
     gen = next(e for e in captured["batch"] if e["type"] == "generation-create")
@@ -3769,7 +3700,7 @@ class TestCacheMissExtraction:
                 "type": "assistant",
                 "timestamp": "2026-05-29T10:00:01+00:00",
                 "message": {
-                    "id": "msg-1", "role": "assistant",
+                    "id": "msg-1", "role": "assistant", "stop_reason": "end_turn",
                     "model": "claude-opus-4-6",
                     "content": [{"type": "text", "text": "ok"}],
                     "usage": {"input_tokens": 1, "output_tokens": 1,
@@ -3784,7 +3715,7 @@ class TestCacheMissExtraction:
                 "type": "assistant",
                 "timestamp": "2026-05-29T10:00:02+00:00",
                 "message": {
-                    "id": "msg-2", "role": "assistant",
+                    "id": "msg-2", "role": "assistant", "stop_reason": "end_turn",
                     "model": "claude-opus-4-6",
                     "content": [{"type": "text", "text": "more"}],
                     "usage": {"input_tokens": 1, "output_tokens": 1,
@@ -3868,20 +3799,27 @@ class TestCacheMissSummary:
 
 
 class TestEffortCapture:
-    def _capture_trace(self, monkeypatch, tmp_path, *, live, effort):
+    """Effort comes from the per-turn transcript field (CC 2.1.220+). The
+    $CLAUDE_EFFORT env fallback is gone: every transcript still on disk
+    carries the field, and the env var only ever described live fires."""
+
+    def _capture_trace(self, monkeypatch, tmp_path, *, effort):
         import json as _json
         transcript = tmp_path / "sess.jsonl"
+        assistant = {"type": "assistant", "timestamp": "2026-05-29T10:00:01+00:00",
+                     "message": {"id": "m1", "role": "assistant", "stop_reason": "end_turn",
+                                 "model": "claude-opus-4-6",
+                                 "content": [{"type": "text", "text": "ok"}],
+                                 "usage": {"input_tokens": 1, "output_tokens": 1,
+                                           "cache_read_input_tokens": 0,
+                                           "cache_creation_input_tokens": 0}}}
+        if effort:
+            assistant["effort"] = effort
         rows = [
             {"type": "user", "timestamp": "2026-05-29T10:00:00+00:00",
              "cwd": str(tmp_path), "version": "2.1.156", "gitBranch": "main",
              "entrypoint": "cli", "message": {"role": "user", "content": "Hi"}},
-            {"type": "assistant", "timestamp": "2026-05-29T10:00:01+00:00",
-             "message": {"id": "m1", "role": "assistant", "model": "claude-opus-4-6",
-                         "stop_reason": "end_turn",
-                         "content": [{"type": "text", "text": "ok"}],
-                         "usage": {"input_tokens": 1, "output_tokens": 1,
-                                   "cache_read_input_tokens": 0,
-                                   "cache_creation_input_tokens": 0}}},
+            assistant,
         ]
         transcript.write_text("\n".join(_json.dumps(r) for r in rows) + "\n")
 
@@ -3891,25 +3829,17 @@ class TestEffortCapture:
             return True
         monkeypatch.setattr(hook, "send_to_langfuse", fake_send)
         monkeypatch.setattr(hook, "STATE_DIR", str(tmp_path / "state"))
-        if effort is None:
-            monkeypatch.delenv("CLAUDE_EFFORT", raising=False)
-        else:
-            monkeypatch.setenv("CLAUDE_EFFORT", effort)
-        hook.process_session("s1", str(transcript), str(tmp_path), live=live)
+        monkeypatch.setenv("CLAUDE_EFFORT", "max")  # must be ignored
+        hook.process_session("s1", str(transcript), str(tmp_path))
         return next(e["body"] for e in captured["batch"] if e["type"] == "trace-create")
 
-    def test_effort_tag_and_metadata_when_live(self, monkeypatch, tmp_path):
-        trace = self._capture_trace(monkeypatch, tmp_path, live=True, effort="high")
+    def test_effort_tag_and_metadata_from_the_transcript(self, monkeypatch, tmp_path):
+        trace = self._capture_trace(monkeypatch, tmp_path, effort="high")
         assert "effort:high" in trace["tags"]
         assert trace["metadata"]["effort_level"] == "high"
 
-    def test_no_effort_when_env_absent(self, monkeypatch, tmp_path):
-        trace = self._capture_trace(monkeypatch, tmp_path, live=True, effort=None)
-        assert not any(t.startswith("effort:") for t in trace["tags"])
-        assert trace["metadata"].get("effort_level") is None
-
-    def test_no_effort_on_reprocess(self, monkeypatch, tmp_path):
-        trace = self._capture_trace(monkeypatch, tmp_path, live=False, effort="high")
+    def test_env_var_is_not_a_fallback(self, monkeypatch, tmp_path):
+        trace = self._capture_trace(monkeypatch, tmp_path, effort=None)
         assert not any(t.startswith("effort:") for t in trace["tags"])
         assert trace["metadata"].get("effort_level") is None
 
