@@ -77,6 +77,8 @@ def calls(monkeypatch):
             if fragment in req.full_url:
                 if outcome == "network":
                     raise URLError("connection refused")
+                if outcome == "timeout":
+                    raise TimeoutError("The read operation timed out")
                 raise _http_error(req, outcome)
         return _Resp()
 
@@ -126,6 +128,15 @@ def test_a_fixable_or_transient_export_failure_is_retried(calls, code):
 def test_a_network_error_is_retried(calls):
     calls["fail"]["/otel/"] = "network"
     assert hook.send_to_langfuse(_batch()) is False
+
+
+def test_a_timeout_is_retried_and_flagged_as_a_possible_duplicate(calls):
+    """Langfuse may have stored the export before the answer timed out, and
+    v4 keeps both copies when the retry lands. No fix exists client-side;
+    the log line makes the duplicate traceable."""
+    calls["fail"]["/otel/"] = "timeout"
+    assert hook.send_to_langfuse(_batch()) is False
+    assert any("[WARN]" in m and "duplicate" in m for m in calls["log"])
 
 
 def test_scores_are_not_sent_when_the_export_will_be_retried(calls):

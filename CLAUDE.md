@@ -51,7 +51,7 @@ python3 langfuse-hook.py --reprocess
 
 - **Dashboard**: http://localhost:3100
 - **Hook log**: `~/.claude/langfuse-hook.log` (auto-rotates at 10 MB)
-- **State files**: `~/.claude/langfuse-state/<session_id>.offset` (parent: line offset + number of turns sent), `<session_id>.subagents.json` (subagents), `<session_id>.lock` (per-session `flock`: fires of one session run one at a time, waiting up to `SESSION_LOCK_TIMEOUT_S = 120`; needed because the hook runs `"async": true`)
+- **State files**: `~/.claude/langfuse-state/<session_id>.offset` (parent: line offset + number of turns sent), `<session_id>.subagents.json` (subagents), `<session_id>.lock` (per-session `flock`: fires of one session run one at a time, waiting up to `SESSION_LOCK_TIMEOUT_S = 180`; needed because the hook runs `"async": true`)
 
 ### Reading the send result
 

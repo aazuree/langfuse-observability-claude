@@ -7,8 +7,9 @@ spliced into source code.
     HOOK_CMD=... python3 tools/configure_hooks.py ~/.claude/settings.json
 
 - Registers the same command on Stop, StopFailure and SessionEnd. Stop sends
-  each finished turn; StopFailure covers a turn that ended in an API error
-  (Stop does not fire for it); SessionEnd sends a last turn that never
+  each finished turn; StopFailure fires instead of Stop when a turn ends in
+  an API error and sends the turns before it (the failed turn follows with
+  the next turn or at SessionEnd); SessionEnd sends a last turn that never
   finished.
 - Updates an existing entry's keys, but never re-points a hook at a
   different Langfuse: an entry whose LANGFUSE_HOST differs from the new

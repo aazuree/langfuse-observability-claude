@@ -65,8 +65,10 @@ SAFE_ID_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 _SYNTHETIC_PROMPT_RE = re.compile(r"^<[a-z][a-z0-9-]*>")
 
 # How long a fire waits for another fire of the same session to finish.
-# Longer than a worst-case send (15s timeout per 50-event chunk).
-SESSION_LOCK_TIMEOUT_S = 120
+# Longer than a worst-case send: one 30s OTLP request plus up to four 30s
+# score requests (150s). A fire that gives up waiting skips its lines, and a
+# skipped SessionEnd fire would leave the last turn for a reprocess.
+SESSION_LOCK_TIMEOUT_S = 180
 
 MAX_SUBAGENT_DEPTH = 5  # CC 2.1.172: sub-agents can spawn sub-agents up to 5 levels
 
@@ -126,7 +128,13 @@ def _post(url: str, data: bytes, headers: dict) -> str:
         # dropping the data now would lose it for good.
         log(f"Failed to send to Langfuse: HTTP {e.code} {e.reason}")
         return "transient"
-    except (URLError, TimeoutError, OSError) as e:
+    except TimeoutError as e:
+        # Langfuse may already have stored the export; v4 keeps both copies
+        # when the retry lands. Retrying still beats dropping it for good.
+        log(f"[WARN] Langfuse did not answer in time ({e}); retrying next fire. "
+            "If it stored the export, the retry duplicates it")
+        return "transient"
+    except (URLError, OSError) as e:
         log(f"Failed to send to Langfuse: {e}")
         return "transient"
 
@@ -2758,7 +2766,8 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
     first_real_prompt = ""
     for t in turns:
         ui = (t.get("display_prompt") or "").strip()
-        if ui and not _is_synthetic_prompt(ui):
+        # A turn with no reply is a bare local command (/exit, /effort high).
+        if ui and t.get("api_call_ids") and not _is_synthetic_prompt(ui):
             first_real_prompt = ui
             break
     session_title = (
@@ -3237,9 +3246,12 @@ def main() -> None:
 def run_stop_hook(hook_input: dict) -> None:
     """Handle one Stop / StopFailure / SessionEnd payload.
 
-    All three run the same export. StopFailure covers a turn that ended in an
-    API error (Stop does not fire for it); SessionEnd is the last chance to
-    send a final turn that never finished. Exceptions propagate to main().
+    All three run the same export. StopFailure fires when a turn ends in an
+    API error (Stop does not fire for it): it sends the turns finished before
+    and refreshes the scores. The failed turn's last real reply is not
+    terminal, so that turn follows once the next one starts, or at
+    SessionEnd, the last chance to send a final turn that never finished.
+    Exceptions propagate to main().
     """
     if not LANGFUSE_PUBLIC_KEY or not LANGFUSE_SECRET_KEY:
         log("LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY must be set")
