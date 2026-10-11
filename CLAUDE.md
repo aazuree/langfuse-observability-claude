@@ -558,7 +558,7 @@ Visible model reasoning is gated by the API `thinking.display` parameter (defaul
 - **Cache tokens only show via usage details.** `cache_read` / `cache_create` (with `cache_5m` / `cache_1h` tier breakdowns) appear as separate line items only because they are keys of `usage_details`.
 - **Metadata values are strings.** Each key is its own attribute (`langfuse.trace.metadata.<k>`, `langfuse.observation.metadata.<k>`) so it is filterable; non-string values are JSON-encoded. Any other attribute lands under `metadata.attributes`.
 - **Trace-level attributes go on the root span** (the turn's generation): `langfuse.trace.name`, `langfuse.trace.tags`, `langfuse.trace.metadata.*`. `session.id` / `user.id` go on every span so filters work on child observations too.
-- **Scores are not spans.** They go to `POST /api/public/scores` and upsert by id. The value is replaced, but **metadata merges key by key** (verified 4.48.0): a key a later fire no longer writes keeps its old value. Scores belong to no trace, so a trace delete leaves them; `--delete-traces` deletes them by id (`session_score_id`).
+- **Scores are not spans.** They go to `POST /api/public/scores` and upsert by id. The value is replaced, but **metadata merges key by key** (verified 4.48.0, 4.56.0): a key a later fire no longer writes keeps its old value. Scores belong to no trace, so a trace delete leaves them; `--delete-traces` deletes them by id (`session_score_id`).
 - **Ingestion is async.** A 200 means "queued"; observations appear a few seconds later, and malformed-but-parseable attributes are dropped silently.
 
 ## Token Anatomy

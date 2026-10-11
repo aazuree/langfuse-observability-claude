@@ -278,7 +278,7 @@ combination at boot:
 | `LANGFUSE_MIGRATION_V4_ALLOW_PREVIEW_OPT_IN` | `true` (v4 read paths, v2 observations API) | `false` |
 | `LANGFUSE_BACKGROUND_MIGRATION_V4_ENABLE_HISTORIC_BACKFILL` | `false` | `false` |
 
-The hook works in all three modes (verified 2026-10-11 on 4.48.0): it sends the
+The hook works in all three modes (verified 2026-10-11 on 4.48.0 and 4.56.0): it sends the
 `x-langfuse-ingestion-version: 4` header, so `legacy` writes its spans to the v3
 tables, `dual` to both, and `events_only` to the events tables only.
 
