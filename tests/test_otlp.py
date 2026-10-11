@@ -42,7 +42,7 @@ def _events():
             "id": "gen-a", "traceId": TRACE_ID, "name": "Turn 1: fix",
             "model": "claude-opus-5-5", "input": "fix it", "output": "done",
             "startTime": "2026-10-11T10:00:00+00:00",
-            "endTime": "2026-10-11T10:00:05.5+00:00",
+            "endTime": "2026-10-11T10:00:05.500+00:00",
             "completionStartTime": "2026-10-11T10:00:01+00:00",
             "usageDetails": {"input": 10, "output": 20},
             "costDetails": {"input": 0.1, "total": 0.3},
