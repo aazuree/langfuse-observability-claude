@@ -99,7 +99,7 @@ All services bound to `127.0.0.1` only. API key never leaves the machine.
 
 ## Tech Stack
 
-- **Hook script**: Python 3.10+ (PEP 604 annotations are evaluated at import; CI runs on 3.10), stdlib only (zero external deps)
+- **Hook script**: Python 3.14+ (CI runs on 3.14 and 3.15), stdlib only (zero external deps)
 - **Backend**: Langfuse v4 (web + worker), PostgreSQL 18, ClickHouse 26, Redis 8, MinIO. The hook needs only the OTLP endpoint and the scores API, so the stack can run `LANGFUSE_MIGRATION_V4_WRITE_MODE=events_only`
 - **Deployment**: Docker Compose (6 services)
 - **Setup**: `./setup.sh` (generates secrets, starts containers, configures hook)

@@ -45,7 +45,7 @@ mode stays the default.
 ## Prerequisites
 
 - Docker and Docker Compose
-- Python 3.10+
+- Python 3.14+
 - Claude Code CLI
 - `openssl` (for secret generation)
 

@@ -41,7 +41,7 @@ def _nanos(iso: str | None) -> str | None:
     if not iso:
         return None
     try:
-        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(iso)
     except ValueError:
         return None
     # Integer arithmetic: float seconds would lose the low digits.

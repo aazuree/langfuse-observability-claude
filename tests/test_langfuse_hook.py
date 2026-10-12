@@ -281,6 +281,14 @@ class TestParseTs:
         result = hook.parse_ts("2026-03-29T10:00:00Z")
         assert result is not None
         assert result.hour == 10
+        assert result.utcoffset().total_seconds() == 0
+
+    def test_short_fraction_with_z_suffix(self):
+        # Python 3.10's fromisoformat rejected 1-digit fractions, so the
+        # timestamp silently became None. 3.11+ parses it.
+        result = hook.parse_ts("2026-03-29T10:00:00.5Z")
+        assert result is not None
+        assert result.microsecond == 500000
 
     def test_empty_string_returns_none(self):
         assert hook.parse_ts("") is None

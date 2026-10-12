@@ -1223,8 +1223,6 @@ def parse_ts(ts_str: str) -> datetime | None:
     if not ts_str:
         return None
     try:
-        # Handle various ISO formats
-        ts_str = ts_str.replace("Z", "+00:00")
         return datetime.fromisoformat(ts_str)
     except ValueError:
         # Invalid ISO format timestamp string
