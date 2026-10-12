@@ -61,8 +61,12 @@ jobs:
           echo "All files under 5MB."
 
   tests:
-    name: Tests
+    name: Tests (Python ${{ matrix.python }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.14", "3.15"]
     steps:
       - uses: actions/checkout@v7
 
@@ -70,7 +74,8 @@ jobs:
         # Exact version: setup-uv stopped publishing floating major tags in v8.
         uses: astral-sh/setup-uv@v10.2.0
 
-      # 3.10 is the oldest Python the hooks run on (PEP 604 `X | None`
-      # annotations are evaluated at import). Testing on it keeps that true.
-      - name: Run tests
-        run: uv run --no-project --python 3.10 --with pytest pytest tests/ -v
+      # 3.14 is the oldest Python the hooks support (the system python3 they
+      # run under); 3.15 is the newest release. Testing both keeps the floor
+      # honest and catches breakage on the next version early.
+      - name: Run tests (Python ${{ matrix.python }})
+        run: uv run --no-project --python ${{ matrix.python }} --with pytest pytest tests/ -v
