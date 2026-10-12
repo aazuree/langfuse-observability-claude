@@ -97,7 +97,7 @@ The hook script (`langfuse-hook.py`) is invoked by Claude Code after each assist
 1. **One trace per turn, sent once** — each finished turn becomes its own trace, grouped by `session.id`; Langfuse v4 keeps every export of a span, so a turn is only sent once it is finished. Session-wide rollups (tokens, cost, subagent costs, ...) are recomputed every fire and sent as session-level scores
 2. **Turn detection** — groups transcript entries into user→assistant turns
 3. **Tool call matching** — pairs `tool_use` blocks with their `tool_result` responses via `tool_use_id`
-4. **Token deduplication** — assistant messages with the same `message.id` are streaming updates carrying identical usage; it is counted once
+4. **Token deduplication** — assistant messages with the same `message.id` are streaming updates; usage is counted once, from the last entry (in subagent transcripts, earlier entries hold a partial count)
 5. **Timing** — uses message timestamps for latency, `turn_duration` entries for total turn time, first assistant timestamp for TTFT
 6. **Cost** — computes equivalent Anthropic API cost from token counts
 7. **Subagent tracking** — finds subagent transcripts through their `.meta.json` `toolUseId` (the Agent call that spawned them), ingests them as nested observations, and rolls up per-subagent cost in the session score

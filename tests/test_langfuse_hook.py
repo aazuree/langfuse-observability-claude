@@ -1605,7 +1605,7 @@ class TestBuildTurns:
         assert turns[1]["user_input"] == "Second question"
 
     def test_streaming_deduplication(self):
-        """Multiple assistant entries with same message_id: first usage wins (identical since v2.1.97)."""
+        """Multiple assistant entries with same message_id: usage is counted once."""
         entries = [
             {
                 "type": "user",
@@ -1639,11 +1639,49 @@ class TestBuildTurns:
         ]
         turns = hook.build_turns(entries)
         assert len(turns) == 1
-        # All entries carry identical usage since v2.1.97; first is taken
+        # Main-thread entries carry identical usage; it is counted once
         assert turns[0]["usage"]["output"] == 5
         assert turns[0]["usage"]["cache_read"] == 100
         # Last text content wins
         assert turns[0]["assistant_output"] == "Hello there!"
+
+    def test_streaming_usage_last_entry_wins(self):
+        """Subagent transcripts write partial usage on early entries of a message.
+
+        The first entry has a running output_tokens count and no speed,
+        server_tool_use or output_tokens_details; only the last entry has the
+        final numbers. Shape copied from a real subagent transcript (CC 2.1.296).
+        """
+        def entry(ts, text, usage):
+            return {
+                "type": "assistant",
+                "timestamp": ts,
+                "message": {
+                    "id": "msg-sub", "role": "assistant", "stop_reason": "end_turn",
+                    "model": "claude-opus-5-5",
+                    "content": [{"type": "text", "text": text}],
+                    "usage": usage,
+                },
+            }
+        base = {"input_tokens": 2, "cache_creation_input_tokens": 3577,
+                "cache_read_input_tokens": 0, "service_tier": "standard"}
+        entries = [
+            {"type": "user", "timestamp": "2026-10-12T10:00:00+00:00",
+             "message": {"role": "user", "content": "Summarize the repo"}},
+            entry("2026-10-12T10:00:01+00:00", "Sum", {**base, "output_tokens": 17}),
+            entry("2026-10-12T10:00:03+00:00", "Summary.", {
+                **base, "output_tokens": 417, "speed": "fast",
+                "output_tokens_details": {"thinking_tokens": 50},
+                "server_tool_use": {"web_search_requests": 1, "web_fetch_requests": 0},
+            }),
+        ]
+        turns = hook.build_turns(entries)
+        assert len(turns) == 1
+        assert turns[0]["usage"]["output"] == 417
+        assert turns[0]["usage"]["cache_creation"] == 3577  # counted once, not per entry
+        assert turns[0]["speed"] == "fast"
+        assert turns[0]["thinking_tokens"] == 50
+        assert turns[0]["web_search_requests"] == 1
 
     def test_synthetic_model_ignored(self):
         """<synthetic> model should not override real model."""
