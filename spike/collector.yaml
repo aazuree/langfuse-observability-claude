@@ -1,0 +1,60 @@
+# Phase B: OTel collector between Claude Code and Langfuse.
+# Rewrites Claude Code's native trace attributes into the ones Langfuse reads,
+# and strips PII before anything is stored. Throwaway spike keys only.
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  transform/claude_code:
+    error_mode: propagate
+    trace_statements:
+      # PII: Claude Code puts these on every span and has no switch to drop them.
+      - context: resource
+        statements:
+          - delete_key(attributes, "user.email")
+          - delete_key(attributes, "user.account_id")
+          - delete_key(attributes, "user.account_uuid")
+          - delete_key(attributes, "organization.id")
+      - context: span
+        statements:
+          - delete_key(attributes, "user.email")
+          - delete_key(attributes, "user.account_id")
+          - delete_key(attributes, "user.account_uuid")
+          - delete_key(attributes, "organization.id")
+          - delete_key(attributes, "terminal.type")
+
+          # LLM calls: token counts -> Langfuse usage keys (its price table uses these).
+          - set(attributes["langfuse.observation.usage_details"], Concat(["{\"input\":", attributes["input_tokens"], ",\"output\":", attributes["output_tokens"], ",\"cache_read_input_tokens\":", attributes["cache_read_tokens"], ",\"cache_creation_input_tokens\":", attributes["cache_creation_tokens"], "}"], "")) where attributes["span.type"] == "llm_request"
+          - set(attributes["langfuse.observation.type"], "generation") where attributes["span.type"] == "llm_request"
+
+          # Turn: the prompt is only an attribute; make it the observation input.
+          - set(attributes["langfuse.observation.input"], attributes["user_prompt"]) where attributes["span.type"] == "interaction" and attributes["user_prompt"] != nil
+          - set(attributes["langfuse.trace.name"], "claude_code.turn") where attributes["span.type"] == "interaction"
+
+          # Tools: the command or path is the closest thing to an input.
+          - set(attributes["langfuse.observation.input"], attributes["full_command"]) where attributes["span.type"] == "tool" and attributes["full_command"] != nil
+          - set(attributes["langfuse.observation.input"], attributes["file_path"]) where attributes["span.type"] == "tool" and attributes["full_command"] == nil and attributes["file_path"] != nil
+
+          # Secret redaction, one pattern as a demonstration of the hook's SECRET_PATTERNS.
+          - replace_pattern(attributes["langfuse.observation.input"], "sk-[A-Za-z0-9_-]{16,}", "[REDACTED]")
+          - replace_pattern(attributes["user_prompt"], "sk-[A-Za-z0-9_-]{16,}", "[REDACTED]")
+          - replace_pattern(attributes["full_command"], "sk-[A-Za-z0-9_-]{16,}", "[REDACTED]")
+
+exporters:
+  otlphttp/langfuse:
+    endpoint: http://langfuse-web:3000/api/public/otel
+    headers:
+      Authorization: Basic cGstbGYtc3Bpa2U6c2stbGYtc3Bpa2U=
+      x-langfuse-ingestion-version: "4"
+  debug:
+    verbosity: basic
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [transform/claude_code]
+      exporters: [otlphttp/langfuse, debug]

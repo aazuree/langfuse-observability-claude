@@ -1,0 +1,1 @@
+Use the Agent tool (general-purpose subagent) to summarize this project's structure in exactly three bullet points.

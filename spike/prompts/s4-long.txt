@@ -1,0 +1,1 @@
+Run these three Bash commands one at a time, each in its own separate tool call, waiting for each to finish before starting the next: `sleep 20; echo a`, then `sleep 20; echo b`, then `sleep 20; echo c`. Then reply with the three outputs on one line.

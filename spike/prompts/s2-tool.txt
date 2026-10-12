@@ -1,0 +1,1 @@
+Use the Read tool to read ./README.md, then use the Bash tool to run "wc -l README.md". Report the line count in one sentence.
