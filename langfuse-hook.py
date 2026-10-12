@@ -1362,10 +1362,12 @@ def build_turns(entries: list[dict]) -> list[dict]:
                 tool_result_timestamps[tool_use_id] = me["timestamp"]
 
     # Deduplicate assistant messages: multiple entries share same message_id (streaming).
-    # For usage, take the FIRST entry per message_id: since v2.1.97 every entry
-    # sharing a message_id carries identical usage, so first == last and taking
-    # one of them is what keeps a streamed message from being counted twice.
-    # The first entry with a message_id also gives us the first-token time.
+    # For usage, take the LAST entry per message_id; taking one entry is what keeps
+    # a streamed message from being counted twice. Main-thread entries carry
+    # identical usage, but subagent transcripts (seen on CC 2.1.296) write a
+    # running output_tokens count on early entries, without speed,
+    # server_tool_use or output_tokens_details; only the last entry is final.
+    # The first entry with a message_id gives us the first-token time.
     msg_id_first_ts = {}  # message_id -> first timestamp seen
     msg_id_final_usage = {}  # message_id -> final usage dict
     msg_id_diagnostics = {}  # message_id -> diagnostics dict
@@ -1376,8 +1378,7 @@ def build_turns(entries: list[dict]) -> list[dict]:
         mid = me["message_id"]
         if mid not in msg_id_first_ts:
             msg_id_first_ts[mid] = me["timestamp"]
-        # All entries for a given message_id carry identical usage since v2.1.97; first is fine
-        if me["usage"] and mid not in msg_id_final_usage:
+        if me["usage"]:
             msg_id_final_usage[mid] = me["usage"]
         if me["diagnostics"] and mid not in msg_id_diagnostics:
             msg_id_diagnostics[mid] = me["diagnostics"]
