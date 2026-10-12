@@ -328,27 +328,19 @@ Infrastructure already satisfies the v4 floors — ClickHouse 25.12 minimum
 
 ## ClickHouse system logs
 
-ClickHouse logs about itself into `system.*` tables: profiler samples
-(`trace_log`), a copy of its server log (`text_log`), metric snapshots every
-second (`metric_log`, `asynchronous_metric_log`), and more. They have no TTL and
-keep writing while the stack is idle. Each ClickHouse upgrade that changes a
-table's definition also leaves the old one behind as `<table>_N`. Langfuse never
-reads any of it. On a Pi-hosted stack they reached **20 GiB, next to 87 MiB of
-Langfuse data**.
+ClickHouse logs about itself into `system.*` tables (profiler samples, server
+log lines, metric snapshots) with no TTL, and leaves the old copy of a table
+behind as `<table>_N` when an upgrade changes it. Langfuse never reads them.
 
 `clickhouse/config.d/z_system_logs.xml` (mounted by `docker-compose.yml`) caps them:
 
-- disables `trace_log`, `text_log`, `opentelemetry_span_log`,
-  `asynchronous_metric_log`, `metric_log`, `latency_log` and
-  `processors_profile_log` ([Langfuse's list](https://langfuse.com/self-hosting/configuration/scaling#clickhouse-system-log-tables)
-  plus the last one);
-- keeps `query_log` and `part_log` with a 30-day TTL, and `error_log` as is;
-- sets the server file log to `warning` (default `trace`).
+- disables the noisy ones ([Langfuse's list](https://langfuse.com/self-hosting/configuration/scaling#clickhouse-system-log-tables)
+  plus `processors_profile_log`);
+- keeps `query_log` and `part_log` for 30 days;
+- sets the server log to `warning`.
 
-A new stack needs nothing else. **An existing stack keeps every table already on
-disk** — disabling a table stops new writes but does not drop it — so free the
-space once after pulling this change. Nothing in these tables is worth a backup.
-Run from the repo directory on the host that runs the stack:
+This only shapes newly created tables. On an existing stack, drop the old ones
+once (no backup needed):
 
 ```bash
 git pull
@@ -372,12 +364,6 @@ SQL
 cat drop-system-logs.sql          # review the list
 ch < drop-system-logs.sql && rm drop-system-logs.sql
 ```
-
-Verified on ClickHouse 26.9.16.11: the disabled tables are not recreated, and the
-new `query_log` / `part_log` carry `TTL event_date + 30 days`. ClickHouse refuses
-to drop a table over 50 GB (`max_table_size_to_drop`); none came close here.
-Hook fires during the ClickHouse restart fail transiently and are retried on the
-next fire.
 
 ## Known limitations
 

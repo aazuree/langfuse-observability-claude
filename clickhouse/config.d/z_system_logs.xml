@@ -4,8 +4,7 @@
 
   ClickHouse logs about itself into system.* tables (profiler samples, server
   log lines, metric snapshots) with no TTL, and keeps writing while idle.
-  Langfuse never reads them. On a Raspberry Pi stack they reached 20 GiB next
-  to 87 MiB of Langfuse data.
+  Langfuse never reads them.
 
   - Disabled: the tables Langfuse lists as safe to drop
     (https://langfuse.com/self-hosting/configuration/scaling#clickhouse-system-log-tables),
