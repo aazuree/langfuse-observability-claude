@@ -1,0 +1,43 @@
+<?xml version="1.0"?>
+<!--
+  Keep ClickHouse's own system log tables from filling the disk.
+
+  ClickHouse logs about itself into system.* tables (profiler samples, server
+  log lines, metric snapshots) with no TTL, and keeps writing while idle.
+  Langfuse never reads them. On a Raspberry Pi stack they reached 20 GiB next
+  to 87 MiB of Langfuse data.
+
+  - Disabled: the tables Langfuse lists as safe to drop
+    (https://langfuse.com/self-hosting/configuration/scaling#clickhouse-system-log-tables),
+    plus processors_profile_log.
+  - Kept with a 30-day TTL: query_log and part_log, small and the first place to
+    look when ClickHouse misbehaves. error_log is kept as is (tiny).
+  - Server file log at warning instead of the default trace.
+
+  Settings only take effect when a table is created. Tables already on disk,
+  including the *_log_N copies ClickHouse leaves behind when a table's
+  definition changes, stay until dropped: see REMOTE-DEPLOY.md,
+  "ClickHouse system logs".
+
+  The z_ prefix makes this file load after the image's own config.d files.
+-->
+<clickhouse>
+    <logger>
+        <level>warning</level>
+    </logger>
+
+    <trace_log remove="1"/>
+    <text_log remove="1"/>
+    <opentelemetry_span_log remove="1"/>
+    <asynchronous_metric_log remove="1"/>
+    <metric_log remove="1"/>
+    <latency_log remove="1"/>
+    <processors_profile_log remove="1"/>
+
+    <query_log>
+        <ttl>event_date + INTERVAL 30 DAY DELETE</ttl>
+    </query_log>
+    <part_log>
+        <ttl>event_date + INTERVAL 30 DAY DELETE</ttl>
+    </part_log>
+</clickhouse>
