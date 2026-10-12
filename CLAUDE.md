@@ -602,6 +602,13 @@ whole subagent transcript (a resumed agent is usually mid-turn, and a tail with 
 prompt builds no turns) and returns the agent's **whole** cost; `_subagent_record` replaces
 the stored totals with it rather than adding to them.
 
+**Handback (CC 2.1.289+):** a subagent now ends with a `SubagentHandback` tool call
+(its report to the parent) instead of a final `end_turn` reply, so its last turn has
+no terminal `stop_reason`. `_handed_back` treats that turn as finished once the
+call's `tool_result` is written. Without it the turn waited for `SessionEnd` or a
+reprocess, and a background job never fires `SessionEnd` (18 of 131 local subagents,
+2026-10-12).
+
 **Nested sub-agents (CC 2.1.172+):** sub-agents can spawn sub-agents up to 5 levels deep.
 Transcripts stay in the flat `<session>/subagents/` dir; each `.meta.json`'s `toolUseId`
 points at the `Agent` tool_use in the *spawner's* transcript. `ingest_subagent` recurses
