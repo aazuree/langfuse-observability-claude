@@ -326,6 +326,45 @@ the four background migrations finished in about 3 minutes on a small stack.
 Infrastructure already satisfies the v4 floors — ClickHouse 25.12 minimum
 (26.4 recommended), PostgreSQL 15 minimum, Redis 7.0 minimum.
 
+## ClickHouse system logs
+
+ClickHouse logs about itself into `system.*` tables (profiler samples, server
+log lines, metric snapshots) with no TTL, and leaves the old copy of a table
+behind as `<table>_N` when an upgrade changes it. Langfuse never reads them.
+
+`clickhouse/config.d/z_system_logs.xml` (mounted by `docker-compose.yml`) caps them:
+
+- disables the noisy ones ([Langfuse's list](https://langfuse.com/self-hosting/configuration/scaling#clickhouse-system-log-tables)
+  plus `processors_profile_log`);
+- keeps `query_log` and `part_log` for 30 days;
+- sets the server log to `warning`.
+
+This only shapes newly created tables. On an existing stack, drop the old ones
+once (no backup needed):
+
+```bash
+git pull
+docker compose up -d clickhouse   # recreated with the new mount; web/worker reconnect
+
+ch() { docker compose exec -T clickhouse sh -c \
+  'clickhouse-client --user "$CLICKHOUSE_USER" --password "$CLICKHOUSE_PASSWORD" --multiquery'; }
+
+# FLUSH LOGS makes ClickHouse rename query_log / part_log to *_N now (their
+# definition changed: TTL), so this one pass also catches those copies.
+ch <<'SQL' > drop-system-logs.sql
+SYSTEM FLUSH LOGS;
+SELECT 'DROP TABLE system.' || name || ' SYNC;'
+FROM system.tables
+WHERE database = 'system'
+  AND (match(name, '_log_[0-9]+$')
+       OR name IN ('trace_log', 'text_log', 'opentelemetry_span_log', 'asynchronous_metric_log',
+                   'metric_log', 'latency_log', 'processors_profile_log'))
+FORMAT TSVRaw
+SQL
+cat drop-system-logs.sql          # review the list
+ch < drop-system-logs.sql && rm drop-system-logs.sql
+```
+
 ## Known limitations
 
 - **No TLS.** Traffic (including the project secret key on ingestion POSTs) is

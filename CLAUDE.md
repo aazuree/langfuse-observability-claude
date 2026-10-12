@@ -111,6 +111,8 @@ langfuse-hook.py                 # Core hook script - parses transcripts, sends 
 langfuse_otlp.py                 # Hook events -> OTLP/JSON export (langfuse.* attributes), scores split out
 langfuse_common.py               # Redaction, logging, auth header, atomic writes
 docker-compose.yml               # Full Langfuse stack (6 services)
+clickhouse/config.d/
+  z_system_logs.xml              # Caps ClickHouse's own system.* log tables (Langfuse never reads them)
 setup.sh                         # One-command setup (generates .env, starts services, configures hook)
 .env.example                     # Template for environment variables
 .env                             # Generated secrets (gitignored)
@@ -640,6 +642,7 @@ Session score `session_cost_usd` → metadata `subagent_costs` summary
   (It used to reset state itself, and v4 keeps every export, so a reprocess without a
   completed delete doubled cost.)
 
+- **ClickHouse system logs are capped** by `clickhouse/config.d/z_system_logs.xml`: the noisy `system.*` log tables are disabled, `query_log` / `part_log` keep 30 days, the server log is at `warning`. Left alone they grow without limit and dwarf the Langfuse data. The config only shapes newly created tables; an existing stack drops the old ones once (REMOTE-DEPLOY.md, "ClickHouse system logs")
 - `.env` contains generated secrets - never commit it
 - The hook never blocks Claude Code: `setup.sh` registers it on Stop / StopFailure / SessionEnd with `"async": true`, and every error, including an unexpected crash, goes to the hook log. A hook registered without `async` runs in the foreground (measured: median 0.8s, max 23s per Stop)
 - First Langfuse login may need incognito window (stale CSRF tokens)
