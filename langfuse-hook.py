@@ -381,6 +381,34 @@ def _tool_output(raw: str) -> str:
     return text
 
 
+# CC 2.1.289+ ends a subagent with this tool call (its report to the parent)
+# instead of a final end_turn reply, so its last turn has no terminal stop_reason.
+SUBAGENT_HANDBACK_TOOL = "SubagentHandback"
+
+
+def _handed_back(entries: list) -> bool:
+    """Whether the agent's last reply is a SubagentHandback call whose result
+    is already written. Requiring the result keeps an async fire that reads
+    between the two from exporting the handback span without its output."""
+    for i in range(len(entries) - 1, -1, -1):
+        entry = entries[i]
+        if entry.get("type") != "assistant" or entry.get("isApiErrorMessage"):
+            continue
+        content = (entry.get("message") or {}).get("content")
+        ids = {b.get("id") for b in content if isinstance(b, dict)
+               and b.get("type") == "tool_use" and b.get("name") == SUBAGENT_HANDBACK_TOOL
+               } if isinstance(content, list) else set()
+        if not ids:
+            return False
+        for later in entries[i + 1:]:
+            c = (later.get("message") or {}).get("content") if later.get("type") == "user" else None
+            if isinstance(c, list) and any(isinstance(b, dict) and b.get("type") == "tool_result"
+                                           and b.get("tool_use_id") in ids for b in c):
+                return True
+        return False
+    return False
+
+
 def ingest_subagent(
     agent_id: str,
     transcript_path: str,
@@ -431,12 +459,13 @@ def ingest_subagent(
     turns = build_turns(entries)
     if not turns:
         return [], empty_cost, total_lines, prior_turn_count, "partial"
-    sendable = complete_turn_count(turns, final)
+    handed_back = _handed_back(entries)
+    sendable = complete_turn_count(turns, final or handed_back)
 
     # Complete when the last assistant entry ended its turn. stop_reason lives
     # inside `message`; reading it off the entry itself never matched, so
     # every subagent used to report "partial".
-    status = "partial"
+    status = "complete" if handed_back else "partial"
     for entry in reversed(entries):
         if entry.get("type") == "assistant" and not entry.get("isApiErrorMessage"):
             if (entry.get("message") or {}).get("stop_reason") == "end_turn":

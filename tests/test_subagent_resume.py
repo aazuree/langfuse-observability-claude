@@ -213,3 +213,54 @@ def test_a_write_landing_during_the_read_is_picked_up_next_fire(tmp_path, monkey
     s.append(s.parent, _parent_turn(2, 1))
     gens = _agent_gens(s.fire())
     assert gens and gens[-1]["output"] == "all done"
+
+
+def _handback(mid, ts, tool):
+    """A subagent's last reply in CC 2.1.289+: a SubagentHandback call carrying
+    its report, with no stop_reason, instead of a final end_turn reply."""
+    return {"type": "assistant", "timestamp": ts,
+            "message": {"id": mid, "role": "assistant", "model": "claude-sonnet-5",
+                        "stop_reason": None,
+                        "content": [{"type": "tool_use", "id": tool, "name": "SubagentHandback",
+                                     "input": {"message": "report"}}],
+                        "usage": {"input_tokens": 10, "output_tokens": 50,
+                                  "cache_read_input_tokens": 0,
+                                  "cache_creation_input_tokens": 0}}}
+
+
+def _agent_start(s):
+    s.append(s.parent, _parent_turn(1, 0, agent=True))
+    s.append(s.agent, [
+        {"type": "user", "timestamp": "2026-09-20T10:00:01+00:00", "isSidechain": True,
+         "message": {"role": "user", "content": "go"}},
+        _assistant("sm1", "2026-09-20T10:00:03+00:00", tool="tr1"),
+        _result("tr1", "2026-09-20T10:00:04+00:00"),
+    ])
+
+
+def test_agent_that_handed_back_its_report_is_finished(tmp_path, monkeypatch):
+    """Without this the turn has no terminal stop_reason and waits for
+    SessionEnd, which a background job never fires."""
+    s = _Session(tmp_path, monkeypatch)
+    _agent_start(s)
+    s.append(s.agent, [_handback("sm2", "2026-09-20T10:00:05+00:00", "thb"),
+                       _result("thb", "2026-09-20T10:00:06+00:00")])
+    gens = _agent_gens(s.fire())
+
+    assert len(gens) == 1
+    assert gens[0]["usageDetails"]["output"] == 100 + 50
+    assert s.state()["status"] == "complete"
+
+
+def test_handback_without_its_result_yet_is_held(tmp_path, monkeypatch):
+    """An async fire can read the transcript between the call and its result;
+    sending then would export the handback span without its output."""
+    s = _Session(tmp_path, monkeypatch)
+    _agent_start(s)
+    s.append(s.agent, [_handback("sm2", "2026-09-20T10:00:05+00:00", "thb")])
+    assert not _agent_gens(s.fire())
+    assert s.state()["status"] == "partial"
+
+    s.append(s.agent, [_result("thb", "2026-09-20T10:00:06+00:00")])
+    s.append(s.parent, _parent_turn(2, 1))
+    assert len(_agent_gens(s.fire())) == 1
