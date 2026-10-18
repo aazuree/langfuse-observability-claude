@@ -1287,7 +1287,7 @@ def _display_prompt(parts: list) -> str:
     return parts[0][0].strip() if parts else ""
 
 
-def build_turns(entries: list[dict]) -> list[dict]:
+def build_turns(entries: list[dict], copied_message_ids: frozenset = frozenset()) -> list[dict]:
     """Group transcript entries into turns with timing and token data.
 
     A turn is everything the user sent before the assistant replied, plus the
@@ -1296,6 +1296,11 @@ def build_turns(entries: list[dict]) -> list[dict]:
     `isMeta` expansion, and a prompt with an image as the text plus an
     `isMeta` "[Image: ...]" entry. The turn's start_time is the *last* of
     those entries, so TTFT is measured from the input the reply answers.
+
+    `copied_message_ids` are messages a continued session copied from its
+    predecessor, which bills them: their usage and tool calls are left out,
+    and a turn whose replies are all copied gets `copied: True`. Turn
+    indices are unchanged.
 
     Returns list of turn dicts with keys:
       user_input, display_prompt, assistant_output, tool_calls, start_time,
@@ -1537,8 +1542,10 @@ def build_turns(entries: list[dict]) -> list[dict]:
             if text.strip():
                 current_turn["assistant_output"] = text
 
-            # Collect tool uses — skip duplicates (same tool_use_id in multiple streaming entries)
-            for tu in extract_tool_uses(content):
+            # Collect tool uses — skip duplicates (same tool_use_id in multiple streaming
+            # entries) and a copied message's, which the predecessor already sent.
+            tool_uses = extract_tool_uses(content) if mid not in copied_message_ids else []
+            for tu in tool_uses:
                 tool_use_id = tu.get("id", "")
                 if tool_use_id and tool_use_id in current_turn["_seen_tool_ids"]:
                     continue
@@ -1585,7 +1592,7 @@ def build_turns(entries: list[dict]) -> list[dict]:
                       "cache_creation": 0, "cache_5m": 0, "cache_1h": 0}
         long_requests = 0
         for mid in turn["api_call_ids"]:
-            if mid in counted_mids:
+            if mid in copied_message_ids or mid in counted_mids:
                 continue
             counted_mids.add(mid)
             u = msg_id_final_usage.get(mid, {})
@@ -1658,6 +1665,8 @@ def build_turns(entries: list[dict]) -> list[dict]:
             if cm_by_reason else None
         )
         turn["request_ids"] = request_ids
+        if turn["api_call_ids"] and turn["api_call_ids"] <= copied_message_ids:
+            turn["copied"] = True
         turn["api_call_ids"] = list(turn["api_call_ids"])  # make serializable
         turn["attribution_skills_all"] = sorted(turn["attribution_skills_all"])
         turn["attribution_plugins_all"] = sorted(turn["attribution_plugins_all"])
@@ -1907,6 +1916,19 @@ def message_models(entries) -> set[str]:
     return {(e.get("message") or {}).get("model") for e in _from_first_user(entries)
             if e.get("type") == "assistant" and not e.get("isApiErrorMessage")
             and (e.get("message") or {}).get("model") not in (None, "", "<synthetic>")}
+
+
+def last_cost_state_start(transcript_path: str):
+    """`startTime` of the last `cost-state` entry with a total, or None.
+
+    Equal start times mean one CLI process: a continued session's cost-state
+    carries on from its predecessor's.
+    """
+    start = None
+    for entry in _entries(transcript_path):
+        if entry.get("type") == "cost-state" and isinstance(entry.get("totalCostUSD"), (int, float)):
+            start = entry.get("startTime")
+    return start
 
 
 def extract_async_hook_responses(transcript_path: str, max_stderr: int = 200) -> dict | None:
@@ -2964,6 +2986,137 @@ def _session_lock(session_id: str):
         os.close(fd)
 
 
+# Claude Code writes `continued-in` into the old transcript when it continues a
+# session in a new one; only bookkeeping lines (last-prompt, cost-state) follow
+# it, so the tail of each sibling transcript is enough to find the predecessor.
+CONTINUATION_TAIL_BYTES = 64 * 1024
+
+
+def find_predecessor(session_id: str, transcript_path: str) -> str:
+    """Path of the transcript that was continued in this session, or "".
+
+    Scans the tail of every other transcript in this one's project dir for a
+    `continued-in` entry naming `session_id`. All 11 continuations seen so far
+    (2026-10-18) stayed in the same project dir.
+    """
+    pdir = os.path.dirname(transcript_path)
+    try:
+        names = sorted(os.listdir(pdir))
+    except OSError:
+        return ""
+    needle = session_id.encode()
+    own = os.path.basename(transcript_path)
+    for name in names:
+        if not name.endswith(".jsonl") or name == own:
+            continue
+        path = os.path.join(pdir, name)
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, os.SEEK_END)
+                f.seek(max(0, f.tell() - CONTINUATION_TAIL_BYTES))
+                tail = f.read()
+        except OSError:
+            continue
+        if needle not in tail:
+            continue
+        for line in tail.splitlines():
+            if needle not in line:
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:  # also the tail's cut-off first line
+                continue
+            if (isinstance(entry, dict) and entry.get("type") == "continued-in"
+                    and entry.get("continuedInSessionId") == session_id):
+                return path
+    return ""
+
+
+def resolve_continuation(session_id: str, transcript_path: str, entries: list[dict]) -> dict:
+    """What this session copied from the session it continues; resolved once, cached.
+
+    A continued session's transcript starts with a copy of the predecessor's
+    history: same entry `uuid`s and message ids, `sessionId` rewritten. Returns
+    {"predecessor": ""} when the session continues nothing. Otherwise the
+    predecessor's id, transcript path and line count, the `uuids` and
+    `message_ids` copied from it, and `cli_cost`: its Claude Code cost-state
+    ({start_time, total_cost_usd}) as of its `continued-in`, or None.
+
+    The copy and the `continued-in` are written before the session's own first
+    entry, so the first fire sees both and a negative answer can be cached.
+    The cache lives next to the other state files: `<session>.continuation.json`.
+    """
+    cache = os.path.join(STATE_DIR, f"{session_id}.continuation.json")
+    try:
+        info = json.loads(Path(cache).read_text())
+        if isinstance(info, dict):
+            return info
+    except (OSError, ValueError):
+        pass
+    info = {"predecessor": ""}
+    pred_path = find_predecessor(session_id, transcript_path)
+    if pred_path:
+        pred_entries, pred_lines, read_ok = parse_transcript(pred_path)
+        if not read_ok:
+            return info  # not cached: the next fire retries
+        pred_uuids, pred_mids, cli_cost, last_cost_state = set(), set(), None, None
+        for e in pred_entries:
+            if e.get("uuid"):
+                pred_uuids.add(e["uuid"])
+            etype = e.get("type")
+            if etype == "assistant" and not e.get("isApiErrorMessage"):
+                mid = (e.get("message") or {}).get("id")
+                if mid:
+                    pred_mids.add(mid)
+            elif etype == "cost-state" and isinstance(e.get("totalCostUSD"), (int, float)):
+                last_cost_state = e
+            elif (etype == "continued-in" and e.get("continuedInSessionId") == session_id
+                    and last_cost_state):
+                usage = last_cost_state.get("modelUsage")
+                cli_cost = {"start_time": last_cost_state.get("startTime"),
+                            "total_cost_usd": last_cost_state["totalCostUSD"],
+                            "by_model": {m: u.get("costUSD") for m, u in usage.items()
+                                         if isinstance(u, dict)} if isinstance(usage, dict) else {}}
+        own_mids = {(e.get("message") or {}).get("id") for e in entries
+                    if e.get("type") == "assistant"}
+        info = {
+            "predecessor": sanitize_id(os.path.basename(pred_path)[:-len(".jsonl")]),
+            "path": pred_path,
+            "lines": pred_lines,
+            "uuids": sorted({e["uuid"] for e in entries if e.get("uuid") in pred_uuids}),
+            "message_ids": sorted(own_mids & pred_mids),
+            "cli_cost": cli_cost,
+        }
+    Path(STATE_DIR).mkdir(parents=True, exist_ok=True)
+    atomic_write_text(cache, json.dumps(info))
+    return info
+
+
+_FLUSHING: set = set()
+
+
+def flush_predecessor(continuation: dict) -> None:
+    """Send what the predecessor has not sent yet, as itself, before its copy is skipped.
+
+    A continuation can happen mid-turn, before the old session ever fired a
+    Stop (0e8220a3, 2026-10-18, had no send at all), so the copy is safe to
+    skip only once the predecessor has sent it. The predecessor is over, so it
+    is processed as final. Runs while its state is behind its transcript, so a
+    failed send is retried on the next fire.
+    """
+    pred, path = continuation.get("predecessor"), continuation.get("path")
+    # A predecessor past Claude Code's 30-day retention has nothing left to send.
+    if not pred or not path or pred in _FLUSHING or not os.path.isfile(path):
+        return
+    if load_state(pred)[0] >= continuation.get("lines", 0):
+        return
+    _FLUSHING.add(pred)
+    try:
+        process_session(pred, path, extract_cwd(path), final=True)
+    finally:
+        _FLUSHING.discard(pred)
+
+
 def process_session(session_id: str, transcript_path: str, cwd: str, last_assistant_message: str = "", final: bool = False, background_tasks: list = None, session_crons: list = None) -> None:
     """Process one session transcript, one fire per session at a time."""
     with _session_lock(session_id) as acquired:
@@ -3033,41 +3186,51 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
         log(f"No new entries for session {session_id} (offset {prev_line_offset}, total {total_lines})")
         return
 
-    turns = build_turns(entries)
+    # A continued session starts with a copy of its predecessor's history,
+    # which the predecessor sends and bills (resolve_continuation).
+    continuation = resolve_continuation(session_id, transcript_path, entries)
+    flush_predecessor(continuation)
+    copied_uuids = frozenset(continuation.get("uuids", ()))
+    own_entries = ([e for e in entries if e.get("uuid") not in copied_uuids]
+                   if copied_uuids else entries)
+
+    turns = build_turns(entries, frozenset(continuation.get("message_ids", ())))
     if not turns:
         log(f"No turns found in {len(entries)} entries")
         save_state(session_id, total_lines, 0)
         return
     sendable = complete_turn_count(turns, final)
+    # Rollups and scores cover this session's own part; indices stay those of `turns`.
+    own_turns = [t for t in turns if not t.get("copied")]
 
-    custom_title = extract_custom_title(entries)
-    permission_mode = extract_permission_mode(entries)
-    permission_timeline = extract_permission_timeline(entries)
-    compaction = extract_compaction(entries)
-    remote_control = extract_bridge(entries)
-    pr_links = extract_pr_links(entries)
-    away_summaries = extract_away_summaries(entries)
-    agent_name = extract_agent_name(entries)
-    ai_title = extract_ai_title(entries)
-    session_kind = extract_session_kind(entries)
-    attachments = extract_attachments(entries)
-    local_commands = extract_local_commands(entries)
-    file_history_stats = extract_file_history_stats(entries)
-    prompt_provenance = extract_prompt_provenance(entries)
-    tool_denials = extract_tool_denials(entries)
-    stop_hook_stats = extract_stop_hook_stats(entries)
-    worktree_state = extract_worktree_state(entries)
-    api_error_messages = extract_api_error_messages(entries)
-    interrupts = extract_interrupts(entries)
-    queue_operations = extract_queue_operations(entries)
-    cost_state = extract_cost_state(entries)
-    async_hooks = extract_async_hook_responses(entries)
-    rate_limits = extract_rate_limits(entries)
-    scheduled_tasks = extract_scheduled_task_fires(entries)
-    continued_in = extract_continued_in(entries)
-    relocations = extract_relocations(entries)
-    session_meta = extract_session_metadata(entries)
-    api_errors = extract_api_errors(entries)
+    custom_title = extract_custom_title(own_entries)
+    permission_mode = extract_permission_mode(own_entries)
+    permission_timeline = extract_permission_timeline(own_entries)
+    compaction = extract_compaction(own_entries)
+    remote_control = extract_bridge(own_entries)
+    pr_links = extract_pr_links(own_entries)
+    away_summaries = extract_away_summaries(own_entries)
+    agent_name = extract_agent_name(own_entries)
+    ai_title = extract_ai_title(own_entries)
+    session_kind = extract_session_kind(own_entries)
+    attachments = extract_attachments(own_entries)
+    local_commands = extract_local_commands(own_entries)
+    file_history_stats = extract_file_history_stats(own_entries)
+    prompt_provenance = extract_prompt_provenance(own_entries)
+    tool_denials = extract_tool_denials(own_entries)
+    stop_hook_stats = extract_stop_hook_stats(own_entries)
+    worktree_state = extract_worktree_state(own_entries)
+    api_error_messages = extract_api_error_messages(own_entries)
+    interrupts = extract_interrupts(own_entries)
+    queue_operations = extract_queue_operations(own_entries)
+    cost_state = extract_cost_state(own_entries)
+    async_hooks = extract_async_hook_responses(own_entries)
+    rate_limits = extract_rate_limits(own_entries)
+    scheduled_tasks = extract_scheduled_task_fires(own_entries)
+    continued_in = extract_continued_in(own_entries)
+    relocations = extract_relocations(own_entries)
+    session_meta = extract_session_metadata(own_entries)
+    api_errors = extract_api_errors(own_entries)
     has_errors = api_errors["total_count"] > 0
 
     # Price each turn once; every rollup below reads this.
@@ -3083,17 +3246,17 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
             turn_start_time=t.get("start_time", ""),
             long_context_usage=t.get("usage_long"),
         )
-    session_cost = sum(t["_cost"][0] for t in turns)
+    session_cost = sum(t["_cost"][0] for t in own_turns)
 
     repo_name = os.path.basename(cwd.rstrip("/")) if cwd else ""
     user_id = _user_id()
-    has_fast = any(t.get("speed") == "fast" for t in turns)
-    turn_signals = build_turn_signal_summary(turns)
+    has_fast = any(t.get("speed") == "fast" for t in own_turns)
+    turn_signals = build_turn_signal_summary(own_turns)
     # Last turn that carried a per-turn `effort` (transcript field, CC 2.1.220+).
-    effort = next((t["effort"] for t in reversed(turns) if t.get("effort")), "")
+    effort = next((t["effort"] for t in reversed(own_turns) if t.get("effort")), "")
 
     model_families = set()
-    for t in turns:
+    for t in own_turns:
         m = (t.get("model") or "").lower()
         if "haiku" in m:
             model_families.add("haiku")
@@ -3106,10 +3269,10 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
     # mispriced (was: defaulted to Opus). Surface it as a filterable tag.
     has_missing_model = any(
         not (t.get("model") or "") and _has_billable_tokens(t.get("usage") or {})
-        for t in turns
+        for t in own_turns
     )
 
-    skill_attribution = build_skill_attribution_summary(turns)
+    skill_attribution = build_skill_attribution_summary(own_turns)
     attribution_tags = build_attribution_tags(skill_attribution)
     sa_state = load_subagent_state(session_id)
 
@@ -3117,7 +3280,7 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
     # > repo/branch. Synthetic stubs (slash commands, reminders) start with an
     # XML-like wrapper tag and are skipped.
     first_real_prompt = ""
-    for t in turns:
+    for t in own_turns:
         ui = (t.get("display_prompt") or "").strip()
         # A turn with no reply is a bare local command (/exit, /effort high).
         if ui and t.get("api_call_ids") and not _is_synthetic_prompt(ui):
@@ -3137,7 +3300,7 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
         f"compact-trigger:{t}" for t in sorted((compaction or {}).get("triggers", {}))
         if t != "unknown"
     ]
-    stop_reasons = build_stop_reasons_summary(turns)
+    stop_reasons = build_stop_reasons_summary(own_turns)
     stop_reason_tags = [
         f"stop-reason:{r}"
         for r in sorted((stop_reasons or {}).get("by_reason", {}))
@@ -3148,7 +3311,7 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
     ]
     # Exact model IDs alongside the family tags, so Opus 5 and Opus 5.5
     # sessions can be filtered apart.
-    model_tags = sorted({f"model:{t['model']}" for t in turns if t.get("model")})
+    model_tags = sorted({f"model:{t['model']}" for t in own_turns if t.get("model")})
 
     # Session state as of this fire, repeated on every turn trace so each one
     # filters on its own. Tags reflect the session so far.
@@ -3179,6 +3342,7 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
         "rate-limited" if (rate_limits or {}).get("by_status", {}).get("rejected") else None,
         "scheduled-task" if scheduled_tasks or (turn_signals or {}).get("scheduled_turns") else None,
         "continued" if continued_in else None,
+        "continuation" if continuation.get("predecessor") else None,
         *compact_trigger_tags,
         *stop_reason_tags,
         *refusal_tags,
@@ -3207,6 +3371,8 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
     sa_visited = set()
     for turn_idx in range(min(prev_turn_count, sendable), sendable):
         turn = turns[turn_idx]
+        if turn.get("copied"):
+            continue  # copied from the predecessor, which sent it
         # Keyed on the turn's index in the whole transcript, so a live fire
         # and a re-ingest after --delete-traces produce the same IDs.
         turn_id = uuid.uuid5(uuid.NAMESPACE_URL, f"{session_id}:turn:{turn_idx}")
@@ -3393,34 +3559,51 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
         if partial_messages:
             session_tags.append("subagent-usage-partial")
 
-    classifier_requests = count_classifier_requests(entries) + sum(
+    classifier_requests = count_classifier_requests(own_entries) + sum(
         s.get("classifier_requests", 0) for s in agents.values())
 
     hook_cost = session_cost + (subagent_costs or {}).get("total_subagent_cost", 0)
     cli_cost_state = None
+    cli_cost = None
     if cost_state:
-        used_models = {t["model"] for t in turns if t.get("model")}
+        cli_cost = cost_state["total_cost_usd"]
+        model_cost = {m: u.get("cost_usd", 0) for m, u in cost_state.get("by_model", {}).items()}
+        cli_cost_state = {**cost_state, "hook_cost_usd": round(hook_cost, 6)}
+        # A continuation runs in the predecessor's CLI process (same cost-state
+        # startTime), and its cost-state carries on from the predecessor's
+        # total, which the predecessor reports itself.
+        pred_cli = continuation.get("cli_cost") or {}
+        if (pred_cli.get("start_time") is not None
+                and pred_cli["start_time"] == last_cost_state_start(own_entries)):
+            cli_cost = round(cli_cost - pred_cli["total_cost_usd"], 6)
+            cli_cost_state["predecessor_cost_usd"] = round(pred_cli["total_cost_usd"], 6)
+            for m, c in (pred_cli.get("by_model") or {}).items():
+                if m in model_cost and isinstance(c, (int, float)):
+                    model_cost[m] = max(0.0, model_cost[m] - c)
+        used_models = {t["model"] for t in own_turns if t.get("model")}
         for s in agents.values():
             used_models.update(s.get("models") or [])
-        cli_cost_state = {
-            **cost_state,
-            "hook_cost_usd": round(hook_cost, 6),
-            # Models no message used: mostly the Haiku behind WebFetch/WebSearch.
-            "side_model_cost_usd": round(sum(
-                u.get("cost_usd", 0) for m, u in cost_state.get("by_model", {}).items()
-                if m not in used_models), 6),
-        }
+        # Models no message used: mostly the Haiku behind WebFetch/WebSearch.
+        cli_cost_state["side_model_cost_usd"] = round(
+            sum(c for m, c in model_cost.items() if m not in used_models), 6)
         # Only meaningful when cost-state covers the whole transcript.
         if not cost_state.get("partial"):
-            cli_cost_state["gap_usd"] = round(cost_state["total_cost_usd"] - hook_cost, 6)
+            cli_cost_state["gap_usd"] = round(cli_cost - hook_cost, 6)
+    continued_from = None
+    if continuation.get("predecessor"):
+        continued_from = {
+            "session_id": continuation["predecessor"],
+            "copied_turns": sum(1 for t in turns if t.get("copied")),
+            "copied_messages": len(continuation.get("message_ids", ())),
+        }
 
     session_rollups = {
         **{k: v for k, v in session_state.items()},
-        "turn_count": len(turns),
-        "tool_calls_total": sum(len(t["tool_calls"]) for t in turns),
-        "total_tokens": sum(t["usage"]["total"] for t in turns),
-        "total_input_tokens": sum(t["usage"]["input"] for t in turns),
-        "total_output_tokens": sum(t["usage"]["output"] for t in turns),
+        "turn_count": len(own_turns),
+        "tool_calls_total": sum(len(t["tool_calls"]) for t in own_turns),
+        "total_tokens": sum(t["usage"]["total"] for t in own_turns),
+        "total_input_tokens": sum(t["usage"]["input"] for t in own_turns),
+        "total_output_tokens": sum(t["usage"]["output"] for t in own_turns),
         "session_cost_usd": round(session_cost, 6),
         "subagent_costs": subagent_costs,
         "api_errors": api_errors if has_errors else None,
@@ -3435,13 +3618,13 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
         "skill_attribution": skill_attribution,
         "compaction": compaction,
         "permission_timeline": permission_timeline,
-        "total_iterations": sum(t.get("iteration_count", 0) for t in turns),
-        "active_duration": build_active_duration_summary(turns),
+        "total_iterations": sum(t.get("iteration_count", 0) for t in own_turns),
+        "active_duration": build_active_duration_summary(own_turns),
         "stop_reasons": stop_reasons,
-        "cost_by_model": build_model_cost_breakdown(turns),
-        "opus_5_5_savings": build_opus_5_5_savings(turns),
-        "cache_miss": build_cache_miss_summary(turns),
-        "thinking": build_thinking_summary(turns),
+        "cost_by_model": build_model_cost_breakdown(own_turns),
+        "opus_5_5_savings": build_opus_5_5_savings(own_turns),
+        "cache_miss": build_cache_miss_summary(own_turns),
+        "thinking": build_thinking_summary(own_turns),
         "turn_signals": turn_signals,
         "background_tasks": background_tasks or None,
         "session_crons": session_crons or None,
@@ -3454,15 +3637,16 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
         "rate_limits": rate_limits,
         "scheduled_tasks": scheduled_tasks,
         "continued_in": continued_in or None,
+        "continued_from": continued_from,
         "relocations": relocations,
         "tags": session_tags,
     }
     batch.extend(build_hook_score_events(
         session_id=session_id,
-        turns=turns,
+        turns=own_turns,
         session_cost=hook_cost,
         rollups={k: v for k, v in session_rollups.items() if v is not None},
-        cli_cost=cost_state["total_cost_usd"] if cost_state else None,
+        cli_cost=cli_cost,
     ))
 
     sent_turns = sendable - min(prev_turn_count, sendable)

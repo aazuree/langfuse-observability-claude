@@ -51,7 +51,7 @@ python3 langfuse-hook.py --reprocess
 
 - **Dashboard**: http://localhost:3100
 - **Hook log**: `~/.claude/langfuse-hook.log` (auto-rotates at 10 MB)
-- **State files**: `~/.claude/langfuse-state/<session_id>.offset` (parent: line offset + number of turns sent), `<session_id>.subagents.json` (subagents), `<session_id>.lock` (per-session `flock`: fires of one session run one at a time, waiting up to `SESSION_LOCK_TIMEOUT_S = 180`; needed because the hook runs `"async": true`)
+- **State files**: `~/.claude/langfuse-state/<session_id>.offset` (parent: line offset + number of turns sent), `<session_id>.subagents.json` (subagents), `<session_id>.lock` (per-session `flock`: fires of one session run one at a time, waiting up to `SESSION_LOCK_TIMEOUT_S = 180`; needed because the hook runs `"async": true`), `<session_id>.continuation.json` (the session this one continues and what it copied from it, resolved once; `{"predecessor": ""}` for most sessions; kept by `--delete-traces`, since it records facts about transcripts)
 
 ### Reading the send result
 
@@ -142,6 +142,7 @@ tests/
   test_cli_signals_2_1_300.py    # cost-state, async hook responses, rate limits, scheduled tasks, continued-in, relocated
   test_fork_context_copy.py      # A fork's copy of its spawning message is billed once, by the spawner
   test_split_message_usage.py    # A message whose entries span two turns is counted once
+  test_continued_sessions.py     # A continued session's copy of its predecessor is sent and billed once
   test_robustness.py             # Atomic state writes, logged crashes
   test_delete_traces.py          # --delete-traces (every per-turn trace, the old session trace, session scores)
   test_setup_tools.py            # tools/render_env.py and tools/configure_hooks.py
@@ -372,8 +373,10 @@ checked against aws.amazon.com/bedrock/pricing.
 > - `system/scheduled_task_fire` + `scheduledTaskId` on the prompt it writes — rollup
 >   `scheduled_tasks`, per-generation `scheduled_task_id`, tag `scheduled-task`.
 > - `continued-in` (`continuedInSessionId`) — rollup `continued_in`, tag `continued`.
->   **Known gap:** the successor transcript repeats the predecessor's messages (same
->   `message.id`), so both sessions bill them (11 pairs, ~$9.9 on 2026-10-18).
+>   The successor transcript starts with a copy of the predecessor's history (same
+>   `uuid`s and message ids, `sessionId` rewritten), which both sessions billed until
+>   2026-10-18 (8 of 11 local pairs, $9.93). The predecessor now keeps the copy; see
+>   "Continued sessions" under Important Notes.
 > - `relocated` (`relocatedCwd`, e.g. entering a worktree) — rollup `relocations`.
 > - `attributionAgent` (subagent transcripts only; equal to the `.meta.json` `agentType`
 >   in 96/96) — per-generation `attribution_agent` on subagent generations.
@@ -496,6 +499,7 @@ Session-wide rollups are not on the traces: they ride on the session-level
 - `rate-limited` — present when a request was refused for quota (`quotaLimits.status: rejected`); see `rate_limits` metadata
 - `scheduled-task` — present when a session cron task fired in the session (`system/scheduled_task_fire`, or a prompt carrying `scheduledTaskId`)
 - `continued` — present when the session was continued in another one (`continued-in`); see `continued_in` metadata
+- `continuation` — present when the session continues another one; see `continued_from` metadata
 - `stop-reason:<reason>` — one per distinct **anomalous** terminal `stop_reason` in the session (`max_tokens`, `stop_sequence`, `refusal`, `pause_turn`, or any unknown reason). The high-frequency normal reasons `end_turn` (turn done) and `tool_use` (paused to call a tool) are **not** tagged — they'd flood every trace with no signal (`NORMAL_STOP_REASONS`). Full per-reason counts live in the `stop_reasons` metadata regardless. Filter on `stop-reason:max_tokens` to find turns whose output was truncated at the token cap.
 
 **`session_title` precedence:**
@@ -551,11 +555,12 @@ also repeats the session state listed above and the full `tags` list.
 - `permission_timeline` — `{modes_used (sorted distinct), sequence (file-order, consecutive dups collapsed), transition_count, ever_bypass, ever_accept_edits}` from `permission-mode` entries. Complements the last-observed `permission_mode`/`permission:<mode>` tag with the full transition history. **No timestamps** on these entries → sequence is order-only, not timed. Null when no `permission-mode` entries. From `extract_permission_timeline()`.
 - `worktree` — `{name, branch, original_cwd, original_branch, original_head_commit}` from the last `type: "worktree-state"` entry. Null when the session never entered a worktree. From `extract_worktree_state()`.
 - `background_tasks` / `session_crons` — raw lists from the Stop hook stdin payload (v2.1.145+). Live fires only; omitted on reprocess.
-- `cli_cost_state` — Claude Code's own totals from the last `cost-state` entry: `{total_cost_usd, hook_cost_usd (parent + subagents, = the session_cost_usd score), gap_usd (total − hook; omitted when partial), side_model_cost_usd (cost of models that answered no message, main or subagent: mostly the WebFetch/WebSearch Haiku), covers_from (process startTime, ISO), partial (startTime > COST_STATE_PARTIAL_S = 120 s after the first entry), api_duration_ms, api_duration_without_retries_ms, tool_duration_ms, wall_duration_ms, lines_added, lines_removed, has_unknown_model_cost, by_model: {<model>: {cost_usd, input_tokens, output_tokens, thinking_tokens, cache_read_tokens, cache_create_tokens, web_search_requests}}}`. A positive `gap_usd` is spend the transcript never records (see the v2.1.300 census note for its four parts); a negative one is the hook over-counting. Retry time = `api_duration_ms − api_duration_without_retries_ms`. Absent until the CLI writes the entry on exit. From `extract_cost_state()`.
+- `cli_cost_state` — Claude Code's own totals from the last `cost-state` entry: `{total_cost_usd, hook_cost_usd (parent + subagents, = the session_cost_usd score), gap_usd (total − hook; omitted when partial), side_model_cost_usd (cost of models that answered no message, main or subagent: mostly the WebFetch/WebSearch Haiku), covers_from (process startTime, ISO), partial (startTime > COST_STATE_PARTIAL_S = 120 s after the first entry), api_duration_ms, api_duration_without_retries_ms, tool_duration_ms, wall_duration_ms, lines_added, lines_removed, has_unknown_model_cost, by_model: {<model>: {cost_usd, input_tokens, output_tokens, thinking_tokens, cache_read_tokens, cache_create_tokens, web_search_requests}}}`. A positive `gap_usd` is spend the transcript never records (see the v2.1.300 census note for its four parts); a negative one is the hook over-counting. Retry time = `api_duration_ms − api_duration_without_retries_ms`. Absent until the CLI writes the entry on exit. In a continuation (same CLI process: equal cost-state `startTime`) the CLI total carries on from the predecessor's, so `predecessor_cost_usd` (its total as of its `continued-in`) is subtracted for `gap_usd` and the `cli_cost_usd` score, and its per-model cost for `side_model_cost_usd`. From `extract_cost_state()`.
 - `async_hooks` — `{count, failures, by_hook: {<hookName>: {count, failures}}, last_failure: {hook, exit_code, stderr, timestamp}}` from `async_hook_response` attachments. `stderr` is redacted, then truncated to 200 chars; only the last failure keeps it. From `extract_async_hook_responses()`.
 - `rate_limits` — `{count, by_status, by_type, last: {status, type, resets_at (ISO UTC), overage_status, overage_disabled_reason, is_using_overage, timestamp}}` from `quotaLimits` (fallback `apiErrorParams.rate_limit_info`) on assistant entries. From `extract_rate_limits()`.
 - `scheduled_tasks` — `{count, tasks: {<taskId>: {cron, fires, first_at, last_at}}}` from `system/scheduled_task_fire`. The fire's prompt is not stored (it is the opened turn's input). From `extract_scheduled_task_fires()`.
 - `continued_in` — id of the session this one was continued in, from `continued-in`. From `extract_continued_in()`.
+- `continued_from` — `{session_id, copied_turns, copied_messages}` when this session continues another: the predecessor and how much of this transcript is its copy (turns sent and billed by the predecessor, skipped here). From `resolve_continuation()`.
 - `relocations` — `{count, cwds (distinct, first-seen order, max 10), last_cwd}` from `relocated` entries. From `extract_relocations()`.
 - `subagent_costs` — see Subagent Cost Tracking. Each agent also carries `models`, `classifier_requests` and `partial_messages` (read from its whole transcript on every full read), and the rollup sums the last as `partial_messages`.
 - `classifier_requests` — distinct auto-mode classifier calls (`serverClassifierRequest`) across the main and subagent transcripts. Their cost is only in cost-state. From `count_classifier_requests()`.
@@ -720,6 +725,31 @@ flags these as missing; it is the session-wide count that must match.
   (It used to reset state itself, and v4 keeps every export, so a reprocess without a
   completed delete doubled cost.)
 
+- **Continued sessions are billed once (2026-10-18).** When Claude Code continues a
+  session in a new one, it writes `continued-in` into the old transcript and starts the
+  new one with a copy of the old history (same entry `uuid`s and message ids). The
+  continuation can happen mid-turn, before the old session ever fired a Stop. The
+  predecessor keeps the copy:
+  - **Discovery** (`resolve_continuation`): on its first fire with new lines, a session
+    scans the last 64 KB of every other transcript in its project dir for a
+    `continued-in` naming it (~2 ms for 61 transcripts), then caches the answer in
+    `<session>.continuation.json`. `continued-in` is written before the new session's
+    own first entry, so the first fire sees it and "none" is safe to cache.
+  - **Flush** (`flush_predecessor`): while the predecessor's state is behind its
+    transcript, the successor first runs `process_session` on it with `final` (it is
+    over), so the copied part is sent once, under the predecessor.
+  - **Skip**: `build_turns(..., copied_message_ids)` leaves copied messages' usage and
+    tool calls out and marks all-copied turns `copied`; those are not sent, and turn
+    indices (trace ids, `prev_turn_count`) are unchanged. The turn that straddles the
+    cut is sent with only the successor's own messages — the predecessor sent its
+    half as its last turn. Rollups, scores and every `extract_*` read only the
+    successor's own entries (`own_entries`, without the copied `uuid`s).
+  - `--reprocess` works in either order: the successor flushes the predecessor if it
+    comes first, and skips the copy if the predecessor already sent it.
+  - Sessions continued before this fix: their session scores correct themselves on the
+    next fire or `--reprocess` (they upsert), but the copied turn traces already sent
+    stay until `--delete-traces` + `--reprocess`. A successor whose predecessor
+    transcript is gone (30-day retention) cannot be matched and keeps the copy.
 - **ClickHouse system logs are capped** by `clickhouse/config.d/z_system_logs.xml`: the noisy `system.*` log tables are disabled, `query_log` / `part_log` keep 30 days, the server log is at `warning`. Left alone they grow without limit and dwarf the Langfuse data. The config only shapes newly created tables; an existing stack drops the old ones once (REMOTE-DEPLOY.md, "ClickHouse system logs")
 - `.env` contains generated secrets - never commit it
 - The hook never blocks Claude Code: `setup.sh` registers it on Stop / StopFailure / SessionEnd with `"async": true`, and every error, including an unexpected crash, goes to the hook log. A hook registered without `async` runs in the foreground (measured: median 0.8s, max 23s per Stop)
@@ -737,7 +767,7 @@ Scores attach to the **session** (`sessionId`, not a turn trace) and are recompu
 | `cache_hit_rate` | Numeric | 0.0-1.0 | cache_read / (cache_read + cache_creation) |
 | `tool_error_rate` | Numeric | 0.0-1.0 | executed calls with `[ERROR]` output / executed calls |
 | `tool_denial_rate` | Numeric | 0.0-1.0 | denied calls / all attempted calls |
-| `cli_cost_usd` | Numeric | USD | Claude Code's own total from the last `cost-state` entry; omitted until the CLI writes it on exit. Compare with `session_cost_usd` (`cli_cost_state.gap_usd`) |
+| `cli_cost_usd` | Numeric | USD | Claude Code's own total from the last `cost-state` entry (minus the predecessor's in a continuation); omitted until the CLI writes it on exit. Compare with `session_cost_usd` (`cli_cost_state.gap_usd`) |
 
 All are deterministic (no LLM calls). Score IDs are `uuid5(session:score:<name>)`, so
 each fire overwrites the previous value. The three rates are omitted entirely when their denominator is zero
