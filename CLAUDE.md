@@ -140,6 +140,8 @@ tests/
   test_turn_merging.py           # Consecutive user entries before a reply form one turn
   test_session_lock.py           # Per-session lock for overlapping (async) fires
   test_cli_signals_2_1_300.py    # cost-state, async hook responses, rate limits, scheduled tasks, continued-in, relocated
+  test_fork_context_copy.py      # A fork's copy of its spawning message is billed once, by the spawner
+  test_split_message_usage.py    # A message whose entries span two turns is counted once
   test_robustness.py             # Atomic state writes, logged crashes
   test_delete_traces.py          # --delete-traces (every per-turn trace, the old session trace, session scores)
   test_setup_tools.py            # tools/render_env.py and tools/configure_hooks.py
@@ -687,6 +689,18 @@ Trace (one parent turn; session.id groups the turns)
 Session score `session_cost_usd` → metadata `subagent_costs` summary
 
 **Exclusions:** `aside_question` subagents are skipped (internal sidechain queries).
+
+**Forked subagents (`agentType: fork`):** the transcript starts with a `fork-context-ref`
+entry (`parentSessionId`, `parentLastUuid`), then a **copy of the spawner's assistant
+message that made the Agent call** — same `message.id`, same usage, new timestamp — and
+only then the first user-text entry (the call's `tool_result` plus the fork's directive).
+That copy is the spawner's API call, already billed in the spawner's turns, so
+`build_turns` leaves it out: assistant entries before the first user text belong to no
+turn. Do not fold them into the first turn — that bills the spawning message once more
+per fork (census 2026-10-18: 6/6 fork transcripts; three forks of one message would add
+3 × its 7,740 output tokens). A per-transcript "sum of messages = sum of turns" check
+flags these as missing; it is the session-wide count that must match.
+`tests/test_fork_context_copy.py` pins this.
 
 **State:** Subagent offsets stored in `~/.claude/langfuse-state/<session_id>.subagents.json`. Both state files are saved only after a successful send — so a timeout retry re-ingests subagent events rather than skipping them. The parent's own cost is recomputed from the whole transcript each fire (`session_cost_usd` rollup).
 

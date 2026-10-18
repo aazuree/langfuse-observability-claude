@@ -1468,6 +1468,11 @@ def build_turns(entries: list[dict]) -> list[dict]:
                         t["duration_ms"] = me["duration_ms"]
                     break
 
+        # Assistant entries before the first user text belong to no turn and are
+        # not counted. The only ones seen are in forked subagents: a copy of the
+        # spawner's Agent-call message (same message.id and usage), written after
+        # `fork-context-ref`. The spawner's turns already bill it; counting it
+        # here would bill it again for every fork of that message.
         elif role == "assistant" and current_turn:
             content = me["content"]
             mid = me["message_id"]
