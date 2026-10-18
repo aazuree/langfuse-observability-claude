@@ -5,6 +5,7 @@ stubs, `system/scheduled_task_fire` and `scheduledTaskId`, `continued-in`,
 `relocated`, `attributionAgent` and `perTurnEffort`."""
 import importlib.util
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 from helpers import session_rollups
@@ -41,12 +42,16 @@ def _asst(mid, *, model="claude-opus-4-8", inp=5, out=3,
     }
 
 
-def _cost_state(total=0.5, **extra):
+# 2026-10-18T10:00:00Z, the first entry of the fixtures below, in epoch ms.
+_START_MS = int(datetime(2026, 10, 18, 10, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
+
+
+def _cost_state(total=0.5, start_ms=_START_MS, **extra):
     return {
         "type": "cost-state", "totalCostUSD": total,
         "totalAPIDuration": 9000, "totalAPIDurationWithoutRetries": 7000,
         "totalToolDuration": 1200, "totalLinesAdded": 12, "totalLinesRemoved": 4,
-        "totalDuration": 60000, "startTime": 1792338605646,
+        "totalDuration": 60000, "startTime": start_ms,
         "hasUnknownModelCost": False,
         "modelUsage": {
             "claude-opus-5-5": {
@@ -151,6 +156,8 @@ class TestExtractCostState:
             "lines_added": 12,
             "lines_removed": 4,
             "has_unknown_model_cost": False,
+            "covers_from": "2026-10-18T10:00:00Z",
+            "partial": False,
             "by_model": {
                 "claude-opus-5-5": {
                     "cost_usd": 0.1, "input_tokens": 10, "output_tokens": 20,
@@ -173,6 +180,18 @@ class TestExtractCostState:
         out = hook.extract_cost_state(_write(
             [{"type": "cost-state", "totalCostUSD": 1.25, "modelUsage": "nope"}], tmp_path))
         assert out == {"total_cost_usd": 1.25}
+
+    def test_partial_when_the_process_started_after_the_first_entry(self, tmp_path):
+        # A resumed session whose earlier process's cost was not restored.
+        late = _START_MS + 3 * 60 * 1000
+        out = hook.extract_cost_state(_write([_user("hi"), _cost_state(start_ms=late)], tmp_path))
+        assert out["partial"] is True
+        assert out["covers_from"] == "2026-10-18T10:03:00Z"
+
+    def test_not_partial_within_two_minutes(self, tmp_path):
+        out = hook.extract_cost_state(_write(
+            [_user("hi"), _cost_state(start_ms=_START_MS + 90 * 1000)], tmp_path))
+        assert out["partial"] is False
 
 
 # ------------------------------------------------------------ async hooks
@@ -372,3 +391,118 @@ class TestProcessSession:
 
     def test_cli_cost_score_is_deleted_with_the_session(self):
         assert "cli_cost_usd" in hook.SESSION_SCORE_NAMES
+
+
+# ------------------------------------------------------------ gap attribution
+
+def _sub_asst(mid, ts, *, stop_reason, classifier=None, model="claude-sonnet-5-5", out=5,
+              content=None):
+    entry = {
+        "type": "assistant", "timestamp": ts, "isSidechain": True,
+        "message": {"id": mid, "role": "assistant", "model": model,
+                    "stop_reason": stop_reason,
+                    "content": content or [{"type": "text", "text": "x"}],
+                    "usage": {"input_tokens": 3, "output_tokens": out}},
+    }
+    if classifier:
+        entry["serverClassifierRequest"] = classifier
+    return entry
+
+
+def _tool_use_block(tid, name="Bash"):
+    return [{"type": "tool_use", "id": tid, "name": name, "input": {}}]
+
+
+def _tool_result_entry(tid, ts):
+    return {"type": "user", "timestamp": ts,
+            "message": {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": tid, "content": "ok"}]}}
+
+
+class TestGapAttribution:
+    """Signals that explain cli_cost_state.gap_usd (2026-10-18 census of 85
+    sessions: $65.79 = WebFetch/WebSearch Haiku backend $35.28 + auto-mode
+    classifier ~$19.9 + under-recorded subagent output $6.31 + the CLI's
+    Sonnet 5.5 cache-read rate ~$4.26)."""
+
+    def _session(self, tmp_path, monkeypatch, cost_state=None):
+        parent = [
+            _user("delegate it"),
+            {**_asst("pm1", model="claude-opus-5-5", ts="2026-10-18T10:00:01Z",
+                     serverClassifierRequest="cA"),
+             "message": {"id": "pm1", "role": "assistant", "model": "claude-opus-5-5",
+                         "stop_reason": "tool_use",
+                         "content": _tool_use_block("toolu_agent1", "Agent"),
+                         "usage": {"input_tokens": 5, "output_tokens": 3}}},
+            _tool_result_entry("toolu_agent1", "2026-10-18T10:05:00Z"),
+            _asst("pm2", model="claude-opus-5-5", ts="2026-10-18T10:05:01Z",
+                  serverClassifierRequest="cB"),
+            _asst("pm2", model="claude-opus-5-5", ts="2026-10-18T10:05:02Z",
+                  serverClassifierRequest="cB"),
+        ]
+        if cost_state:
+            parent.append(cost_state)
+        transcript = tmp_path / "sess.jsonl"
+        transcript.write_text("\n".join(json.dumps(e) for e in parent) + "\n")
+
+        sub_dir = tmp_path / "sess" / "subagents"
+        sub_dir.mkdir(parents=True)
+        sub = [
+            _user("subtask", ts="2026-10-18T10:00:02Z"),
+            # Stream-start entries only (CC 2.1.289+): no final entry, stop_reason null.
+            _sub_asst("sm1", "2026-10-18T10:00:03Z", stop_reason=None, classifier="cS1",
+                      content=_tool_use_block("t1")),
+            _tool_result_entry("t1", "2026-10-18T10:00:04Z"),
+            _sub_asst("sm2", "2026-10-18T10:00:05Z", stop_reason=None, classifier="cS2",
+                      content=_tool_use_block("t2")),
+            _tool_result_entry("t2", "2026-10-18T10:00:06Z"),
+            _sub_asst("sm3", "2026-10-18T10:00:07Z", stop_reason="end_turn"),
+        ]
+        (sub_dir / "agent-sub1.jsonl").write_text("\n".join(json.dumps(e) for e in sub) + "\n")
+        (sub_dir / "agent-sub1.meta.json").write_text(json.dumps(
+            {"agentType": "general-purpose", "description": "task", "toolUseId": "toolu_agent1"}))
+
+        captured = {}
+        monkeypatch.setattr(hook, "send_to_langfuse",
+                            lambda batch: captured.setdefault("batch", batch) or True)
+        monkeypatch.setattr(hook, "STATE_DIR", str(tmp_path / "state"))
+        hook.process_session("sess-gap", str(transcript), "/x/repo", final=True)
+        batch = captured["batch"]
+        tags = next(e for e in batch if e["type"] == "trace-create")["body"]["tags"]
+        return session_rollups(batch), tags
+
+    def test_classifier_requests_counted_across_main_and_subagents(self, tmp_path, monkeypatch):
+        md, _ = self._session(tmp_path, monkeypatch)
+        # main: cA, cB (cB on two entries of one message); subagent: cS1, cS2
+        assert md["classifier_requests"] == 4
+        agent = md["subagent_costs"]["agents"][0]
+        assert agent["classifier_requests"] == 2
+
+    def test_partial_subagent_messages_flagged(self, tmp_path, monkeypatch):
+        md, tags = self._session(tmp_path, monkeypatch)
+        agent = md["subagent_costs"]["agents"][0]
+        assert agent["partial_messages"] == 2
+        assert md["subagent_costs"]["partial_messages"] == 2
+        assert "subagent-usage-partial" in tags
+
+    def test_side_model_cost_is_models_no_message_used(self, tmp_path, monkeypatch):
+        md, _ = self._session(tmp_path, monkeypatch, cost_state=_cost_state(total=0.5))
+        # opus-5-5 answers the main thread, the subagent is sonnet-5-5;
+        # haiku-5-5 (the WebFetch/WebSearch backend) appears in no message.
+        assert md["subagent_costs"]["agents"][0]["models"] == ["claude-sonnet-5-5"]
+        assert md["cli_cost_state"]["side_model_cost_usd"] == 0.4
+
+    def test_partial_cost_state_has_no_gap(self, tmp_path, monkeypatch):
+        late = _START_MS + 60 * 60 * 1000
+        md, _ = self._session(tmp_path, monkeypatch,
+                              cost_state=_cost_state(total=0.5, start_ms=late))
+        assert md["cli_cost_state"]["partial"] is True
+        assert "gap_usd" not in md["cli_cost_state"]
+
+    def test_final_last_message_is_not_partial(self, tmp_path):
+        entries = [_user("go"),
+                   _sub_asst("a", "2026-10-18T10:00:01Z", stop_reason="end_turn"),
+                   _user("more", ts="2026-10-18T10:00:02Z"),
+                   _sub_asst("b", "2026-10-18T10:00:03Z", stop_reason=None)]
+        # "b" is the last message and may still be streaming: not counted.
+        assert hook.count_partial_messages(entries) == 0

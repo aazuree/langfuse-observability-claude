@@ -245,7 +245,7 @@ These stack multiplicatively on the base rates above (and apply uniformly across
 
 ### Server-side Tool Billing
 
-- **Web search**: $0.01 per request (`$10 / 1,000 searches`). Billed via `costDetails.web_search` line item using `web_search_requests` from `usage.server_tool_use`. Added to turn total.
+- **Web search**: $0.01 per request (`$10 / 1,000 searches`). Billed via `costDetails.web_search` line item using `web_search_requests` from `usage.server_tool_use`. Added to turn total. **Claude Code's WebSearch tool does not show up here:** the search runs in a separate Haiku request that the transcript never records, so the main thread's `web_search_requests` is 0 and the fee is only in cost-state (`cli_cost_state.side_model_cost_usd`).
 - **Web fetch**: free (token cost only).
 - **Code execution**: $0.05/container-hour after 1,550 free hours/org/month. Not currently emitted by Claude Code; not billed.
 
@@ -340,14 +340,28 @@ checked against aws.amazon.com/bedrock/pricing.
 >
 > Second census against **v2.1.300** (2026-10-18, 199 transcripts incl. subagents). Now
 > captured:
-> - `cost-state` entry — Claude Code's own running cost. Cumulative across resumes (same
->   `startTime`, totals only grow), so the last entry is the session total. Written when
->   the CLI exits: **before** `SessionEnd` fires, never before `Stop` (tested with a
->   throwaway hook on 2.1.300), so live Stop fires lack it and a SessionEnd fire or
+> - `cost-state` entry — Claude Code's own running cost. Usually cumulative across resumes
+>   (same `startTime`, totals only grow), so the last entry is the session total — but 5 of
+>   85 local sessions had a `startTime` after their first entry (an earlier process, e.g.
+>   CC 2.1.252, whose cost was not restored); those get `partial: true` and no `gap_usd`.
+>   Written when the CLI exits: **before** `SessionEnd` fires, never before `Stop` (tested
+>   with a throwaway hook on 2.1.300), so live Stop fires lack it and a SessionEnd fire or
 >   `--reprocess` fills it in. Rollup `cli_cost_state` + score `cli_cost_usd`. Tokens and
 >   cost match the hook to the cent where the transcript records every call (a
->   price-watch run); the gap is calls the transcript never records, e.g. the Haiku
->   requests behind WebSearch (~$0.01 per search on top of the search fee).
+>   `bypassPermissions` price-watch run: no classifier calls). Over the 85 sessions that
+>   cost-state covers whole, CLI − hook = $65.79, made of exactly four parts:
+>   - $35.28 — the Haiku calls behind WebFetch (page summaries) and WebSearch, including
+>     the $0.01 search fee. Not in any transcript: `side_model_cost_usd`.
+>   - ~$19.9 — auto-mode classifier calls on the session's model, one per classified tool
+>     call (mostly cache reads, ~10 output tokens). Cost not in the transcript; the count is
+>     (distinct `serverClassifierRequest`): `classifier_requests`.
+>   - $6.31 — subagent output under-recorded: since CC 2.1.289 subagent transcripts often
+>     keep only a message's stream-start entries (0–21% of subagent messages end on a final
+>     entry, 99–100% on the main thread). Detectable, not recoverable:
+>     `subagent_costs.partial_messages`, tag `subagent-usage-partial`. The parent's Agent
+>     `toolUseResult.usage` carries only the agent's **final** message's usage.
+>   - ~$4.26 — Claude Code prices **Sonnet 5.5 cache reads at $0.20/M**; the pricing page
+>     says $0.10/M (0.05x, re-verified 2026-10-18). The CLI is wrong here, not the hook.
 > - `async_hook_response` attachments — exit code + stderr of every `"async": true` hook.
 >   The only place a failing background hook shows up (it caught this hook's Stop command
 >   exiting 2 during the 2026-10-11 migration). Rollup `async_hooks`, tag `has-hook-failures`.
@@ -365,8 +379,7 @@ checked against aws.amazon.com/bedrock/pricing.
 >   on `<synthetic>` stubs, which `build_turns` skips. Used as a fallback for a missing
 >   `effort`, never as an override.
 >
-> Seen but **not captured**: `turnPosition`, `apiBlockIndex`, `serverClassifierRequest`,
-> `requestRef`, `thinkingDisplay`, `input_transformations`, `wireToolInputs` /
+> Seen but **not captured**: `turnPosition`, `apiBlockIndex`, `requestRef`, `thinkingDisplay`, `input_transformations`, `wireToolInputs` /
 > `wireIngestContext` (raw tool inputs, already in tool spans), `usage.fallback_credit`
 > (always null so far), `credential_org` (org UUID), `hook_success` attachments (hook
 > stdout, PII + size; `system/stop_hook_summary` already covers Stop), and the
@@ -476,6 +489,7 @@ Session-wide rollups are not on the traces: they ride on the session-level
 - `has-background-tasks` — present when the Stop payload carried running background tasks
 - `has-subagents`, `subagents:<count>` — present when the session dispatched subagents
 - `nested-subagents` — present when any ingested subagent was spawned by another subagent (depth ≥ 2; CC 2.1.172+)
+- `subagent-usage-partial` — present when a subagent message's transcript entries stop before its final one (CC 2.1.289+); its output tokens, and so the subagent cost, are a lower bound. See `subagent_costs.partial_messages`
 - `has-hook-failures` — present when an `"async": true` hook exited non-zero (`async_hook_response` attachments); see `async_hooks` metadata
 - `rate-limited` — present when a request was refused for quota (`quotaLimits.status: rejected`); see `rate_limits` metadata
 - `scheduled-task` — present when a session cron task fired in the session (`system/scheduled_task_fire`, or a prompt carrying `scheduledTaskId`)
@@ -535,13 +549,14 @@ also repeats the session state listed above and the full `tags` list.
 - `permission_timeline` — `{modes_used (sorted distinct), sequence (file-order, consecutive dups collapsed), transition_count, ever_bypass, ever_accept_edits}` from `permission-mode` entries. Complements the last-observed `permission_mode`/`permission:<mode>` tag with the full transition history. **No timestamps** on these entries → sequence is order-only, not timed. Null when no `permission-mode` entries. From `extract_permission_timeline()`.
 - `worktree` — `{name, branch, original_cwd, original_branch, original_head_commit}` from the last `type: "worktree-state"` entry. Null when the session never entered a worktree. From `extract_worktree_state()`.
 - `background_tasks` / `session_crons` — raw lists from the Stop hook stdin payload (v2.1.145+). Live fires only; omitted on reprocess.
-- `cli_cost_state` — Claude Code's own totals from the last `cost-state` entry: `{total_cost_usd, hook_cost_usd (parent + subagents, = the session_cost_usd score), gap_usd (total − hook), api_duration_ms, api_duration_without_retries_ms, tool_duration_ms, wall_duration_ms, lines_added, lines_removed, has_unknown_model_cost, by_model: {<model>: {cost_usd, input_tokens, output_tokens, thinking_tokens, cache_read_tokens, cache_create_tokens, web_search_requests}}}`. A positive `gap_usd` is spend the transcript never records (WebSearch's Haiku backend; per `by_model`); a negative one is the hook over-counting. Retry time = `api_duration_ms − api_duration_without_retries_ms`. Absent until the CLI writes the entry on exit. From `extract_cost_state()`.
+- `cli_cost_state` — Claude Code's own totals from the last `cost-state` entry: `{total_cost_usd, hook_cost_usd (parent + subagents, = the session_cost_usd score), gap_usd (total − hook; omitted when partial), side_model_cost_usd (cost of models that answered no message, main or subagent: mostly the WebFetch/WebSearch Haiku), covers_from (process startTime, ISO), partial (startTime > COST_STATE_PARTIAL_S = 120 s after the first entry), api_duration_ms, api_duration_without_retries_ms, tool_duration_ms, wall_duration_ms, lines_added, lines_removed, has_unknown_model_cost, by_model: {<model>: {cost_usd, input_tokens, output_tokens, thinking_tokens, cache_read_tokens, cache_create_tokens, web_search_requests}}}`. A positive `gap_usd` is spend the transcript never records (see the v2.1.300 census note for its four parts); a negative one is the hook over-counting. Retry time = `api_duration_ms − api_duration_without_retries_ms`. Absent until the CLI writes the entry on exit. From `extract_cost_state()`.
 - `async_hooks` — `{count, failures, by_hook: {<hookName>: {count, failures}}, last_failure: {hook, exit_code, stderr, timestamp}}` from `async_hook_response` attachments. `stderr` is redacted, then truncated to 200 chars; only the last failure keeps it. From `extract_async_hook_responses()`.
 - `rate_limits` — `{count, by_status, by_type, last: {status, type, resets_at (ISO UTC), overage_status, overage_disabled_reason, is_using_overage, timestamp}}` from `quotaLimits` (fallback `apiErrorParams.rate_limit_info`) on assistant entries. From `extract_rate_limits()`.
 - `scheduled_tasks` — `{count, tasks: {<taskId>: {cron, fires, first_at, last_at}}}` from `system/scheduled_task_fire`. The fire's prompt is not stored (it is the opened turn's input). From `extract_scheduled_task_fires()`.
 - `continued_in` — id of the session this one was continued in, from `continued-in`. From `extract_continued_in()`.
 - `relocations` — `{count, cwds (distinct, first-seen order, max 10), last_cwd}` from `relocated` entries. From `extract_relocations()`.
-- `subagent_costs` — see Subagent Cost Tracking.
+- `subagent_costs` — see Subagent Cost Tracking. Each agent also carries `models`, `classifier_requests` and `partial_messages` (read from its whole transcript on every full read), and the rollup sums the last as `partial_messages`.
+- `classifier_requests` — distinct auto-mode classifier calls (`serverClassifierRequest`) across the main and subagent transcripts. Their cost is only in cost-state. From `count_classifier_requests()`.
 
 Extracted from the first `type: "user"` entry in the JSONL transcript via `extract_session_metadata()`.
 API errors extracted from `type: "system"` / `subtype: "api_error"` entries via `extract_api_errors()`.

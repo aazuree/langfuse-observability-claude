@@ -318,6 +318,8 @@ def _file_size(path: str) -> int | None:
 # sa_state bookkeeping that is not reported in trace metadata (a path would
 # also leak the local username).
 _SA_STATE_ONLY_KEYS = frozenset({"path", "size", "parent_span_id", "trace_id", "offset", "correlation"})
+# Per-agent facts ingest_subagent reads from the whole transcript.
+_SA_OBSERVED_KEYS = ("models", "classifier_requests", "partial_messages")
 
 
 def _subagent_record(prev: dict, events: list, cost: dict, offset: int,
@@ -333,11 +335,15 @@ def _subagent_record(prev: dict, events: list, cost: dict, offset: int,
     without finding its Agent call again — a background agent keeps writing
     after the parent turn that launched it has been sent.
     """
+    # Read from the whole transcript on every full read, so they refresh even
+    # when the read sent nothing new (an agent recorded before they existed).
+    observed = {k: cost[k] for k in _SA_OBSERVED_KEYS if k in cost}
     if not events and prev:
-        return {**prev, **fields, "offset": offset}
+        return {**prev, **fields, **observed, "offset": offset}
     return {
         **prev,
         **fields,
+        **observed,
         "offset": offset,
         "turn_count": turn_count,
         "status": status,
@@ -597,6 +603,9 @@ def ingest_subagent(
         "turns": len(turns),
         "status": status,
         "cost_breakdown": {k: round(v, 6) for k, v in cost_breakdown.items()},
+        "models": sorted(message_models(entries)),
+        "classifier_requests": count_classifier_requests(entries),
+        "partial_messages": count_partial_messages(entries),
     }
     return events, cost_summary, total_lines, max(prior_turn_count, sendable), status
 
@@ -1785,17 +1794,29 @@ _COST_STATE_MODEL_KEYS = (
 )
 
 
+# A cost-state whose process started this long after the transcript's first
+# entry does not cover the whole session.
+COST_STATE_PARTIAL_S = 120
+
+
 def extract_cost_state(transcript_path: str) -> dict | None:
     """Claude Code's own running cost, from the last `cost-state` entry.
 
-    Written when the CLI exits — before SessionEnd fires, never before Stop —
-    and cumulative across resumes, so the last entry is the session total. It
-    counts API calls the transcript never records, such as the Haiku requests
-    behind WebSearch, so it can exceed the hook's cost; the rollup's `gap_usd`
-    shows by how much. None without an entry that carries a total.
+    Written when the CLI exits — before SessionEnd fires, never before Stop.
+    Usually cumulative across resumes (`startTime` stays the session's first
+    process), so the last entry is the session total. Not always: a process
+    that did not restore an earlier one's cost starts a new total, so
+    `partial` is set when `startTime` (`covers_from`) is more than
+    COST_STATE_PARTIAL_S after the first entry. It counts API calls the
+    transcript never records — the Haiku requests behind WebFetch and
+    WebSearch, auto-mode classifier calls — so it can exceed the hook's cost.
+    None without an entry that carries a total.
     """
     last = None
+    first_ts = ""
     for entry in _entries(transcript_path):
+        if not first_ts and entry.get("timestamp"):
+            first_ts = entry["timestamp"]
         if entry.get("type") == "cost-state" and isinstance(entry.get("totalCostUSD"), (int, float)):
             last = entry
     if last is None:
@@ -1804,6 +1825,16 @@ def extract_cost_state(transcript_path: str) -> dict | None:
     for src, dst in _COST_STATE_KEYS:
         if isinstance(last.get(src), (int, float)):
             out[dst] = last[src]
+    start_ms = last.get("startTime")
+    covers_from = (_epoch_to_iso(start_ms / 1000)
+                   if isinstance(start_ms, (int, float)) and not isinstance(start_ms, bool) else None)
+    if covers_from:
+        out["covers_from"] = covers_from
+        first = parse_ts(first_ts)
+        if first is not None:
+            if first.tzinfo is None:
+                first = first.replace(tzinfo=timezone.utc)
+            out["partial"] = start_ms / 1000 - first.timestamp() > COST_STATE_PARTIAL_S
     by_model = {}
     usage = last.get("modelUsage")
     for model, u in (usage.items() if isinstance(usage, dict) else ()):
@@ -1816,6 +1847,53 @@ def extract_cost_state(transcript_path: str) -> dict | None:
     if by_model:
         out["by_model"] = by_model
     return out
+
+
+def _from_first_user(entries) -> list[dict]:
+    """Entries from the first user entry on. A forked subagent's transcript
+    opens with a copy of its spawner's Agent-call message, which belongs to
+    the spawner (see build_turns)."""
+    out, seen_user = [], False
+    for entry in _entries(entries):
+        seen_user = seen_user or entry.get("type") == "user"
+        if seen_user:
+            out.append(entry)
+    return out
+
+
+def count_classifier_requests(entries) -> int:
+    """Distinct auto-mode classifier calls (`serverClassifierRequest`).
+
+    Each is an API call on the session's model, one per classified tool call
+    (mostly cache reads, ~10 output tokens), that the transcript never records
+    as a message: its cost is in cost-state only.
+    """
+    return len({e["serverClassifierRequest"] for e in _from_first_user(entries)
+                if e.get("type") == "assistant" and e.get("serverClassifierRequest")})
+
+
+def count_partial_messages(entries) -> int:
+    """Messages whose last entry has no stop_reason, the last message excepted.
+
+    Since CC 2.1.289 subagent transcripts often keep only a message's
+    stream-start entries, whose output_tokens is a running count, so their
+    output is under-counted (0-21% of subagent messages end on a final entry,
+    99-100% on the main thread). The last message may still be streaming.
+    """
+    last_stop: dict[str, str] = {}
+    for e in _from_first_user(entries):
+        msg = e.get("message") or {}
+        if e.get("type") == "assistant" and not e.get("isApiErrorMessage") and msg.get("id"):
+            last_stop[msg["id"]] = msg.get("stop_reason") or ""
+    mids = list(last_stop)[:-1]
+    return sum(1 for mid in mids if not last_stop[mid])
+
+
+def message_models(entries) -> set[str]:
+    """Models that answered at least one message in the transcript."""
+    return {(e.get("message") or {}).get("model") for e in _from_first_user(entries)
+            if e.get("type") == "assistant" and not e.get("isApiErrorMessage")
+            and (e.get("message") or {}).get("model") not in (None, "", "<synthetic>")}
 
 
 def extract_async_hook_responses(transcript_path: str, max_stderr: int = 200) -> dict | None:
@@ -3286,25 +3364,42 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
         summaries = [{"agent_id": aid, **{k: v for k, v in s.items() if k not in _SA_STATE_ONLY_KEYS}}
                      for aid, s in agents.items()]
         total_subagent_cost = sum(s.get("total_cost", 0) for s in summaries)
+        partial_messages = sum(s.get("partial_messages", 0) for s in summaries)
         subagent_costs = {
             "agents": summaries,
             "total_subagent_cost": round(total_subagent_cost, 6),
             "parent_cost": round(session_cost, 6),
             "harness_total_cost": round(session_cost + total_subagent_cost, 6),
+            "partial_messages": partial_messages,
         }
         # In place: every turn trace in this batch holds this same list.
         session_tags += ["has-subagents", f"subagents:{len(summaries)}"]
         if any(s.get("depth", 1) >= 2 for s in summaries):
             session_tags.append("nested-subagents")
+        # Their output tokens are a lower bound (see count_partial_messages).
+        if partial_messages:
+            session_tags.append("subagent-usage-partial")
+
+    classifier_requests = count_classifier_requests(entries) + sum(
+        s.get("classifier_requests", 0) for s in agents.values())
 
     hook_cost = session_cost + (subagent_costs or {}).get("total_subagent_cost", 0)
     cli_cost_state = None
     if cost_state:
+        used_models = {t["model"] for t in turns if t.get("model")}
+        for s in agents.values():
+            used_models.update(s.get("models") or [])
         cli_cost_state = {
             **cost_state,
             "hook_cost_usd": round(hook_cost, 6),
-            "gap_usd": round(cost_state["total_cost_usd"] - hook_cost, 6),
+            # Models no message used: mostly the Haiku behind WebFetch/WebSearch.
+            "side_model_cost_usd": round(sum(
+                u.get("cost_usd", 0) for m, u in cost_state.get("by_model", {}).items()
+                if m not in used_models), 6),
         }
+        # Only meaningful when cost-state covers the whole transcript.
+        if not cost_state.get("partial"):
+            cli_cost_state["gap_usd"] = round(cost_state["total_cost_usd"] - hook_cost, 6)
 
     session_rollups = {
         **{k: v for k, v in session_state.items()},
@@ -3341,6 +3436,7 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
         "interrupts": interrupts,
         "queue_operations": queue_operations,
         "cli_cost_state": cli_cost_state,
+        "classifier_requests": classifier_requests or None,
         "async_hooks": async_hooks,
         "rate_limits": rate_limits,
         "scheduled_tasks": scheduled_tasks,
