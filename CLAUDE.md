@@ -178,7 +178,7 @@ uv run pytest tests/ -k "subagent" -v  # Run tests matching pattern
    `<command-name>` entry plus an `isMeta` expansion, and a prompt with an image as the
    text plus an `isMeta` "[Image: ...]" entry. The turn starts at the last of them, so
    TTFT is measured from the input the reply answers
-3. Deduplicate streaming updates (one usage per `message.id`, from the **last** entry. Main-thread entries carry identical usage, but subagent transcripts write a running `output_tokens` count on early entries, without `speed`, `server_tool_use` or `output_tokens_details`. Taking the first entry counted subagent output ~10x low until 2026-10-12)
+3. Deduplicate streaming updates (one usage per `message.id`, from the **last** entry. Main-thread entries carry identical usage, but subagent transcripts write a running `output_tokens` count on early entries, without `speed`, `server_tool_use` or `output_tokens_details`. Taking the first entry counted subagent output ~10x low until 2026-10-12). A message also counts **once across turns**, in the turn it started in: when it calls Skill (or reads an image) and then another tool, the skill body (or `[Image: ...]` note) is an `isMeta` user entry written between its entries and opens a new turn, so its id is in both turns. Until 2026-10-18 both turns billed it (8 local transcripts, $2.40)
 4. Compute usage (tokens), latency, TTFT, cost
 5. Build events for the finished, not-yet-sent turns (turn trace -> generation -> tool spans -> subagent generations), plus the session scores
 6. Translate to OTLP (`langfuse_otlp.build_export`), POST one gzipped export, then the scores; save state
