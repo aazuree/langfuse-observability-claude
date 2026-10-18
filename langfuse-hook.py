@@ -25,7 +25,7 @@ import sys
 import time
 import traceback
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -1324,8 +1324,14 @@ def build_turns(entries: list[dict]) -> list[dict]:
                 "attribution_plugin": entry.get("attributionPlugin", "") if etype == "assistant" else "",
                 # Per-turn effort level, new as a transcript field in CC 2.1.220.
                 # Previously only reachable via $CLAUDE_EFFORT on live fires; this
-                # source also survives --reprocess.
-                "effort": entry.get("effort", "") if etype == "assistant" else "",
+                # source also survives --reprocess. perTurnEffort (2.1.29x) repeats
+                # it on real turns (or is null) and is set alone only on synthetic
+                # stubs, so it is a fallback, never an override.
+                "effort": (entry.get("effort") or entry.get("perTurnEffort") or "")
+                          if etype == "assistant" else "",
+                # Subagent transcripts only: the agent type (general-purpose,
+                # web-fetch, fork, ...), the same value as the .meta.json agentType.
+                "attribution_agent": entry.get("attributionAgent", "") if etype == "assistant" else "",
                 # Per-entry signals. requestedModel (CC 2.1.295) differs from
                 # message.model only when Claude Code fell back to another model.
                 # thinkingDurationMs (2.1.287) is written on every streamed entry
@@ -1339,6 +1345,8 @@ def build_turns(entries: list[dict]) -> list[dict]:
                 # human / sdk / task_notification / peer (CC 2.1.278), on the
                 # user entry that opens a turn.
                 "turn_origin": entry.get("turnOrigin", "") if etype == "user" else "",
+                # The session cron task whose fire wrote this prompt.
+                "scheduled_task_id": entry.get("scheduledTaskId", "") if etype == "user" else "",
                 # A refused tool call, not a failed one (CC 2.1.2xx). Both arrive
                 # with is_error:true, so this is what keeps a denial out of
                 # tool_error_rate.
@@ -1402,6 +1410,8 @@ def build_turns(entries: list[dict]) -> list[dict]:
                 current_turn["messages"].append(me)
                 if not current_turn["turn_origin"]:
                     current_turn["turn_origin"] = me.get("turn_origin", "")
+                if not current_turn["scheduled_task_id"]:
+                    current_turn["scheduled_task_id"] = me.get("scheduled_task_id", "")
             elif text.strip():
                 if current_turn:
                     turns.append(current_turn)
@@ -1431,6 +1441,8 @@ def build_turns(entries: list[dict]) -> list[dict]:
                     "aborted_mid_stream": False,
                     "advisor_model": "",
                     "turn_origin": me.get("turn_origin", ""),
+                    "attribution_agent": "",
+                    "scheduled_task_id": me.get("scheduled_task_id", ""),
                 }
             elif current_turn:
                 current_turn["messages"].append(me)
@@ -1481,6 +1493,8 @@ def build_turns(entries: list[dict]) -> list[dict]:
                 if not current_turn["attribution_plugin"]:
                     current_turn["attribution_plugin"] = pl
                 current_turn["attribution_plugins_all"].add(pl)
+            if me.get("attribution_agent") and not current_turn["attribution_agent"]:
+                current_turn["attribution_agent"] = me["attribution_agent"]
 
             # Last non-empty effort wins — a mid-turn /effort change should be
             # attributed to the level the turn actually finished under.
@@ -1689,6 +1703,7 @@ def extract_api_error_messages(transcript_path: str) -> dict | None:
     count = 0
     by_status: dict[str, int] = {}
     by_error: dict[str, int] = {}
+    by_api_error: dict[str, int] = {}
     first_at = ""
     last_at = ""
     max_retry = None
@@ -1703,6 +1718,10 @@ def extract_api_error_messages(transcript_path: str) -> dict | None:
         error = entry.get("error")
         if error:
             by_error[str(error)] = by_error.get(str(error), 0) + 1
+        # The specific reason (e.g. usage_limit_reached for error rate_limit).
+        api_error = entry.get("apiError")
+        if api_error:
+            by_api_error[str(api_error)] = by_api_error.get(str(api_error), 0) + 1
         ts = entry.get("timestamp", "")
         if ts:
             if not first_at or ts < first_at:
@@ -1722,6 +1741,8 @@ def extract_api_error_messages(transcript_path: str) -> dict | None:
         "first_at": first_at,
         "last_at": last_at,
     }
+    if by_api_error:
+        out["by_api_error"] = by_api_error
     if max_retry is not None:
         out["max_retry_attempt"] = max_retry
     return out
@@ -1741,6 +1762,202 @@ def extract_interrupts(transcript_path: str) -> dict | None:
     if count == 0:
         return None
     return {"count": count}
+
+
+# cost-state field -> rollup key; session totals, then per-model modelUsage.
+_COST_STATE_KEYS = (
+    ("totalAPIDuration", "api_duration_ms"),
+    ("totalAPIDurationWithoutRetries", "api_duration_without_retries_ms"),
+    ("totalToolDuration", "tool_duration_ms"),
+    ("totalDuration", "wall_duration_ms"),
+    ("totalLinesAdded", "lines_added"),
+    ("totalLinesRemoved", "lines_removed"),
+    ("hasUnknownModelCost", "has_unknown_model_cost"),
+)
+_COST_STATE_MODEL_KEYS = (
+    ("costUSD", "cost_usd"),
+    ("inputTokens", "input_tokens"),
+    ("outputTokens", "output_tokens"),
+    ("thinkingTokens", "thinking_tokens"),
+    ("cacheReadInputTokens", "cache_read_tokens"),
+    ("cacheCreationInputTokens", "cache_create_tokens"),
+    ("webSearchRequests", "web_search_requests"),
+)
+
+
+def extract_cost_state(transcript_path: str) -> dict | None:
+    """Claude Code's own running cost, from the last `cost-state` entry.
+
+    Written when the CLI exits — before SessionEnd fires, never before Stop —
+    and cumulative across resumes, so the last entry is the session total. It
+    counts API calls the transcript never records, such as the Haiku requests
+    behind WebSearch, so it can exceed the hook's cost; the rollup's `gap_usd`
+    shows by how much. None without an entry that carries a total.
+    """
+    last = None
+    for entry in _entries(transcript_path):
+        if entry.get("type") == "cost-state" and isinstance(entry.get("totalCostUSD"), (int, float)):
+            last = entry
+    if last is None:
+        return None
+    out = {"total_cost_usd": round(last["totalCostUSD"], 6)}
+    for src, dst in _COST_STATE_KEYS:
+        if isinstance(last.get(src), (int, float)):
+            out[dst] = last[src]
+    by_model = {}
+    usage = last.get("modelUsage")
+    for model, u in (usage.items() if isinstance(usage, dict) else ()):
+        if not isinstance(u, dict):
+            continue
+        by_model[model] = {
+            dst: round(u[src], 6) if dst == "cost_usd" else u[src]
+            for src, dst in _COST_STATE_MODEL_KEYS if isinstance(u.get(src), (int, float))
+        }
+    if by_model:
+        out["by_model"] = by_model
+    return out
+
+
+def extract_async_hook_responses(transcript_path: str, max_stderr: int = 200) -> dict | None:
+    """Outcomes of `"async": true` hooks, from `async_hook_response` attachments.
+
+    Claude Code records each finished async hook with its exit code and
+    stderr; nothing else shows a background hook failing (these entries
+    caught this hook's Stop command exiting 2 while its file was moved away).
+    Only the last failure's stderr is kept, redacted before it is truncated so
+    a secret cut at the limit cannot slip past the patterns. None without any
+    response.
+    """
+    count = failures = 0
+    by_hook: dict[str, dict] = {}
+    last_failure = None
+    for entry in _entries(transcript_path):
+        att = entry.get("attachment") if entry.get("type") == "attachment" else None
+        if not isinstance(att, dict) or att.get("type") != "async_hook_response":
+            continue
+        name = att.get("hookName") or att.get("hookEvent") or "unknown"
+        hook_counts = by_hook.setdefault(name, {"count": 0, "failures": 0})
+        count += 1
+        hook_counts["count"] += 1
+        code = att.get("exitCode")
+        if isinstance(code, int) and code != 0:
+            failures += 1
+            hook_counts["failures"] += 1
+            last_failure = {
+                "hook": name,
+                "exit_code": code,
+                "stderr": truncate(redact_secrets(str(att.get("stderr") or "").strip()), max_stderr),
+                "timestamp": entry.get("timestamp", ""),
+            }
+    if count == 0:
+        return None
+    out = {"count": count, "failures": failures, "by_hook": by_hook}
+    if last_failure:
+        out["last_failure"] = last_failure
+    return out
+
+
+def _epoch_to_iso(value) -> str | None:
+    """Epoch seconds -> ISO-8601 UTC, or None when it is not a usable number."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    try:
+        return datetime.fromtimestamp(value, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def extract_rate_limits(transcript_path: str) -> dict | None:
+    """Rate-limit state on assistant entries.
+
+    `quotaLimits` (CC 2.1.29x), or `apiErrorParams.rate_limit_info` without
+    it, rides on the stub written when a request was refused for quota:
+    `status` (`rejected`), `rateLimitType` (e.g. `five_hour`), `resetsAt`
+    (epoch seconds) and the overage state. `last` is the latest one. None
+    when no entry carries it.
+    """
+    count = 0
+    by_status: dict[str, int] = {}
+    by_type: dict[str, int] = {}
+    last = None
+    for entry in _entries(transcript_path):
+        if entry.get("type") != "assistant":
+            continue
+        quota = entry.get("quotaLimits")
+        if not isinstance(quota, dict):
+            params = entry.get("apiErrorParams")
+            quota = params.get("rate_limit_info") if isinstance(params, dict) else None
+        if not isinstance(quota, dict):
+            continue
+        count += 1
+        status = str(quota.get("status") or "unknown")
+        rtype = str(quota.get("rateLimitType") or "unknown")
+        by_status[status] = by_status.get(status, 0) + 1
+        by_type[rtype] = by_type.get(rtype, 0) + 1
+        last = {
+            "status": status,
+            "type": rtype,
+            "resets_at": _epoch_to_iso(quota.get("resetsAt")),
+            "overage_status": quota.get("overageStatus"),
+            "overage_disabled_reason": quota.get("overageDisabledReason"),
+            "is_using_overage": quota.get("isUsingOverage"),
+            "timestamp": entry.get("timestamp", ""),
+        }
+    if count == 0:
+        return None
+    return {"count": count, "by_status": by_status, "by_type": by_type, "last": last}
+
+
+def extract_scheduled_task_fires(transcript_path: str) -> dict | None:
+    """Session cron fires (`system/scheduled_task_fire`), grouped by task id.
+
+    The fire's prompt is not stored: it is the input of the turn it opens,
+    which carries `scheduled_task_id`. None without fires.
+    """
+    count = 0
+    tasks: dict[str, dict] = {}
+    for entry in _entries(transcript_path):
+        if entry.get("type") != "system" or entry.get("subtype") != "scheduled_task_fire":
+            continue
+        count += 1
+        ts = entry.get("timestamp", "")
+        task = tasks.setdefault(str(entry.get("taskId") or "unknown"), {
+            "cron": entry.get("cron", ""), "fires": 0, "first_at": ts, "last_at": ts})
+        task["fires"] += 1
+        if ts and (not task["first_at"] or ts < task["first_at"]):
+            task["first_at"] = ts
+        if ts > task["last_at"]:
+            task["last_at"] = ts
+    return {"count": count, "tasks": tasks} if count else None
+
+
+def extract_continued_in(transcript_path: str) -> str:
+    """Id of the session this one was continued in (`continued-in`), or ""."""
+    out = ""
+    for entry in _entries(transcript_path):
+        if entry.get("type") == "continued-in" and entry.get("continuedInSessionId"):
+            out = entry["continuedInSessionId"]
+    return out
+
+
+def extract_relocations(transcript_path: str, max_cwds: int = 10) -> dict | None:
+    """Working-directory moves (`relocated` entries, e.g. into a worktree).
+
+    `cwds` lists the distinct targets in first-seen order, capped at
+    `max_cwds`; `count` counts every entry. None without relocations.
+    """
+    count = 0
+    cwds: list[str] = []
+    last_cwd = ""
+    for entry in _entries(transcript_path):
+        cwd = entry.get("relocatedCwd") if entry.get("type") == "relocated" else None
+        if not cwd:
+            continue
+        count += 1
+        last_cwd = cwd
+        if cwd not in cwds and len(cwds) < max_cwds:
+            cwds.append(cwd)
+    return {"count": count, "cwds": cwds, "last_cwd": last_cwd} if count else None
 
 
 def extract_cwd(transcript_path) -> str:
@@ -2486,7 +2703,7 @@ def build_attribution_tags(summary: dict | None) -> list[str]:
 # Every score the hook writes for a session. Ids depend only on session and
 # name, so --delete-traces can remove them without asking Langfuse.
 SESSION_SCORE_NAMES = ("session_cost_usd", "cache_hit_rate", "tool_error_rate",
-                       "tool_denial_rate")
+                       "tool_denial_rate", "cli_cost_usd")
 
 
 def session_score_id(session_id: str, name: str) -> str:
@@ -2498,6 +2715,7 @@ def build_hook_score_events(
     turns: list[dict],
     session_cost: float,
     rollups: dict | None = None,
+    cli_cost: float | None = None,
 ) -> list[dict]:
     """Build the session-level score-create events.
 
@@ -2509,9 +2727,14 @@ def build_hook_score_events(
     - `cache_hit_rate`, `tool_error_rate`, `tool_denial_rate`: omitted when
       their classifier returns None (no cache activity / no executed calls /
       no attempted calls), so "absent" stays distinct from a genuine 0.0.
+    - `cli_cost_usd`: Claude Code's own total from the `cost-state` entry,
+      next to `session_cost_usd` for comparison; omitted until that entry
+      is written (the CLI writes it on exit).
     """
     scores = [{"name": "session_cost_usd", "value": round(session_cost, 6),
                "metadata": rollups or {}}]
+    if cli_cost is not None:
+        scores.append({"name": "cli_cost_usd", "value": round(cli_cost, 6)})
     for name, value in (
         ("cache_hit_rate", compute_cache_hit_rate(turns)),
         ("tool_error_rate", calculate_tool_error_rate(turns)),
@@ -2572,6 +2795,10 @@ def gen_metadata_turn_signals(turn: dict) -> dict:
         out["advisor_model"] = turn["advisor_model"]
     if turn.get("turn_origin"):
         out["turn_origin"] = turn["turn_origin"]
+    if turn.get("attribution_agent"):
+        out["attribution_agent"] = turn["attribution_agent"]
+    if turn.get("scheduled_task_id"):
+        out["scheduled_task_id"] = turn["scheduled_task_id"]
     # Only where it changed the price: other models bill long prompts at the
     # same rate, so the count would read as a surcharge that never happened.
     if turn.get("long_context_requests") and _has_long_context_tier(turn.get("model") or ""):
@@ -2595,6 +2822,7 @@ def build_turn_signal_summary(turns: list[dict]) -> dict | None:
         "aborted_turns": sum(1 for s in signals if s.get("aborted_mid_stream")),
         "thinking_duration_ms": sum(s.get("thinking_duration_ms", 0) for s in signals),
         "long_context_requests": sum(s.get("long_context_requests", 0) for s in signals),
+        "scheduled_turns": sum(1 for s in signals if s.get("scheduled_task_id")),
     }
 
 
@@ -2741,6 +2969,12 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
     api_error_messages = extract_api_error_messages(entries)
     interrupts = extract_interrupts(entries)
     queue_operations = extract_queue_operations(entries)
+    cost_state = extract_cost_state(entries)
+    async_hooks = extract_async_hook_responses(entries)
+    rate_limits = extract_rate_limits(entries)
+    scheduled_tasks = extract_scheduled_task_fires(entries)
+    continued_in = extract_continued_in(entries)
+    relocations = extract_relocations(entries)
     session_meta = extract_session_metadata(entries)
     api_errors = extract_api_errors(entries)
     has_errors = api_errors["total_count"] > 0
@@ -2850,6 +3084,10 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
         "compacted" if compaction else None,
         "remote-control" if remote_control else None,
         "permission-bypass" if (permission_timeline or {}).get("ever_bypass") else None,
+        "has-hook-failures" if (async_hooks or {}).get("failures") else None,
+        "rate-limited" if (rate_limits or {}).get("by_status", {}).get("rejected") else None,
+        "scheduled-task" if scheduled_tasks or (turn_signals or {}).get("scheduled_turns") else None,
+        "continued" if continued_in else None,
         *compact_trigger_tags,
         *stop_reason_tags,
         *refusal_tags,
@@ -3059,6 +3297,15 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
         if any(s.get("depth", 1) >= 2 for s in summaries):
             session_tags.append("nested-subagents")
 
+    hook_cost = session_cost + (subagent_costs or {}).get("total_subagent_cost", 0)
+    cli_cost_state = None
+    if cost_state:
+        cli_cost_state = {
+            **cost_state,
+            "hook_cost_usd": round(hook_cost, 6),
+            "gap_usd": round(cost_state["total_cost_usd"] - hook_cost, 6),
+        }
+
     session_rollups = {
         **{k: v for k, v in session_state.items()},
         "turn_count": len(turns),
@@ -3093,13 +3340,20 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
         "api_error_messages": api_error_messages,
         "interrupts": interrupts,
         "queue_operations": queue_operations,
+        "cli_cost_state": cli_cost_state,
+        "async_hooks": async_hooks,
+        "rate_limits": rate_limits,
+        "scheduled_tasks": scheduled_tasks,
+        "continued_in": continued_in or None,
+        "relocations": relocations,
         "tags": session_tags,
     }
     batch.extend(build_hook_score_events(
         session_id=session_id,
         turns=turns,
-        session_cost=session_cost + (subagent_costs or {}).get("total_subagent_cost", 0),
+        session_cost=hook_cost,
         rollups={k: v for k, v in session_rollups.items() if v is not None},
+        cli_cost=cost_state["total_cost_usd"] if cost_state else None,
     ))
 
     sent_turns = sendable - min(prev_turn_count, sendable)

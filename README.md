@@ -18,6 +18,8 @@ Self-hosted Langfuse that captures every Claude Code interaction via the `Stop` 
 | Time to first token | completionStartTime |
 | Cost estimate (Anthropic API equivalent rates) | costDetails |
 | Per-subagent and total harness cost | Trace metadata |
+| Claude Code's own cost total (`cost-state`), next to the hook's | Score `cli_cost_usd` + session metadata |
+| Async hook failures, rate-limit hits, scheduled-task fires | Session metadata + tags |
 | Session grouping | Trace per session |
 
 ## Quick Start
