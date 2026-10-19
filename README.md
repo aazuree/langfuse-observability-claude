@@ -215,6 +215,15 @@ Each turn reports what it would cost at Anthropic API rates (model-aware, cache 
 - **Langfuse init vars**: `LANGFUSE_INIT_USER_EMAIL` must be valid email format, `LANGFUSE_INIT_PROJECT_NAME` must not have spaces. Validation errors are generic with no detail.
 - **First login**: If the browser shows an error, try an incognito window (stale CSRF tokens).
 - **Hook does not block Claude Code** when registered with `"async": true` (setup does this); if Langfuse is down, errors go to `~/.claude/langfuse-hook.log`.
+- **Headless runs (`claude --print`) can lose the export.** An async `Stop` hook is killed when the CLI exits; the async `SessionEnd` one survives the exit, but a systemd unit (`KillMode=control-group`, the default) or a cron job that tears down its process group kills it too. Nothing reaches Langfuse and nothing is logged. After a scripted run, send the session synchronously as a `SessionEnd`, using the hook command from `settings.json`:
+
+  ```bash
+  HOOK=$(jq -r '[.hooks.SessionEnd[]?.hooks[]? | .command // empty | select(test("langfuse-hook\\.py"))][0]' ~/.claude/settings.json)
+  jq -n --arg s "$SESSION_ID" --arg t "$TRANSCRIPT" --arg c "$PWD" \
+    '{session_id: $s, transcript_path: $t, cwd: $c, hook_event_name: "SessionEnd"}' | bash -c "$HOOK"
+  ```
+
+  `--output-format json` prints the `session_id`; the transcript is `~/.claude/projects/<cwd with every non-alphanumeric character replaced by ->/<session_id>.jsonl`.
 - **Secret redaction**: The hook redacts common patterns but cannot catch all secrets. Avoid pasting raw credentials into Claude Code prompts.
 
 ## Why Not a Proxy (e.g. LiteLLM)?
