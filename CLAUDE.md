@@ -139,6 +139,7 @@ tests/
   test_session_rollups.py        # Session rollups cover the whole session; each turn sent once; unfinished turns held
   test_turn_merging.py           # Consecutive user entries before a reply form one turn
   test_session_lock.py           # Per-session lock for overlapping (async) fires
+  test_cli_signals_2_1_300.py    # cost-state, async hook responses, rate limits, scheduled tasks, continued-in, relocated
   test_robustness.py             # Atomic state writes, logged crashes
   test_delete_traces.py          # --delete-traces (every per-turn trace, the old session trace, session scores)
   test_setup_tools.py            # tools/render_env.py and tools/configure_hooks.py
@@ -244,7 +245,7 @@ These stack multiplicatively on the base rates above (and apply uniformly across
 
 ### Server-side Tool Billing
 
-- **Web search**: $0.01 per request (`$10 / 1,000 searches`). Billed via `costDetails.web_search` line item using `web_search_requests` from `usage.server_tool_use`. Added to turn total.
+- **Web search**: $0.01 per request (`$10 / 1,000 searches`). Billed via `costDetails.web_search` line item using `web_search_requests` from `usage.server_tool_use`. Added to turn total. **Claude Code's WebSearch tool does not show up here:** the search runs in a separate Haiku request that the transcript never records, so the main thread's `web_search_requests` is 0 and the fee is only in cost-state (`cli_cost_state.side_model_cost_usd`).
 - **Web fetch**: free (token cost only).
 - **Code execution**: $0.05/container-hour after 1,550 free hours/org/month. Not currently emitted by Claude Code; not billed.
 
@@ -337,12 +338,54 @@ checked against aws.amazon.com/bedrock/pricing.
 >   Overlaps the older `origin`/`promptSource` used by `prompt_provenance`, but is present
 >   on every opening entry rather than a minority.
 >
-> Seen but **not captured**: `perTurnEffort` (duplicates `effort`), `quotaLimits`
-> (rate-limit status on rejected requests — candidate for a future event), `turnPosition`,
-> `apiBlockIndex`, `attributionAgent`, `scheduledTaskId`, `serverClassifierRequest`,
-> `wireToolInputs` / `wireIngestContext` (raw tool inputs, already in tool spans),
-> `usage.fallback_credit` (always null so far), and the `cost-state` entry (Claude Code's
-> own running cost total — usable as a cross-check against `session_cost_usd`).
+> Second census against **v2.1.300** (2026-10-18, 199 transcripts incl. subagents). Now
+> captured:
+> - `cost-state` entry — Claude Code's own running cost. Usually cumulative across resumes
+>   (same `startTime`, totals only grow), so the last entry is the session total — but 5 of
+>   85 local sessions had a `startTime` after their first entry (an earlier process, e.g.
+>   CC 2.1.252, whose cost was not restored); those get `partial: true` and no `gap_usd`.
+>   Written when the CLI exits: **before** `SessionEnd` fires, never before `Stop` (tested
+>   with a throwaway hook on 2.1.300), so live Stop fires lack it and a SessionEnd fire or
+>   `--reprocess` fills it in. Rollup `cli_cost_state` + score `cli_cost_usd`. Tokens and
+>   cost match the hook to the cent where the transcript records every call (a
+>   `bypassPermissions` price-watch run: no classifier calls). Over the 85 sessions that
+>   cost-state covers whole, CLI − hook = $65.79, made of exactly four parts:
+>   - $35.28 — the Haiku calls behind WebFetch (page summaries) and WebSearch, including
+>     the $0.01 search fee. Not in any transcript: `side_model_cost_usd`.
+>   - ~$19.9 — auto-mode classifier calls on the session's model, one per classified tool
+>     call (mostly cache reads, ~10 output tokens). Cost not in the transcript; the count is
+>     (distinct `serverClassifierRequest`): `classifier_requests`.
+>   - $6.31 — subagent output under-recorded: since CC 2.1.289 subagent transcripts often
+>     keep only a message's stream-start entries (0–21% of subagent messages end on a final
+>     entry, 99–100% on the main thread). Detectable, not recoverable:
+>     `subagent_costs.partial_messages`, tag `subagent-usage-partial`. The parent's Agent
+>     `toolUseResult.usage` carries only the agent's **final** message's usage.
+>   - ~$4.26 — Claude Code prices **Sonnet 5.5 cache reads at $0.20/M**; the pricing page
+>     says $0.10/M (0.05x, re-verified 2026-10-18). The CLI is wrong here, not the hook.
+> - `async_hook_response` attachments — exit code + stderr of every `"async": true` hook.
+>   The only place a failing background hook shows up (it caught this hook's Stop command
+>   exiting 2 during the 2026-10-11 migration). Rollup `async_hooks`, tag `has-hook-failures`.
+> - `quotaLimits` (or `apiErrorParams.rate_limit_info`) and `apiError` on the rate-limit
+>   stub — rollup `rate_limits`, tag `rate-limited`, `api_error_messages.by_api_error`.
+> - `system/scheduled_task_fire` + `scheduledTaskId` on the prompt it writes — rollup
+>   `scheduled_tasks`, per-generation `scheduled_task_id`, tag `scheduled-task`.
+> - `continued-in` (`continuedInSessionId`) — rollup `continued_in`, tag `continued`.
+>   **Known gap:** the successor transcript repeats the predecessor's messages (same
+>   `message.id`), so both sessions bill them (11 pairs, ~$9.9 on 2026-10-18).
+> - `relocated` (`relocatedCwd`, e.g. entering a worktree) — rollup `relocations`.
+> - `attributionAgent` (subagent transcripts only; equal to the `.meta.json` `agentType`
+>   in 96/96) — per-generation `attribution_agent` on subagent generations.
+> - `perTurnEffort` — equal to `effort` (12,196 entries) or null (7,131); set alone only
+>   on `<synthetic>` stubs, which `build_turns` skips. Used as a fallback for a missing
+>   `effort`, never as an override.
+>
+> Seen but **not captured**: `turnPosition`, `apiBlockIndex`, `requestRef`, `thinkingDisplay`, `input_transformations`, `wireToolInputs` /
+> `wireIngestContext` (raw tool inputs, already in tool spans), `usage.fallback_credit`
+> (always null so far), `credential_org` (org UUID), `hook_success` attachments (hook
+> stdout, PII + size; `system/stop_hook_summary` already covers Stop), and the
+> `api-request` / `api-request-blob` / `api-request-shape` entries (raw request params,
+> tool schemas and auto-mode classifier context — large, and `api-request-blob` holds
+> message bodies).
 >
 > Changelog v2.1.253–v2.1.286 reviewed for new transcript-JSONL fields or hook-input changes — nothing
 > found (changes were fixes to redaction, subagents, retries and model fallback). One behaviour
@@ -446,6 +489,11 @@ Session-wide rollups are not on the traces: they ride on the session-level
 - `has-background-tasks` — present when the Stop payload carried running background tasks
 - `has-subagents`, `subagents:<count>` — present when the session dispatched subagents
 - `nested-subagents` — present when any ingested subagent was spawned by another subagent (depth ≥ 2; CC 2.1.172+)
+- `subagent-usage-partial` — present when a subagent message's transcript entries stop before its final one (CC 2.1.289+); its output tokens, and so the subagent cost, are a lower bound. See `subagent_costs.partial_messages`
+- `has-hook-failures` — present when an `"async": true` hook exited non-zero (`async_hook_response` attachments); see `async_hooks` metadata
+- `rate-limited` — present when a request was refused for quota (`quotaLimits.status: rejected`); see `rate_limits` metadata
+- `scheduled-task` — present when a session cron task fired in the session (`system/scheduled_task_fire`, or a prompt carrying `scheduledTaskId`)
+- `continued` — present when the session was continued in another one (`continued-in`); see `continued_in` metadata
 - `stop-reason:<reason>` — one per distinct **anomalous** terminal `stop_reason` in the session (`max_tokens`, `stop_sequence`, `refusal`, `pause_turn`, or any unknown reason). The high-frequency normal reasons `end_turn` (turn done) and `tool_use` (paused to call a tool) are **not** tagged — they'd flood every trace with no signal (`NORMAL_STOP_REASONS`). Full per-reason counts live in the `stop_reasons` metadata regardless. Filter on `stop-reason:max_tokens` to find turns whose output was truncated at the token cap.
 
 **`session_title` precedence:**
@@ -474,7 +522,7 @@ also repeats the session state listed above and the full `tags` list.
 - `turn_count`, `tool_calls_total`, `total_tokens`, `total_input_tokens`, `total_output_tokens`
 - `session_cost_usd` — cost of every parent (non-subagent) turn in the session; equals `subagent_costs.parent_cost` when subagents exist
 - `api_errors` — error summary from `system/api_error` entries: `total_count`, `by_status` (HTTP codes), `first_error_at`, `last_error_at`
-- `api_error_messages` — **separate** assistant-channel error/retry summary from `isApiErrorMessage` entries (CC 2.1.179+/2.1.181 auto-retry): `{count, by_status (apiErrorStatus, e.g. 404/429/529), by_error (e.g. model_not_found/rate_limit), first_at, last_at}`, plus `max_retry_attempt` when any entry carries `retryAttempt`. Null when none. From `extract_api_error_messages()`. Distinct channel from `api_errors`; these stubs are skipped by `build_turns` so they don't pollute turn output.
+- `api_error_messages` — **separate** assistant-channel error/retry summary from `isApiErrorMessage` entries (CC 2.1.179+/2.1.181 auto-retry): `{count, by_status (apiErrorStatus, e.g. 404/429/529), by_error (e.g. model_not_found/rate_limit), first_at, last_at}`, plus `by_api_error` (the specific `apiError`, e.g. `usage_limit_reached` behind `rate_limit`) when any entry carries one and `max_retry_attempt` when any entry carries `retryAttempt`. Null when none. From `extract_api_error_messages()`. Distinct channel from `api_errors`; these stubs are skipped by `build_turns` so they don't pollute turn output.
 - `interrupts` — `{count}` of user interrupts (ESC mid-turn) from `interruptedMessageId` on `user` entries. A friction / misalignment signal. Null when none. From `extract_interrupts()`.
 - `queue_operations` — prompt-queue activity from `type:"queue-operation"` entries (prompts the user queued while the assistant was busy): `{operations: {<op>: n}, queued, executed, removed, total_wait_ms, max_wait_ms}`. `executed` = prompts pulled from the queue to run (`dequeue`/`popAll`); `removed` = queued prompts the user cancelled. Wait = time a prompt sat queued (enqueue→dequeue/popAll), matched **FIFO** (no per-prompt id → approximate); `remove` is excluded from wait stats. Prompt `content` is **not stored** (PII). Long waits = the user racing ahead of the agent (friction signal). Null when nothing was queued. From `extract_queue_operations()`.
 - `stop_reasons` — rollup of per-turn terminal `stop_reason` (the API's reason each turn ended): `{by_reason: {<reason>: count}, turns_counted, last}`. `last` = the terminal reason of the session's final turn that carried one (the outcome). Null when no turn carried a stop_reason. Anomalous reasons also surface as `stop-reason:<reason>` tags. When any turn was refused, adds `refusal_categories: {<category>: count}` from the API's `stop_details.category` (null → `uncategorized`), also tagged `refusal:<category>`. From `build_stop_reasons_summary()`.
@@ -501,7 +549,14 @@ also repeats the session state listed above and the full `tags` list.
 - `permission_timeline` — `{modes_used (sorted distinct), sequence (file-order, consecutive dups collapsed), transition_count, ever_bypass, ever_accept_edits}` from `permission-mode` entries. Complements the last-observed `permission_mode`/`permission:<mode>` tag with the full transition history. **No timestamps** on these entries → sequence is order-only, not timed. Null when no `permission-mode` entries. From `extract_permission_timeline()`.
 - `worktree` — `{name, branch, original_cwd, original_branch, original_head_commit}` from the last `type: "worktree-state"` entry. Null when the session never entered a worktree. From `extract_worktree_state()`.
 - `background_tasks` / `session_crons` — raw lists from the Stop hook stdin payload (v2.1.145+). Live fires only; omitted on reprocess.
-- `subagent_costs` — see Subagent Cost Tracking.
+- `cli_cost_state` — Claude Code's own totals from the last `cost-state` entry: `{total_cost_usd, hook_cost_usd (parent + subagents, = the session_cost_usd score), gap_usd (total − hook; omitted when partial), side_model_cost_usd (cost of models that answered no message, main or subagent: mostly the WebFetch/WebSearch Haiku), covers_from (process startTime, ISO), partial (startTime > COST_STATE_PARTIAL_S = 120 s after the first entry), api_duration_ms, api_duration_without_retries_ms, tool_duration_ms, wall_duration_ms, lines_added, lines_removed, has_unknown_model_cost, by_model: {<model>: {cost_usd, input_tokens, output_tokens, thinking_tokens, cache_read_tokens, cache_create_tokens, web_search_requests}}}`. A positive `gap_usd` is spend the transcript never records (see the v2.1.300 census note for its four parts); a negative one is the hook over-counting. Retry time = `api_duration_ms − api_duration_without_retries_ms`. Absent until the CLI writes the entry on exit. From `extract_cost_state()`.
+- `async_hooks` — `{count, failures, by_hook: {<hookName>: {count, failures}}, last_failure: {hook, exit_code, stderr, timestamp}}` from `async_hook_response` attachments. `stderr` is redacted, then truncated to 200 chars; only the last failure keeps it. From `extract_async_hook_responses()`.
+- `rate_limits` — `{count, by_status, by_type, last: {status, type, resets_at (ISO UTC), overage_status, overage_disabled_reason, is_using_overage, timestamp}}` from `quotaLimits` (fallback `apiErrorParams.rate_limit_info`) on assistant entries. From `extract_rate_limits()`.
+- `scheduled_tasks` — `{count, tasks: {<taskId>: {cron, fires, first_at, last_at}}}` from `system/scheduled_task_fire`. The fire's prompt is not stored (it is the opened turn's input). From `extract_scheduled_task_fires()`.
+- `continued_in` — id of the session this one was continued in, from `continued-in`. From `extract_continued_in()`.
+- `relocations` — `{count, cwds (distinct, first-seen order, max 10), last_cwd}` from `relocated` entries. From `extract_relocations()`.
+- `subagent_costs` — see Subagent Cost Tracking. Each agent also carries `models`, `classifier_requests` and `partial_messages` (read from its whole transcript on every full read), and the rollup sums the last as `partial_messages`.
+- `classifier_requests` — distinct auto-mode classifier calls (`serverClassifierRequest`) across the main and subagent transcripts. Their cost is only in cost-state. From `count_classifier_requests()`.
 
 Extracted from the first `type: "user"` entry in the JSONL transcript via `extract_session_metadata()`.
 API errors extracted from `type: "system"` / `subtype: "api_error"` entries via `extract_api_errors()`.
@@ -518,7 +573,9 @@ and away summaries are extracted via `extract_custom_title()`, `extract_ai_title
 - `web_search_requests`, `web_fetch_requests` — server-side tool use counts
 - `attribution_skill`, `attribution_plugin` — primary skill / plugin for the turn (first non-empty observed)
 - `attribution_skills_all` — list of all distinct skills observed in the turn (only emitted when more than one)
-- `effort` — effort level for this turn (`low`/`medium`/`high`/`xhigh`/`max`), from the per-assistant-entry transcript field (CC 2.1.220+). Last non-empty value in the turn wins. Omitted on older transcripts. Pair with `usageDetails` to compare token spend across effort levels.
+- `effort` — effort level for this turn (`low`/`medium`/`high`/`xhigh`/`max`), from the per-assistant-entry transcript field (CC 2.1.220+), falling back to `perTurnEffort` when `effort` is missing. Last non-empty value in the turn wins. Omitted on older transcripts. Pair with `usageDetails` to compare token spend across effort levels.
+- `attribution_agent` — subagent generations only: the agent type from `attributionAgent` (`general-purpose`, `web-fetch`, `fork`, ...), first non-empty in the turn.
+- `scheduled_task_id` — the session cron task whose fire wrote the turn's prompt (`scheduledTaskId`). Counted per session as `turn_signals.scheduled_turns`.
 - `refusal_category` — present only when the turn's terminal `stop_reason` is `refusal`: the `stop_details.category` (or `uncategorized`).
 - `iteration_count` — number of server-side iterations in the turn (length of `usage.iterations`; 0 when absent).
 - `ttft_ms` — time-to-first-token in ms (first assistant-token timestamp − turn start). Omitted when not derivable.
@@ -666,6 +723,7 @@ Scores attach to the **session** (`sessionId`, not a turn trace) and are recompu
 | `cache_hit_rate` | Numeric | 0.0-1.0 | cache_read / (cache_read + cache_creation) |
 | `tool_error_rate` | Numeric | 0.0-1.0 | executed calls with `[ERROR]` output / executed calls |
 | `tool_denial_rate` | Numeric | 0.0-1.0 | denied calls / all attempted calls |
+| `cli_cost_usd` | Numeric | USD | Claude Code's own total from the last `cost-state` entry; omitted until the CLI writes it on exit. Compare with `session_cost_usd` (`cli_cost_state.gap_usd`) |
 
 All are deterministic (no LLM calls). Score IDs are `uuid5(session:score:<name>)`, so
 each fire overwrites the previous value. The three rates are omitted entirely when their denominator is zero
