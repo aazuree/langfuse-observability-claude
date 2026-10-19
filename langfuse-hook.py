@@ -1468,6 +1468,11 @@ def build_turns(entries: list[dict]) -> list[dict]:
                         t["duration_ms"] = me["duration_ms"]
                     break
 
+        # Assistant entries before the first user text belong to no turn and are
+        # not counted. The only ones seen are in forked subagents: a copy of the
+        # spawner's Agent-call message (same message.id and usage), written after
+        # `fork-context-ref`. The spawner's turns already bill it; counting it
+        # here would bill it again for every fork of that message.
         elif role == "assistant" and current_turn:
             content = me["content"]
             mid = me["message_id"]
@@ -1553,7 +1558,12 @@ def build_turns(entries: list[dict]) -> list[dict]:
     if current_turn:
         turns.append(current_turn)
 
-    # Aggregate usage per turn from deduplicated API calls
+    # Aggregate usage per turn from deduplicated API calls. A message can span
+    # two turns: when it calls Skill (or reads an image) and then another tool,
+    # the skill body (or "[Image: ...]" note) is an isMeta user entry written
+    # between its entries, and it opens a new turn. Each message counts once,
+    # in the turn it started in.
+    counted_mids = set()
     for turn in turns:
         usage = {"input": 0, "output": 0, "total": 0,
                  "cache_read": 0, "cache_creation": 0}
@@ -1575,6 +1585,9 @@ def build_turns(entries: list[dict]) -> list[dict]:
                       "cache_creation": 0, "cache_5m": 0, "cache_1h": 0}
         long_requests = 0
         for mid in turn["api_call_ids"]:
+            if mid in counted_mids:
+                continue
+            counted_mids.add(mid)
             u = msg_id_final_usage.get(mid, {})
             inp = u.get("input_tokens", 0)
             out = u.get("output_tokens", 0)
