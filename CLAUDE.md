@@ -147,6 +147,7 @@ tests/
   test_fork_context_copy.py      # A fork's copy of its spawning message is billed once, by the spawner
   test_split_message_usage.py    # A message whose entries span two turns is counted once
   test_continued_sessions.py     # A continued session's copy of its predecessor is sent and billed once
+  test_mixed_model_turns.py      # A turn answered by several models prices each model's share at its rates
   test_robustness.py             # Atomic state writes, logged crashes
   test_delete_traces.py          # --delete-traces (every per-turn trace, the old session trace, session scores)
   test_setup_tools.py            # tools/render_env.py and tools/configure_hooks.py
@@ -237,6 +238,8 @@ looked up in `_SONNET_RATES` / `_HAIKU_RATES` / `_TOP_TIER_RATES`. `claude-sonne
 **New-tokenizer note:** Opus 4.7+, Fable 5, **and Sonnet 5 / 5.5** ship a new tokenizer that produces ~30% more tokens for the same input text vs. prior models (Sonnet 4.6 and earlier keep the old tokenizer). Per-token rates are unchanged, but absolute session cost for equivalent workloads is meaningfully higher — the extra cost comes from token *counts* (already in `usageDetails`), not the rate table.
 
 Cache write cost is split by tier when `cache_5m` / `cache_1h` are available in `usageDetails`; otherwise all cache_create is billed at the 5m rate.
+
+**A turn answered by more than one model is priced per model.** Some Opus turns carry a few Haiku messages; the turn's `model` (and the generation's) is the last one that answered. `build_turns` keeps each model's share in `usage_by_model` (only when there are several) and `price_turn` bills each share at its own rates; `cost_by_model` counts the turn under each model with its share. Until 2026-10-24 the whole turn was billed at the last model (2 local sessions, $0.36 over), found by `tools/audit_costs.py`'s recount. Speed and `inference_geo` stay turn-level (last non-empty wins): the recount, which prices them per message, agrees on every local session.
 
 **Extended-thinking tokens are NOT a separate billing category.** `usage.output_tokens_details.thinking_tokens` is a breakdown *inside* `output_tokens`, billed at the plain output rate. It is reported as the `output_thinking` line in `usageDetails` and rolled up in the session rollup `thinking` (`{total_thinking_tokens, total_output_tokens, share_of_output, turns_with_thinking, max_thinking_tokens}`) purely for analytics — never added to a cost total, and `calculate_turn_cost` does not take it as an input. It answers "what is the effort level actually buying", which the `effort_level` tag alone cannot. Note the token *count* is present even though CC has stripped thinking *text* from transcripts since v2.1.112.
 

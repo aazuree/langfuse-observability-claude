@@ -486,17 +486,7 @@ def ingest_subagent(
 
     for turn_idx, turn in enumerate(turns):
         model = turn.get("model") or ""
-        turn_cost, _in, _out, cost_details = calculate_turn_cost(
-            turn["usage"],
-            model,
-            turn.get("cache_ephemeral_5m", 0),
-            turn.get("cache_ephemeral_1h", 0),
-            speed=turn.get("speed", ""),
-            inference_geo=turn.get("inference_geo", ""),
-            web_search_requests=turn.get("web_search_requests", 0),
-            turn_start_time=turn.get("start_time", ""),
-            long_context_usage=turn.get("usage_long"),
-        )
+        turn_cost, _in, _out, cost_details = price_turn(turn)
         total_cost += turn_cost
         total_tokens += turn["usage"]["total"]
         if cost_details:
@@ -1287,6 +1277,33 @@ def _display_prompt(parts: list) -> str:
     return parts[0][0].strip() if parts else ""
 
 
+def _add_model_share(by_model: dict, model: str, u: dict) -> None:
+    """Add one message's usage to its model's share of a turn."""
+    share = by_model.setdefault(model, {
+        "usage": {"input": 0, "output": 0, "total": 0, "cache_read": 0, "cache_creation": 0},
+        "cache_5m": 0, "cache_1h": 0, "web_search_requests": 0, "usage_long": None,
+    })
+    inp = u.get("input_tokens", 0)
+    out = u.get("output_tokens", 0)
+    cr = u.get("cache_read_input_tokens", 0)
+    ccr = u.get("cache_creation_input_tokens", 0)
+    tiers = u.get("cache_creation", {}) or {}
+    c5 = tiers.get("ephemeral_5m_input_tokens", 0)
+    c1 = tiers.get("ephemeral_1h_input_tokens", 0)
+    for k, v in (("input", inp), ("output", out), ("total", inp + out),
+                 ("cache_read", cr), ("cache_creation", ccr)):
+        share["usage"][k] += v
+    share["cache_5m"] += c5
+    share["cache_1h"] += c1
+    share["web_search_requests"] += (u.get("server_tool_use", {}) or {}).get("web_search_requests", 0)
+    if inp + cr + ccr > LONG_CONTEXT_THRESHOLD:
+        lu = share["usage_long"] = share["usage_long"] or {
+            "input": 0, "output": 0, "cache_read": 0, "cache_creation": 0, "cache_5m": 0, "cache_1h": 0}
+        for k, v in (("input", inp), ("output", out), ("cache_read", cr),
+                     ("cache_creation", ccr), ("cache_5m", c5), ("cache_1h", c1)):
+            lu[k] += v
+
+
 def build_turns(entries: list[dict], copied_message_ids: frozenset = frozenset()) -> list[dict]:
     """Group transcript entries into turns with timing and token data.
 
@@ -1393,6 +1410,7 @@ def build_turns(entries: list[dict], copied_message_ids: frozenset = frozenset()
     msg_id_first_ts = {}  # message_id -> first timestamp seen
     msg_id_final_usage = {}  # message_id -> final usage dict
     msg_id_diagnostics = {}  # message_id -> diagnostics dict
+    msg_id_model = {}  # message_id -> the model that answered it
 
     for me in msg_entries:
         if me["role"] != "assistant" or not me["message_id"]:
@@ -1400,6 +1418,8 @@ def build_turns(entries: list[dict], copied_message_ids: frozenset = frozenset()
         mid = me["message_id"]
         if mid not in msg_id_first_ts:
             msg_id_first_ts[mid] = me["timestamp"]
+        if me["model"] and me["model"] != "<synthetic>":
+            msg_id_model[mid] = me["model"]
         if me["usage"]:
             msg_id_final_usage[mid] = me["usage"]
         if me["diagnostics"] and mid not in msg_id_diagnostics:
@@ -1591,11 +1611,15 @@ def build_turns(entries: list[dict], copied_message_ids: frozenset = frozenset()
         usage_long = {"input": 0, "output": 0, "cache_read": 0,
                       "cache_creation": 0, "cache_5m": 0, "cache_1h": 0}
         long_requests = 0
+        # Each model's share of the turn, for pricing when more than one
+        # model answered in it (price_turn); the turn's `model` is the last.
+        by_model: dict[str, dict] = {}
         for mid in turn["api_call_ids"]:
             if mid in copied_message_ids or mid in counted_mids:
                 continue
             counted_mids.add(mid)
             u = msg_id_final_usage.get(mid, {})
+            _add_model_share(by_model, msg_id_model.get(mid) or turn["model"], u)
             inp = u.get("input_tokens", 0)
             out = u.get("output_tokens", 0)
             cr = u.get("cache_read_input_tokens", 0)
@@ -1649,6 +1673,8 @@ def build_turns(entries: list[dict], copied_message_ids: frozenset = frozenset()
         ]
         turn["usage"] = usage
         turn["usage_long"] = usage_long if long_requests else None
+        if len(by_model) > 1:
+            turn["usage_by_model"] = by_model
         turn["long_context_requests"] = long_requests
         turn["thinking_duration_ms"] = sum(turn.pop("_thinking_ms_by_mid").values())
         turn["speed"] = speed
@@ -2487,25 +2513,76 @@ def calculate_tool_denial_rate(turns: list[dict]) -> float | None:
     return round(denied / total, 4)
 
 
+def model_shares(turn: dict) -> dict:
+    """{model: share of the turn's usage}; one entry unless several models answered."""
+    return turn.get("usage_by_model") or {turn.get("model") or "": {
+        "usage": turn.get("usage") or {},
+        "cache_5m": turn.get("cache_ephemeral_5m", 0),
+        "cache_1h": turn.get("cache_ephemeral_1h", 0),
+        "web_search_requests": turn.get("web_search_requests", 0),
+        "usage_long": turn.get("usage_long"),
+    }}
+
+
+def _price_share(turn: dict, model: str, share: dict) -> tuple:
+    return calculate_turn_cost(
+        share["usage"],
+        model,
+        share["cache_5m"],
+        share["cache_1h"],
+        speed=turn.get("speed", ""),
+        inference_geo=turn.get("inference_geo", ""),
+        web_search_requests=share["web_search_requests"],
+        turn_start_time=turn.get("start_time", ""),
+        long_context_usage=share["usage_long"],
+    )
+
+
+def price_turn(turn: dict, model: str | None = None) -> tuple:
+    """Price one built turn: (turn_cost, input_cost, output_cost, cost_details).
+
+    A turn answered by more than one model (`usage_by_model`, e.g. a few Haiku
+    messages inside an Opus turn) prices each model's share at its own rates;
+    billing it all at the turn's model overcharged such turns (2 local
+    sessions, $0.36, found by tools/audit_costs.py on 2026-10-24).
+    `model` overrides the turn's own model, for counterfactual pricing of the
+    same token usage; other models' shares keep their rates. Counterfactual
+    pricing keeps the request split: it only applies if that model has a
+    long-prompt tier.
+    """
+    own = turn.get("model") or ""
+    shares = model_shares(turn)
+    total = [0.0, 0.0, 0.0]
+    details: dict = {}
+    for share_model, share in shares.items():
+        priced = _price_share(turn, model if model is not None and share_model == own else share_model, share)
+        if len(shares) == 1:
+            return priced
+        for i in range(3):
+            total[i] += priced[i]
+        for k, v in priced[3].items():
+            details[k] = details.get(k, 0) + v
+    return total[0], total[1], total[2], details
+
+
 def _turn_cost_usd(turn: dict, model: str | None = None) -> float:
     """Total cost of one built turn. `model` overrides the turn's own model,
     for counterfactual pricing of the same token usage."""
     if model is None and "_cost" in turn:
         return turn["_cost"][0]
-    cost, _i, _o, _cd = calculate_turn_cost(
-        turn.get("usage") or {},
-        (turn.get("model") or "") if model is None else model,
-        turn.get("cache_ephemeral_5m", 0),
-        turn.get("cache_ephemeral_1h", 0),
-        speed=turn.get("speed", ""),
-        inference_geo=turn.get("inference_geo", ""),
-        web_search_requests=turn.get("web_search_requests", 0),
-        turn_start_time=turn.get("start_time", ""),
-        # Counterfactual pricing under another model keeps the request split:
-        # it only applies if that model has a long-prompt tier.
-        long_context_usage=turn.get("usage_long"),
-    )
-    return cost
+    return price_turn(turn, model)[0]
+
+
+def _turns_by_model(turns: list[dict]):
+    """(turn, model, usage, cost) for each model's share of each turn."""
+    for t in turns:
+        shares = model_shares(t)
+        if len(shares) == 1:
+            ((model, share),) = shares.items()
+            yield t, model, share["usage"], _turn_cost_usd(t)
+            continue
+        for model, share in shares.items():
+            yield t, model, share["usage"], _price_share(t, model, share)[0]
 
 
 def build_model_cost_breakdown(turns: list[dict]) -> dict | None:
@@ -2516,15 +2593,15 @@ def build_model_cost_breakdown(turns: list[dict]) -> dict | None:
     Opus 5.5 defaults to effort `medium` where Opus 5 defaults to `high`:
     comparing the two models without it mixes a price change with an effort
     change. Turns without an effort field land in "unset". Turns without a
-    model land in "_missing". None when there are no turns.
+    model land in "_missing". A turn several models answered in counts under
+    each of them, with that model's share of its tokens and cost. None when
+    there are no turns.
     """
     if not turns:
         return None
     breakdown: dict[str, dict] = {}
-    for t in turns:
-        usage = t.get("usage") or {}
-        cost = _turn_cost_usd(t)
-        b = breakdown.setdefault(t.get("model") or "_missing", {
+    for t, model, usage, cost in _turns_by_model(turns):
+        b = breakdown.setdefault(model or "_missing", {
             "turns": 0,
             "input_tokens": 0,
             "output_tokens": 0,
@@ -3235,17 +3312,7 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
 
     # Price each turn once; every rollup below reads this.
     for t in turns:
-        t["_cost"] = calculate_turn_cost(
-            t["usage"],
-            t.get("model") or "",
-            t.get("cache_ephemeral_5m", 0),
-            t.get("cache_ephemeral_1h", 0),
-            speed=t.get("speed", ""),
-            inference_geo=t.get("inference_geo", ""),
-            web_search_requests=t.get("web_search_requests", 0),
-            turn_start_time=t.get("start_time", ""),
-            long_context_usage=t.get("usage_long"),
-        )
+        t["_cost"] = price_turn(t)
     session_cost = sum(t["_cost"][0] for t in own_turns)
 
     repo_name = os.path.basename(cwd.rstrip("/")) if cwd else ""
