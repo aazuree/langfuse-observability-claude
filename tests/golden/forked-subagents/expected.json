@@ -1,0 +1,10 @@
+{
+  "covers": "Forked subagents whose transcripts open with a copy of the spawner's Agent call",
+  "sessions": {
+    "5807ad07-de00-0edd-53b7-e679b7564a5a": {
+      "generations": 10,
+      "hook_usd": 4.209144,
+      "recount_usd": 4.209144
+    }
+  }
+}

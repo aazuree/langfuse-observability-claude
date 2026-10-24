@@ -230,6 +230,9 @@ def run_hook(projects: Path, hook, on_batch=None) -> dict:
         return True
 
     hook.send_to_langfuse = capture
+    # Subagent discovery falls back to the cwd's project dir; keep it inside
+    # the transcripts being audited.
+    hook.PROJECTS_DIR = str(projects)
     for main in sorted(projects.glob("*/*.jsonl")):
         session_id = hook.sanitize_id(main.stem)
         # A continuation flushes its predecessor first; a session already

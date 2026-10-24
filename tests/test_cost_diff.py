@@ -46,6 +46,7 @@ def test_cost_or_generation_changes_are_listed():
 
 
 def test_checkout_hook_writes_every_hook_module(tmp_path):
+    """HEAD has all three; older refs may lack the helper modules."""
     path = cost_diff.checkout_hook("HEAD", tmp_path)
     assert path == tmp_path / "langfuse-hook.py"
     assert sorted(p.name for p in tmp_path.iterdir()) == sorted(cost_diff.HOOK_FILES)

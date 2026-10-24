@@ -35,8 +35,9 @@ def checkout_hook(ref: str, dest: Path) -> Path:
     """Write the hook files as of git `ref` into `dest`."""
     for name in HOOK_FILES:
         out = subprocess.run(["git", "-C", str(REPO_ROOT), "show", f"{ref}:{name}"],
-                             capture_output=True, check=True)
-        (dest / name).write_bytes(out.stdout)
+                             capture_output=True, check=name == "langfuse-hook.py")
+        if out.returncode == 0:  # older refs predate some modules
+            (dest / name).write_bytes(out.stdout)
     return dest / "langfuse-hook.py"
 
 

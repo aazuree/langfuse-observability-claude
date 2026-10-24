@@ -1,0 +1,15 @@
+{
+  "covers": "A session continued in another: the successor's copy of the history is billed once, by the predecessor",
+  "sessions": {
+    "11cc2548-fe13-f141-dd9c-f80dbdfa7a7c": {
+      "generations": 13,
+      "hook_usd": 12.142329,
+      "recount_usd": 12.142329
+    },
+    "79eb9b15-1d51-102f-9bb1-b230358718a7": {
+      "generations": 1,
+      "hook_usd": 0.728965,
+      "recount_usd": 0.728965
+    }
+  }
+}

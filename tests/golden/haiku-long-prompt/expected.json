@@ -1,0 +1,10 @@
+{
+  "covers": "Haiku 5.5 requests over 100K prompt tokens, billed at the long-prompt rates per request",
+  "sessions": {
+    "863dd9b8-d40e-6b20-67d8-ac8076c254fb": {
+      "generations": 5,
+      "hook_usd": 0.273132,
+      "recount_usd": 0.273132
+    }
+  }
+}
