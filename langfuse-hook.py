@@ -25,6 +25,7 @@ import sys
 import time
 import traceback
 import uuid
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -317,9 +318,11 @@ def _file_size(path: str) -> int | None:
 
 # sa_state bookkeeping that is not reported in trace metadata (a path would
 # also leak the local username).
-_SA_STATE_ONLY_KEYS = frozenset({"path", "size", "parent_span_id", "trace_id", "offset", "correlation"})
+_SA_STATE_ONLY_KEYS = frozenset({"path", "size", "parent_span_id", "trace_id", "offset", "correlation",
+                                 "message_ids"})
 # Per-agent facts ingest_subagent reads from the whole transcript.
-_SA_OBSERVED_KEYS = ("models", "classifier_requests", "partial_messages")
+_SA_OBSERVED_KEYS = ("models", "classifier_requests", "partial_messages",
+                     "tokens_by_model", "web_tool_calls", "message_ids")
 
 
 def _subagent_record(prev: dict, events: list, cost: dict, offset: int,
@@ -596,6 +599,10 @@ def ingest_subagent(
         "models": sorted(message_models(entries)),
         "classifier_requests": count_classifier_requests(entries),
         "partial_messages": count_partial_messages(entries),
+        # For the session's cost_check (check_cost, duplicate billing).
+        "tokens_by_model": tokens_by_model(turns),
+        "web_tool_calls": count_web_tool_calls(turns),
+        "message_ids": sorted({mid for t in turns for mid in t["api_call_ids"]}),
     }
     return events, cost_summary, total_lines, max(prior_turn_count, sendable), status
 
@@ -1846,6 +1853,22 @@ _COST_STATE_MODEL_KEYS = (
 # entry does not cover the whole session.
 COST_STATE_PARTIAL_S = 120
 
+# check_cost: transcript tokens against Claude Code's own cost-state. An
+# overcount (transcript above the CLI) worth less than this is rounding.
+OVERCOUNT_TOLERANCE_USD = 0.01
+# Output tokens the CLI may count beyond the transcript per call it makes but
+# never writes as a message. Fitted on the 2026-10 history (93 sessions) with
+# headroom; a session with none of these matched within 8 tokens.
+SIDE_CALL_OUTPUT_ALLOWANCE = {
+    "classifier_requests": 40,   # auto-mode classifier, ~10 output tokens each
+    "compactions": 20_000,       # /compact summary
+    "away_summaries": 600,       # recap written when the user comes back
+    "web_tool_calls": 3_000,     # Haiku summarising a WebFetch page / WebSearch
+}
+OUTPUT_SLACK_TOKENS = 200
+TOKEN_KINDS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_create_tokens")
+WEB_TOOLS = frozenset({"WebFetch", "WebSearch"})
+
 
 def extract_cost_state(transcript_path: str) -> dict | None:
     """Claude Code's own running cost, from the last `cost-state` entry.
@@ -2585,6 +2608,72 @@ def _turns_by_model(turns: list[dict]):
             yield t, model, share["usage"], _price_share(t, model, share)[0]
 
 
+def tokens_by_model(turns: list[dict]) -> dict:
+    """{model: {input_tokens, output_tokens, cache_read_tokens, cache_create_tokens}}."""
+    out: dict[str, dict] = {}
+    for t in turns:
+        for model, share in model_shares(t).items():
+            if not model:
+                continue
+            u = share["usage"]
+            b = out.setdefault(model, dict.fromkeys(TOKEN_KINDS, 0))
+            b["input_tokens"] += u.get("input", 0)
+            b["output_tokens"] += u.get("output", 0)
+            b["cache_read_tokens"] += u.get("cache_read", 0)
+            b["cache_create_tokens"] += u.get("cache_creation", 0)
+    return out
+
+
+def count_web_tool_calls(turns: list[dict]) -> int:
+    return sum(1 for t in turns for tc in t["tool_calls"] if tc["name"] in WEB_TOOLS)
+
+
+def check_cost(tokens: dict, cli_by_model: dict, side_calls: dict, partial_messages: int) -> dict:
+    """Compare the tokens the hook bills with Claude Code's own count.
+
+    `tokens` and `cli_by_model` are {model: {input_tokens, output_tokens,
+    cache_read_tokens, cache_create_tokens}}. The CLI also counts calls the
+    transcript never records, so the hook can never legitimately bill more
+    of any model: excess worth over OVERCOUNT_TOLERANCE_USD is `overcount`.
+    Every message has output tokens, so a message the transcript lost shows
+    up as CLI output beyond what the unrecorded `side_calls` explain
+    (SIDE_CALL_OUTPUT_ALLOWANCE): `unreconciled`. With partially recorded
+    subagent messages the hook's output is a known lower bound and that
+    check is skipped (`output-lower-bound`). tools/audit_costs.py runs this
+    same check against an independent recount.
+    """
+    overcount, overcount_usd = {}, 0.0
+    for model, t in tokens.items():
+        c = cli_by_model.get(model, {})
+        excess = {k: t[k] - c.get(k, 0) for k in TOKEN_KINDS if t[k] > c.get(k, 0)}
+        if excess:
+            overcount[model] = excess
+            overcount_usd += calculate_turn_cost({
+                "input": excess.get("input_tokens", 0), "output": excess.get("output_tokens", 0),
+                "cache_read": excess.get("cache_read_tokens", 0),
+                "cache_creation": excess.get("cache_create_tokens", 0)}, model)[0]
+    allowance = OUTPUT_SLACK_TOKENS + sum(
+        n * SIDE_CALL_OUTPUT_ALLOWANCE[k] for k, n in side_calls.items())
+    cli_out = sum(c.get("output_tokens", 0) for m, c in cli_by_model.items() if m in tokens)
+    output_excess = cli_out - sum(t["output_tokens"] for t in tokens.values())
+    if overcount_usd > OVERCOUNT_TOLERANCE_USD:
+        status = "overcount"
+    elif partial_messages:
+        status = "output-lower-bound"
+    elif output_excess > allowance:
+        status = "unreconciled"
+    else:
+        status = "ok"
+    return {
+        "status": status,
+        "overcount_usd": round(overcount_usd, 6),
+        "overcount": overcount or None,
+        "output_excess_tokens": output_excess,
+        "output_allowance": allowance,
+        "side_calls": side_calls,
+    }
+
+
 def build_model_cost_breakdown(turns: list[dict]) -> dict | None:
     """Per-model rollup of turns, tokens and cost, split by effort level.
 
@@ -2893,7 +2982,7 @@ def build_attribution_tags(summary: dict | None) -> list[str]:
 # Every score the hook writes for a session. Ids depend only on session and
 # name, so --delete-traces can remove them without asking Langfuse.
 SESSION_SCORE_NAMES = ("session_cost_usd", "cache_hit_rate", "tool_error_rate",
-                       "tool_denial_rate", "cli_cost_usd")
+                       "tool_denial_rate", "cli_cost_usd", "cost_residual_usd")
 
 
 def session_score_id(session_id: str, name: str) -> str:
@@ -2906,6 +2995,7 @@ def build_hook_score_events(
     session_cost: float,
     rollups: dict | None = None,
     cli_cost: float | None = None,
+    cost_residual: float | None = None,
 ) -> list[dict]:
     """Build the session-level score-create events.
 
@@ -2920,11 +3010,18 @@ def build_hook_score_events(
     - `cli_cost_usd`: Claude Code's own total from the `cost-state` entry,
       next to `session_cost_usd` for comparison; omitted until that entry
       is written (the CLI writes it on exit).
+    - `cost_residual_usd`: CLI total − hook cost − the models that answered
+      no message (`cli_cost_state.gap_usd − side_model_cost_usd`): spend on
+      the session's own models that the transcript never records (classifier
+      calls, compaction, partially recorded subagents). Negative means the
+      hook bills more than the CLI. Omitted without a whole-session cost-state.
     """
     scores = [{"name": "session_cost_usd", "value": round(session_cost, 6),
                "metadata": rollups or {}}]
     if cli_cost is not None:
         scores.append({"name": "cli_cost_usd", "value": round(cli_cost, 6)})
+    if cost_residual is not None:
+        scores.append({"name": "cost_residual_usd", "value": round(cost_residual, 6)})
     for name, value in (
         ("cache_hit_rate", compute_cache_hit_rate(turns)),
         ("tool_error_rate", calculate_tool_error_rate(turns)),
@@ -3028,6 +3125,66 @@ def gen_metadata_cache_miss(turn: dict) -> dict:
         "cache_missed_tokens": cm["missed_tokens"],
         "cache_miss_by_reason": by,
     }
+
+
+def build_cost_check(own_turns: list[dict], agents: dict, cost_state: dict | None,
+                     cli_cost_state: dict | None, compaction: dict | None, away_summaries: list,
+                     classifier_requests: int, copied_message_ids: frozenset) -> dict:
+    """The session's `cost_check` rollup, plus the tags it raises.
+
+    `duplicate_messages` counts API messages billed by more than one of the
+    parent and its subagents; each message must be billed exactly once. The
+    cost-state comparison (check_cost) needs a cost-state that covers the
+    whole session, which the CLI writes on exit; a continuation's carries on
+    from its predecessor's, whose tokens this session does not bill, so it
+    is not compared.
+    """
+    billed = Counter({mid for t in own_turns for mid in t["api_call_ids"]} - copied_message_ids)
+    for agent in agents.values():
+        billed.update(set(agent.get("message_ids") or ()))
+    duplicates = sum(1 for n in billed.values() if n > 1)
+
+    out: dict = {"duplicate_messages": duplicates}
+    if not cost_state:
+        out["status"] = "unchecked: no cost-state yet"
+    elif cost_state.get("partial"):
+        out["status"] = "unchecked: cost-state covers part of the session"
+    elif "predecessor_cost_usd" in (cli_cost_state or {}):
+        out["status"] = "unchecked: continuation"
+    elif any("tokens_by_model" not in a for a in agents.values()):
+        out["status"] = "unchecked: subagent state predates the check"
+    else:
+        tokens = tokens_by_model(own_turns)
+        for agent in agents.values():
+            for model, t in agent["tokens_by_model"].items():
+                mine = tokens.setdefault(model, dict.fromkeys(TOKEN_KINDS, 0))
+                for k in TOKEN_KINDS:
+                    mine[k] += t.get(k, 0)
+        side_calls = {
+            "classifier_requests": classifier_requests,
+            "compactions": (compaction or {}).get("count", 0),
+            "away_summaries": len(away_summaries or ()),
+            "web_tool_calls": count_web_tool_calls(own_turns)
+                              + sum(a.get("web_tool_calls", 0) for a in agents.values()),
+        }
+        partial = sum(a.get("partial_messages", 0) for a in agents.values())
+        out.update(check_cost(tokens, cost_state.get("by_model", {}), side_calls, partial))
+
+    tags, notes = [], []
+    if duplicates:
+        tags.append("duplicate-billing")
+        notes.append(f"{duplicates} message(s) billed more than once")
+    if out["status"] == "overcount":
+        tags.append("cost-overcount")
+        notes.append(f"transcript tokens exceed the CLI's own count by ${out['overcount_usd']:.4f} "
+                     f"({out['overcount']})")
+    elif out["status"] == "unreconciled":
+        tags.append("cost-unreconciled")
+        notes.append(f"the CLI counted {out['output_excess_tokens']:,} more output tokens than the "
+                     f"transcript, beyond the {out['output_allowance']:,} its side calls explain")
+    out["tags"] = tags
+    out["summary"] = "; ".join(notes)
+    return out
 
 
 @contextlib.contextmanager
@@ -3656,6 +3813,15 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
         # Only meaningful when cost-state covers the whole transcript.
         if not cost_state.get("partial"):
             cli_cost_state["gap_usd"] = round(cli_cost - hook_cost, 6)
+    cost_check = build_cost_check(own_turns, agents, cost_state, cli_cost_state, compaction,
+                                  away_summaries, classifier_requests,
+                                  frozenset(continuation.get("message_ids", ())))
+    for tag in cost_check["tags"]:
+        session_tags.append(tag)
+        log(f"[WARN] {tag} in session {session_id}: {cost_check['summary']}")
+    cost_residual = None
+    if cli_cost_state and "gap_usd" in cli_cost_state:
+        cost_residual = cli_cost_state["gap_usd"] - cli_cost_state["side_model_cost_usd"]
     continued_from = None
     if continuation.get("predecessor"):
         continued_from = {
@@ -3699,6 +3865,7 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
         "interrupts": interrupts,
         "queue_operations": queue_operations,
         "cli_cost_state": cli_cost_state,
+        "cost_check": {k: v for k, v in cost_check.items() if k != "tags"},
         "classifier_requests": classifier_requests or None,
         "async_hooks": async_hooks,
         "rate_limits": rate_limits,
@@ -3714,6 +3881,7 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
         session_cost=hook_cost,
         rollups={k: v for k, v in session_rollups.items() if v is not None},
         cli_cost=cli_cost,
+        cost_residual=cost_residual,
     ))
 
     sent_turns = sendable - min(prev_turn_count, sendable)
