@@ -350,6 +350,17 @@ python3 tools/cost_diff.py                                # origin/main vs this 
   ```
 - **Rates are checked weekly** by `.github/workflows/pricing-drift.yml` (Mondays, plus
   manual dispatch), which runs `check_pricing_drift.py`; GitHub emails on a failed run.
+- **Weekly local run:** a systemd user timer runs the full audit against the deployed
+  stack and notifies on exit 1 or 2 (the units live in `~/.config/systemd/user`, not in
+  this repo):
+  ```ini
+  # langfuse-cost-audit.service (+ a .timer with OnCalendar=Mon *-*-* 09:30, Persistent=true)
+  [Unit]
+  OnFailure=langfuse-cost-audit-notify.service   # notify-send -u critical ...
+  [Service]
+  Type=oneshot
+  ExecStart=/usr/bin/python3 %h/<REPO_ROOT>/tools/audit_costs.py --langfuse --from-settings
+  ```
 - The Langfuse check skips sessions written to in the last hour and needs the stored
   sessions to fit one metrics query (1,000 rows over the local transcripts' window).
 
