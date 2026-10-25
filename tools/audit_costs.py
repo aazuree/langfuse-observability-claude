@@ -14,18 +14,14 @@ Three checks, each catching a different way cost goes wrong:
    `check_pricing_drift.py`, this checks counting.
 
 2. **Claude Code's own totals** — the `cost-state` entry the CLI writes on
-   exit. Per model, the tokens the transcript records can never exceed what
-   the CLI counted (it also counts calls the transcript never records), so
-   any excess worth more than `OVERCOUNT_TOLERANCE_USD` is an **overcount**.
-   Output tokens are the undercount check: every message has some, so a
-   message the transcript lost shows up there. The CLI's extra calls that
-   are never written as messages get an allowance each, fitted on 2026-10
-   history (`SIDE_CALL_OUTPUT_ALLOWANCE`): auto-mode classifier calls,
-   compactions, away summaries, and the Haiku calls behind WebFetch /
-   WebSearch. A session with no such calls must match within
-   `OUTPUT_SLACK_TOKENS`. Sessions with partially recorded subagent
-   messages (`subagent-usage-partial`) are reported, not checked: their
-   output is a known lower bound.
+   exit, compared per model with the recount's tokens by the hook's own
+   `check_cost` (the live hook runs the same rule on its own tokens, so the
+   two can't drift apart). The transcript can never legitimately exceed
+   the CLI's count: that is an **overcount**. CLI output beyond what its
+   unrecorded side calls explain (auto-mode classifier, compaction, away
+   summaries, the Haiku behind WebFetch / WebSearch) is an **undercount**.
+   Sessions with partially recorded subagent messages are not checked for
+   undercount: their output is a known lower bound.
 
 3. **What Langfuse holds** (`--langfuse`) — the stored per-session cost must
    equal what a fresh run of the hook computes. More means spans exported
@@ -62,19 +58,6 @@ DEFAULT_PROJECTS = Path.home() / ".claude" / "projects"
 
 # Dollar differences below this are float rounding, not a finding.
 COST_TOLERANCE_USD = 0.005
-# An overcount (transcript tokens above the CLI's own count) worth less than
-# this is rounding in the CLI's per-model totals, not a finding.
-OVERCOUNT_TOLERANCE_USD = 0.01
-# Output tokens the CLI may count beyond the transcript per call it makes but
-# never writes as a message. Fitted on the 2026-10 history (93 sessions) with
-# headroom; a clean session (none of these) matched within 8 tokens.
-SIDE_CALL_OUTPUT_ALLOWANCE = {
-    "classifier_requests": 40,   # auto-mode classifier, ~10 output tokens each
-    "compactions": 20_000,       # /compact summary
-    "away_summaries": 600,       # recap written when the user comes back
-    "web_tool_calls": 3_000,     # Haiku summarising a WebFetch page / WebSearch
-}
-OUTPUT_SLACK_TOKENS = 200
 # Sessions written to within this many seconds may still be running.
 ACTIVE_S = 3600
 
@@ -273,7 +256,7 @@ def side_calls(naive: dict, meta: dict) -> dict:
 
 
 def cost_state_findings(session_id: str, naive_all: dict, scores: dict, hook) -> list[str]:
-    """Compare the transcript's per-model tokens with Claude Code's cost-state."""
+    """Compare the recount's per-model tokens with Claude Code's cost-state."""
     meta = scores[session_id].get("metadata") or {}
     cli = meta.get("cli_cost_state") or {}
     if not cli or cli.get("partial") or "by_model" not in cli:
@@ -284,43 +267,28 @@ def cost_state_findings(session_id: str, naive_all: dict, scores: dict, hook) ->
     if "predecessor_cost_usd" in cli:
         group.append((meta.get("continued_from") or {}).get("session_id", ""))
     tokens: dict[str, dict] = defaultdict(lambda: dict.fromkeys(TOKEN_KINDS, 0))
-    calls = dict.fromkeys(SIDE_CALL_OUTPUT_ALLOWANCE, 0)
+    calls: dict[str, int] = defaultdict(int)
     partial = 0
     for sid in group:
         for m, t in naive_all.get(sid, {}).get("tokens", {}).items():
-            for k in TOKEN_KINDS:
-                tokens[m][k] += t[k]
+            if m:
+                for k in TOKEN_KINDS:
+                    tokens[m][k] += t[k]
         sid_meta = (scores.get(sid) or {}).get("metadata") or {}
         for k, n in side_calls(naive_all.get(sid, {}), sid_meta).items():
             calls[k] += n
         partial += (sid_meta.get("subagent_costs") or {}).get("partial_messages", 0)
 
-    findings = []
-    for model, t in sorted(tokens.items()):
-        if not model or not any(t.values()):
-            continue
-        c = cli["by_model"].get(model, {})
-        excess = {k: max(0, t[k] - c.get(k, 0)) for k in TOKEN_KINDS}
-        usd = hook.calculate_turn_cost(
-            {"input": excess["input_tokens"], "output": excess["output_tokens"],
-             "cache_read": excess["cache_read_tokens"], "cache_creation": excess["cache_create_tokens"]},
-            model)[0]
-        if usd > OVERCOUNT_TOLERANCE_USD:
-            what = ", ".join(f"{k} +{v:,}" for k, v in excess.items() if v)
-            findings.append(f"overcount: {model} transcript exceeds the CLI's own count "
-                            f"({what}; ${usd:.4f})")
-    if partial:
-        return findings  # output is a known lower bound; reported via subagent-usage-partial
-    allowance = OUTPUT_SLACK_TOKENS + sum(
-        n * SIDE_CALL_OUTPUT_ALLOWANCE[k] for k, n in calls.items())
-    cli_out = sum(c.get("output_tokens", 0) for m, c in cli["by_model"].items() if m in tokens)
-    ours = sum(t["output_tokens"] for t in tokens.values())
-    if cli_out - ours > allowance:
+    check = hook.check_cost(dict(tokens), cli["by_model"], dict(calls), partial)
+    if check["status"] == "overcount":
+        return [f"overcount: transcript tokens exceed the CLI's own count by "
+                f"${check['overcount_usd']:.4f} ({check['overcount']})"]
+    if check["status"] == "unreconciled":
         explained = ", ".join(f"{n} {k}" for k, n in calls.items() if n) or "no side calls"
-        findings.append(
-            f"undercount: the CLI counted {cli_out - ours:,} more output tokens than the "
-            f"transcript records, beyond the {allowance:,} that {explained} explain")
-    return findings
+        return [f"undercount: the CLI counted {check['output_excess_tokens']:,} more output tokens "
+                f"than the transcript records, beyond the {check['output_allowance']:,} that "
+                f"{explained} explain"]
+    return []
 
 
 # ---------------------------------------------------------------------------

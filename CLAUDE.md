@@ -131,6 +131,7 @@ tests/
   test_pricing_drift.py          # Pricing drift-checker tests (offline, synthetic feeds)
   test_audit_costs.py            # Each audit check fires on its failure and stays quiet otherwise
   test_cost_diff.py              # tools/cost_diff.py
+  test_cost_check.py             # Live cost_check: overcount, unreconciled, duplicate billing
   test_thinking_tokens.py        # output_tokens_details.thinking_tokens capture + rollup
   test_prompt_provenance.py      # origin.kind / promptSource / turnCompanion capture
   test_prompt_provenance_fallback.py  # shape-based classification of untagged prompt entries
@@ -302,7 +303,7 @@ audit runs three checks and exits 1 on any finding:
 | Check | Compares | Catches |
 |-------|----------|---------|
 | Recount | the hook (dry run) vs a naive second count: one usage per `message.id` (last entry) across **all** transcripts, owned by the first writer (`continued-in` decides a continuation's copy) | a message billed twice or dropped; a turn priced at the wrong model |
-| cost-state | per-model transcript tokens vs Claude Code's own `cost-state` | overcount: transcript above the CLI (> `OVERCOUNT_TOLERANCE_USD`); undercount: CLI output beyond what its unrecorded side calls explain (`SIDE_CALL_OUTPUT_ALLOWANCE`) |
+| cost-state | per-model recount tokens vs Claude Code's own `cost-state`, via the hook's `check_cost` | overcount: transcript above the CLI (> `OVERCOUNT_TOLERANCE_USD`); undercount: CLI output beyond what its unrecorded side calls explain (`SIDE_CALL_OUTPUT_ALLOWANCE`) |
 | Langfuse (`--langfuse`) | stored per-session `totalCost` (metrics API) vs a fresh hook run | spans exported twice, turns never sent |
 
 ```bash
@@ -321,6 +322,14 @@ python3 tools/cost_diff.py                                # origin/main vs this 
   lower bound, tag `subagent-usage-partial`).
 - Both sides of the recount price with `calculate_turn_cost`, so the recount does not
   validate rates — only what gets counted, and at which model.
+- **The hook runs the same cost-state check live** on its own tokens (parent +
+  subagents) whenever the transcript holds a whole-session cost-state (a `SessionEnd`
+  fire or `--reprocess`), and checks that no API message is billed by more than one of
+  the parent and its subagents. Results: session rollup `cost_check`, tags
+  `cost-overcount` / `cost-unreconciled` / `duplicate-billing`, a `[WARN]` in the hook
+  log, and the score `cost_residual_usd`. Over the 2026-10 history: 62 sessions `ok`,
+  15 `output-lower-bound`, the rest unchecked (continuation, partial cost-state, no
+  cost-state yet); no tags raised, the closest `ok` session at 56% of its allowance.
 - The Langfuse check skips sessions written to in the last hour and needs the stored
   sessions to fit one metrics query (1,000 rows over the local transcripts' window).
 
@@ -534,6 +543,9 @@ Session-wide rollups are not on the traces: they ride on the session-level
 - `has-subagents`, `subagents:<count>` — present when the session dispatched subagents
 - `nested-subagents` — present when any ingested subagent was spawned by another subagent (depth ≥ 2; CC 2.1.172+)
 - `subagent-usage-partial` — present when a subagent message's transcript entries stop before its final one (CC 2.1.289+); its output tokens, and so the subagent cost, are a lower bound. See `subagent_costs.partial_messages`
+- `cost-overcount` — the hook bills more tokens of some model than Claude Code's own `cost-state` counted (worth > `OVERCOUNT_TOLERANCE_USD`). Always a hook bug: the CLI also counts calls the transcript never records. See `cost_check`
+- `cost-unreconciled` — Claude Code counted more output tokens than the transcript records, beyond what its unrecorded side calls explain: a message the transcript (or the hook) lost. See `cost_check`
+- `duplicate-billing` — an API message is billed by more than one of the parent and its subagents. See `cost_check.duplicate_messages`
 - `has-hook-failures` — present when an `"async": true` hook exited non-zero (`async_hook_response` attachments); see `async_hooks` metadata
 - `rate-limited` — present when a request was refused for quota (`quotaLimits.status: rejected`); see `rate_limits` metadata
 - `scheduled-task` — present when a session cron task fired in the session (`system/scheduled_task_fire`, or a prompt carrying `scheduledTaskId`)
@@ -595,6 +607,7 @@ also repeats the session state listed above and the full `tags` list.
 - `worktree` — `{name, branch, original_cwd, original_branch, original_head_commit}` from the last `type: "worktree-state"` entry. Null when the session never entered a worktree. From `extract_worktree_state()`.
 - `background_tasks` / `session_crons` — raw lists from the Stop hook stdin payload (v2.1.145+). Live fires only; omitted on reprocess.
 - `cli_cost_state` — Claude Code's own totals from the last `cost-state` entry: `{total_cost_usd, hook_cost_usd (parent + subagents, = the session_cost_usd score), gap_usd (total − hook; omitted when partial), side_model_cost_usd (cost of models that answered no message, main or subagent: mostly the WebFetch/WebSearch Haiku), covers_from (process startTime, ISO), partial (startTime > COST_STATE_PARTIAL_S = 120 s after the first entry), api_duration_ms, api_duration_without_retries_ms, tool_duration_ms, wall_duration_ms, lines_added, lines_removed, has_unknown_model_cost, by_model: {<model>: {cost_usd, input_tokens, output_tokens, thinking_tokens, cache_read_tokens, cache_create_tokens, web_search_requests}}}`. A positive `gap_usd` is spend the transcript never records (see the v2.1.300 census note for its four parts); a negative one is the hook over-counting. Retry time = `api_duration_ms − api_duration_without_retries_ms`. Absent until the CLI writes the entry on exit. In a continuation (same CLI process: equal cost-state `startTime`) the CLI total carries on from the predecessor's, so `predecessor_cost_usd` (its total as of its `continued-in`) is subtracted for `gap_usd` and the `cli_cost_usd` score, and its per-model cost for `side_model_cost_usd`. From `extract_cost_state()`.
+- `cost_check` — the hook's cost checked against Claude Code's: `{status, duplicate_messages, summary}`, plus, when compared, `{overcount_usd, overcount: {<model>: {<kind>: excess tokens}}, output_excess_tokens, output_allowance, side_calls: {classifier_requests, compactions, away_summaries, web_tool_calls}}`. `status`: `ok`, `overcount`, `unreconciled`, `output-lower-bound` (partially recorded subagent messages: no undercount check), or `unchecked: <reason>` (no cost-state yet, partial cost-state, continuation, subagent state from before the check). From `build_cost_check()` / `check_cost()`; the thresholds and their fit are under Cost guardrails.
 - `async_hooks` — `{count, failures, by_hook: {<hookName>: {count, failures}}, last_failure: {hook, exit_code, stderr, timestamp}}` from `async_hook_response` attachments. `stderr` is redacted, then truncated to 200 chars; only the last failure keeps it. From `extract_async_hook_responses()`.
 - `rate_limits` — `{count, by_status, by_type, last: {status, type, resets_at (ISO UTC), overage_status, overage_disabled_reason, is_using_overage, timestamp}}` from `quotaLimits` (fallback `apiErrorParams.rate_limit_info`) on assistant entries. From `extract_rate_limits()`.
 - `scheduled_tasks` — `{count, tasks: {<taskId>: {cron, fires, first_at, last_at}}}` from `system/scheduled_task_fire`. The fire's prompt is not stored (it is the opened turn's input). From `extract_scheduled_task_fires()`.
@@ -806,6 +819,7 @@ Scores attach to the **session** (`sessionId`, not a turn trace) and are recompu
 | `cache_hit_rate` | Numeric | 0.0-1.0 | cache_read / (cache_read + cache_creation) |
 | `tool_error_rate` | Numeric | 0.0-1.0 | executed calls with `[ERROR]` output / executed calls |
 | `tool_denial_rate` | Numeric | 0.0-1.0 | denied calls / all attempted calls |
+| `cost_residual_usd` | Numeric | USD | `cli_cost_state.gap_usd − side_model_cost_usd`: spend on the session's own models the transcript never records (classifier calls, compaction, partially recorded subagents); negative = the hook bills more than the CLI. Omitted without a whole-session cost-state |
 | `cli_cost_usd` | Numeric | USD | Claude Code's own total from the last `cost-state` entry (minus the predecessor's in a continuation); omitted until the CLI writes it on exit. Compare with `session_cost_usd` (`cli_cost_state.gap_usd`) |
 
 All are deterministic (no LLM calls). Score IDs are `uuid5(session:score:<name>)`, so
