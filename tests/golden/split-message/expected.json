@@ -1,0 +1,10 @@
+{
+  "covers": "A message whose entries span two turns (Skill body in between) is billed once",
+  "sessions": {
+    "c48147cd-1662-74e9-f034-d652f4b66a26": {
+      "generations": 2,
+      "hook_usd": 0.33704,
+      "recount_usd": 0.33704
+    }
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "covers": "A general-purpose subagent whose messages keep only stream-start entries (output a lower bound)",
+  "sessions": {
+    "318e0605-9a4c-284e-da09-9da63cc0c4c7": {
+      "generations": 9,
+      "hook_usd": 5.121301,
+      "recount_usd": 5.121301
+    }
+  }
+}

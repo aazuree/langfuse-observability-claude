@@ -120,6 +120,7 @@ tools/
   check_pricing_drift.py         # Compares hardcoded pricing against a public feed (manual/CI, never run by the hook)
   audit_costs.py                 # Cost audit: independent recount, Claude Code's cost-state, stored Langfuse cost
   cost_diff.py                   # What two hook versions bill for the same local transcripts (run before cost PRs)
+  make_cost_golden.py            # Scrubs real sessions into tests/golden cases; --update re-pins expected billing
   render_env.py                  # setup.sh: fills the .env template literally (no sed), escapes $ for compose
   configure_hooks.py             # setup.sh: registers langfuse-hook.py on Stop + StopFailure + SessionEnd (async)
 tests/
@@ -132,6 +133,8 @@ tests/
   test_audit_costs.py            # Each audit check fires on its failure and stays quiet otherwise
   test_cost_diff.py              # tools/cost_diff.py
   test_cost_check.py             # Live cost_check: overcount, unreconciled, duplicate billing
+  test_cost_goldens.py           # The hook bills exactly what each tests/golden case pins
+  golden/<case>/                 # Scrubbed real sessions (projects/ + expected.json), see Cost guardrails
   test_thinking_tokens.py        # output_tokens_details.thinking_tokens capture + rollup
   test_prompt_provenance.py      # origin.kind / promptSource / turnCompanion capture
   test_prompt_provenance_fallback.py  # shape-based classification of untagged prompt entries
@@ -330,6 +333,34 @@ python3 tools/cost_diff.py                                # origin/main vs this 
   log, and the score `cost_residual_usd`. Over the 2026-10 history: 62 sessions `ok`,
   15 `output-lower-bound`, the rest unchecked (continuation, partial cost-state, no
   cost-state yet); no tags raised, the closest `ok` session at 56% of its allowance.
+- **CI pins real sessions.** `tests/golden/<case>/` holds real transcripts scrubbed by
+  `tools/make_cost_golden.py` down to what billing reads: entry types and order, message
+  ids, models, usage, tool names and subagent links. Every id is re-hashed with a
+  random salt that is not stored, timestamps are shifted to start at 2026-01-01, and all
+  text is replaced. The tool refuses a case if any free text survives, or if the scrubbed
+  copy bills differently from the original. `tests/test_cost_goldens.py` asserts the
+  hook bills exactly what `expected.json` pins and that the recount agrees. Cases:
+  continued session, forked subagents, partially recorded subagent output, Haiku 5.5
+  long prompts, a split message, a mixed-model turn. The hook from before #62/#63 fails
+  three of them. When a change moves a pinned number on purpose, explain it in the PR
+  (cost_diff), then run `python3 tools/make_cost_golden.py --update`. **The repo is
+  public:** review a new case's files before committing it.
+  ```bash
+  python3 tools/make_cost_golden.py <case> <session-id> [<session-id> ...] --why "what it covers"
+  ```
+- **Rates are checked weekly** by `.github/workflows/pricing-drift.yml` (Mondays, plus
+  manual dispatch), which runs `check_pricing_drift.py`; GitHub emails on a failed run.
+- **Weekly local run:** a systemd user timer runs the full audit against the deployed
+  stack and notifies on exit 1 or 2 (the units live in `~/.config/systemd/user`, not in
+  this repo):
+  ```ini
+  # langfuse-cost-audit.service (+ a .timer with OnCalendar=Mon *-*-* 09:30, Persistent=true)
+  [Unit]
+  OnFailure=langfuse-cost-audit-notify.service   # notify-send -u critical ...
+  [Service]
+  Type=oneshot
+  ExecStart=/usr/bin/python3 %h/<REPO_ROOT>/tools/audit_costs.py --langfuse --from-settings
+  ```
 - The Langfuse check skips sessions written to in the last hour and needs the stored
   sessions to fit one metrics query (1,000 rows over the local transcripts' window).
 

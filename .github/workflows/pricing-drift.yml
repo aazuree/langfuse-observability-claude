@@ -1,0 +1,26 @@
+name: Pricing drift
+
+# The hook's rate table is hardcoded (see CLAUDE.md, "Keeping prices up to
+# date"). This compares it weekly with a public price feed; a failed run is
+# the signal to re-check platform.claude.com/docs/en/about-claude/pricing.
+on:
+  schedule:
+    - cron: "17 6 * * 1"   # Mondays 06:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    name: Compare rates with the feed
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install uv
+        # Exact version: setup-uv stopped publishing floating major tags in v8.
+        uses: astral-sh/setup-uv@v10.2.0
+
+      - name: Check pricing drift
+        run: uv run --no-project --python 3.14 python tools/check_pricing_drift.py
