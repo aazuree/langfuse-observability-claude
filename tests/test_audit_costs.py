@@ -156,6 +156,26 @@ def test_hook_double_count_is_a_finding(projects, run, monkeypatch):
     assert "recount: hook over recount" in findings[0]
 
 
+def test_active_session_is_not_checked(projects, run, monkeypatch):
+    """A running session grows between the recount's read and the hook's,
+    so any gap between them is noise until it goes idle."""
+    _write(projects / "p" / f"{P}.jsonl",
+           _session(P, out=1000) + [_cost_state({MODEL: (2000, 1000)})])
+    real = audit_costs.run_hook
+
+    def grew(projects_dir, hook):
+        scores = real(projects_dir, hook)
+        for body in scores.values():
+            body["value"] *= 2
+        return scores
+
+    monkeypatch.setattr(audit_costs, "run_hook", grew)
+    monkeypatch.setattr(audit_costs, "ACTIVE_S", 3600)
+    report = run(langfuse={})
+    assert report["findings"] == []
+    assert report["sessions"][0]["note"] == "active session, not checked"
+
+
 # ---------------------------------------------------------------------------
 # Check 2: Claude Code's cost-state
 # ---------------------------------------------------------------------------
