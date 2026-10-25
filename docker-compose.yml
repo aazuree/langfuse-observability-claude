@@ -5,7 +5,7 @@
 # External connections from other machines will not be able to reach these services directly.
 services:
   langfuse-worker:
-    image: docker.io/langfuse/langfuse-worker:4.63.0
+    image: docker.io/langfuse/langfuse-worker:4.70.0
     restart: always
     depends_on: &langfuse-depends-on
       postgres:
@@ -80,7 +80,7 @@ services:
       SMTP_CONNECTION_URL: ${SMTP_CONNECTION_URL:-}
 
   langfuse-web:
-    image: docker.io/langfuse/langfuse:4.63.0
+    image: docker.io/langfuse/langfuse:4.70.0
     restart: always
     depends_on: *langfuse-depends-on
     ports:
@@ -104,7 +104,7 @@ services:
       LANGFUSE_INIT_USER_PASSWORD: ${LANGFUSE_INIT_USER_PASSWORD:-}
 
   clickhouse:
-    image: docker.io/clickhouse/clickhouse-server:26.9.21.9
+    image: docker.io/clickhouse/clickhouse-server:26.9.25.15
     restart: always
     user: "101:101"
     environment:
@@ -127,7 +127,7 @@ services:
       start_period: 1s
 
   minio:
-    image: cgr.dev/chainguard/minio@sha256:709099319add48dfb44aa596a7070d3ddd8dd04d7ae881765719aec29df9e510
+    image: cgr.dev/chainguard/minio@sha256:87896cb33f93ecfcca4e883c3fb2f86a0a1a600c003a104011ed30631c1869c3
     restart: always
     entrypoint: sh
     # create the 'langfuse' bucket before starting the service
