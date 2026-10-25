@@ -118,6 +118,8 @@ setup.sh                         # One-command setup (generates .env, starts ser
 .env                             # Generated secrets (gitignored)
 tools/
   check_pricing_drift.py         # Compares hardcoded pricing against a public feed (manual/CI, never run by the hook)
+  audit_costs.py                 # Cost audit: independent recount, Claude Code's cost-state, stored Langfuse cost
+  cost_diff.py                   # What two hook versions bill for the same local transcripts (run before cost PRs)
   render_env.py                  # setup.sh: fills the .env template literally (no sed), escapes $ for compose
   configure_hooks.py             # setup.sh: registers langfuse-hook.py on Stop + StopFailure + SessionEnd (async)
 tests/
@@ -127,6 +129,8 @@ tests/
   test_otlp.py                   # Event -> OTLP span translation (IDs, attributes, trace attrs on the root)
   test_send.py                   # One gzipped OTLP request per fire; status handling; scores after spans
   test_pricing_drift.py          # Pricing drift-checker tests (offline, synthetic feeds)
+  test_audit_costs.py            # Each audit check fires on its failure and stays quiet otherwise
+  test_cost_diff.py              # tools/cost_diff.py
   test_thinking_tokens.py        # output_tokens_details.thinking_tokens capture + rollup
   test_prompt_provenance.py      # origin.kind / promptSource / turnCompanion capture
   test_prompt_provenance_fallback.py  # shape-based classification of untagged prompt entries
@@ -284,6 +288,38 @@ historical turns whenever an upstream entry changed — and a wrong feed entry w
 confidently wrong costs, where today an unknown model produces an obvious `$0` plus a
 `[WARN]`. Any date-aware pricing window needs the rate that applied *at the turn's
 timestamp*; a live feed only ever carries today's rate.
+
+### Cost guardrails
+
+Rates are checked by `check_pricing_drift.py`; **counting** is checked by
+`tools/audit_costs.py`. Every past miscount (subagent output ~10x low, continued
+sessions and split messages billed twice) was a counting bug found by accident. The
+audit runs three checks and exits 1 on any finding:
+
+| Check | Compares | Catches |
+|-------|----------|---------|
+| Recount | the hook (dry run) vs a naive second count: one usage per `message.id` (last entry) across **all** transcripts, owned by the first writer (`continued-in` decides a continuation's copy) | a message billed twice or dropped; a turn priced at the wrong model |
+| cost-state | per-model transcript tokens vs Claude Code's own `cost-state` | overcount: transcript above the CLI (> `OVERCOUNT_TOLERANCE_USD`); undercount: CLI output beyond what its unrecorded side calls explain (`SIDE_CALL_OUTPUT_ALLOWANCE`) |
+| Langfuse (`--langfuse`) | stored per-session `totalCost` (metrics API) vs a fresh hook run | spans exported twice, turns never sent |
+
+```bash
+python3 tools/audit_costs.py                              # recount + cost-state
+python3 tools/audit_costs.py --langfuse --from-settings   # + stored cost; host/keys from the Stop hook
+python3 tools/cost_diff.py                                # origin/main vs this checkout, per session
+```
+
+- **Any PR that touches usage, turn building or pricing** runs `tools/cost_diff.py`
+  and pastes its summary into the PR body. Every changed session must be one the
+  change intends; an unexplained delta blocks the merge. Then `audit_costs.py` must
+  still pass.
+- The undercount allowances were fitted on the 2026-10 history (93 sessions): a session
+  with no side calls matched the CLI within 8 output tokens. Sessions with partially
+  recorded subagent messages are not checked for undercount (their output is a known
+  lower bound, tag `subagent-usage-partial`).
+- Both sides of the recount price with `calculate_turn_cost`, so the recount does not
+  validate rates — only what gets counted, and at which model.
+- The Langfuse check skips sessions written to in the last hour and needs the stored
+  sessions to fit one metrics query (1,000 rows over the local transcripts' window).
 
 ### AWS Bedrock Pricing (reference)
 
