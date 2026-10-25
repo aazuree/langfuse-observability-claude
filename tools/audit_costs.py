@@ -376,18 +376,22 @@ def audit(projects: Path, hook_path: Path, langfuse_env: dict | None) -> dict:
         cli = (s.get("metadata") or {}).get("cli_cost_state") or {}
         row = {"session": session_id, "recount_usd": n_cost, "hook_usd": h_cost,
                "cli_usd": cli.get("total_cost_usd"), "findings": []}
+        if stored is not None:
+            got = stored.get(session_id)
+            row["langfuse_usd"] = None if got is None else round(got, 6)
+        # A running session grows between the recount's read and the hook's,
+        # and its last turn is not in Langfuse yet: none of the checks hold.
+        if now - mtimes.get(session_id, 0) < ACTIVE_S:
+            row["note"] = "active session, not checked"
+            rows.append(row)
+            continue
         if abs(n_cost - h_cost) > COST_TOLERANCE_USD:
             kind = "hook over recount" if h_cost > n_cost else "hook under recount"
             row["findings"].append(f"recount: {kind} by ${abs(h_cost - n_cost):.4f}")
         if s:
             row["findings"] += cost_state_findings(session_id, naive, scores, hook)
         if stored is not None:
-            active = now - mtimes.get(session_id, 0) < ACTIVE_S
-            got = stored.get(session_id)
-            row["langfuse_usd"] = None if got is None else round(got, 6)
-            if active:
-                row["note"] = "active session, Langfuse check skipped"
-            elif got is None:
+            if got is None:
                 if h_cost > COST_TOLERANCE_USD:
                     row["findings"].append(f"langfuse: session missing (hook computes ${h_cost:.4f})")
             elif abs(got - h_cost) > COST_TOLERANCE_USD:
