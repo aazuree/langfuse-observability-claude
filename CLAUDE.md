@@ -142,9 +142,9 @@ tests/
   test_file_history_delta.py     # file-history-delta rollup (edits, distinct files, versions)
   test_log_isolation.py          # LOG_FILE env override + production-log isolation
   test_hook_scores.py            # Session score classifier tests
+  test_tag_cleanup.py            # Tags carry signal only; queued prompts = typed prompts that waited
   test_subagent_tracking.py      # Subagent cost tracking tests
   test_subagent_resume.py        # Background subagents resumed after their parent turn was sent
-  test_tag_cleanup.py            # Tags carry signal only; queued prompts = typed prompts that waited
   test_session_rollups.py        # Session rollups cover the whole session; each turn sent once; unfinished turns held
   test_turn_merging.py           # Consecutive user entries before a reply form one turn
   test_session_lock.py           # Per-session lock for overlapping (async) fires
