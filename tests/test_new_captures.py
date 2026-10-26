@@ -213,7 +213,7 @@ class TestNewCapturesWiring:
         assert "compacted" in tags
         assert "compact-trigger:manual" in tags
         assert "remote-control" in tags
-        assert "permission:acceptEdits" in tags
+        assert not [t for t in tags if t.startswith("permission:")]
 
     def test_interrupts_metadata_and_tag(self, tmp_path, monkeypatch):
         entries = [

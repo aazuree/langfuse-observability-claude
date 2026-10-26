@@ -673,11 +673,11 @@ class TestExtractSessionKind:
         f.write_text("\n".join(json.dumps(e) for e in entries) + "\n")
         assert hook.extract_session_kind(str(f)) == "bg"
 
-    def test_defaults_to_fg_when_absent(self, tmp_path):
-        # Older transcripts don't carry sessionKind at all
+    def test_empty_when_absent(self, tmp_path):
+        # Older transcripts and SDK runs don't carry sessionKind at all
         f = tmp_path / "t.jsonl"
         f.write_text(json.dumps({"type": "user"}) + "\n")
-        assert hook.extract_session_kind(str(f)) == "fg"
+        assert hook.extract_session_kind(str(f)) == ""
 
     def test_skips_empty_values(self, tmp_path):
         f = tmp_path / "t.jsonl"
@@ -689,7 +689,7 @@ class TestExtractSessionKind:
         assert hook.extract_session_kind(str(f)) == "fg"
 
     def test_nonexistent_file(self):
-        assert hook.extract_session_kind("/nonexistent.jsonl") == "fg"
+        assert hook.extract_session_kind("/nonexistent.jsonl") == ""
 
 
 # ---------------------------------------------------------------------------
@@ -2198,7 +2198,7 @@ class TestProcessSession:
         assert trace["id"] == uuid.uuid5(uuid.NAMESPACE_URL, "test-session:turn:0").hex
         assert trace["sessionId"] == "test-session"
         assert trace["name"] == "Fix the login bug"
-        assert "claude-code" in trace["tags"]
+        assert "claude-code" not in trace["tags"]  # on every trace: no signal
         assert trace["metadata"]["turn_index"] == 1
         assert gen_events[0]["body"]["traceId"] == trace["id"]
         assert session_rollups(batch)["turn_count"] == 1
@@ -2461,7 +2461,9 @@ class TestProcessSession:
         hook.process_session("tag-sess", path, "/test")
 
         trace = [e for e in sent_batches[0] if e["type"] == "trace-create"][0]
-        assert "opus" in trace["body"]["tags"]
+        # `model:<id>` only; the family tag said the same thing less precisely.
+        assert "model:claude-opus-4-6" in trace["body"]["tags"]
+        assert "opus" not in trace["body"]["tags"]
 
     def test_background_tasks_metadata_and_tag(self, tmp_path, monkeypatch):
         state_dir = tmp_path / "state"
@@ -2482,7 +2484,8 @@ class TestProcessSession:
         hook.process_session("bg-sess", path, "/test",
                              background_tasks=[{"id": "t1"}], session_crons=[{"id": "c1"}])
         trace = [e for e in sent[0] if e["type"] == "trace-create"][0]
-        assert "has-background-tasks" in trace["body"]["tags"]
+        # Live fires only, so a reprocess would drop it: metadata, not a tag.
+        assert "has-background-tasks" not in trace["body"]["tags"]
         assert session_rollups(sent[0])["background_tasks"] == [{"id": "t1"}]
         assert session_rollups(sent[0])["session_crons"] == [{"id": "c1"}]
 
@@ -2508,7 +2511,8 @@ class TestProcessSession:
         path = self._make_transcript(tmp_path, entries)
         hook.process_session("wt-sess", path, "/test")
         trace = [e for e in sent[0] if e["type"] == "trace-create"][0]
-        assert "worktree:my-feature" in trace["body"]["tags"]
+        assert "worktree" in trace["body"]["tags"]
+        assert trace["body"]["metadata"]["worktree"]["name"] == "my-feature"
         assert trace["body"]["metadata"]["worktree"]["branch"] == "worktree-my-feature"
 
     def test_model_missing_tag_when_billable_turn_lacks_model(self, tmp_path, monkeypatch):
@@ -3318,12 +3322,13 @@ class TestTraceNamePrecedence:
         evt = self._get_trace_event(tmp_path, monkeypatch, entries, cwd="/home/user/myrepo")
         assert evt["body"]["metadata"]["session_title"] == "myrepo/feat/improve-search"
 
-    def test_agent_name_tag_added_when_present(self, tmp_path, monkeypatch):
+    def test_agent_name_is_metadata_not_a_tag(self, tmp_path, monkeypatch):
         entries = self._base_entries() + [
             {"type": "agent-name", "agentName": "my-task"},
         ]
         evt = self._get_trace_event(tmp_path, monkeypatch, entries, cwd="/repo")
-        assert "agent-name:my-task" in evt["body"]["tags"]
+        assert not [t for t in evt["body"]["tags"] if t.startswith("agent-name:")]
+        assert evt["body"]["metadata"]["agent_name"] == "my-task"
 
     def test_agent_name_tag_absent_when_missing(self, tmp_path, monkeypatch):
         entries = self._base_entries()

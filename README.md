@@ -187,7 +187,7 @@ Always delete first: Langfuse v4 keeps every export of a span, so re-sending a s
 
 When Claude Code spawns subagents via the Agent tool, the hook automatically discovers their transcripts at `<session>/subagents/agent-{id}.jsonl`, matches them to their Agent call through the `.meta.json` `toolUseId`, and ingests them as nested generations/spans under that Agent tool span, in the trace of the turn that launched them.
 
-Turn traces of such sessions get `has-subagents` and `subagents:{count}` tags, and the session score's metadata includes a `subagent_costs` summary with per-agent cost breakdowns and total harness cost. Nested sub-agent dispatches (CC 2.1.172+) are followed recursively up to 5 levels and appear as nested generations/spans with per-agent lineage in `subagent_costs`.
+Turn traces of such sessions get the `has-subagents` tag, and the session score's metadata includes a `subagent_costs` summary with per-agent cost breakdowns and total harness cost. Nested sub-agent dispatches (CC 2.1.172+) are followed recursively up to 5 levels and appear as nested generations/spans with per-agent lineage in `subagent_costs`.
 
 ## Running Tests
 
