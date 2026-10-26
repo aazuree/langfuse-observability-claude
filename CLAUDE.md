@@ -142,6 +142,7 @@ tests/
   test_file_history_delta.py     # file-history-delta rollup (edits, distinct files, versions)
   test_log_isolation.py          # LOG_FILE env override + production-log isolation
   test_hook_scores.py            # Session score classifier tests
+  test_tag_cleanup.py            # Tags carry signal only; queued prompts = typed prompts that waited
   test_subagent_tracking.py      # Subagent cost tracking tests
   test_subagent_resume.py        # Background subagents resumed after their parent turn was sent
   test_subagent_identity.py      # subagent_id = owner, spawned_agent_* on Agent spans, at every depth
@@ -544,25 +545,30 @@ Session-wide rollups are not on the traces: they ride on the session-level
 **`session_cost_usd` score** (see Hook-Level Scores), whose `metadata` holds every
 "Session Rollups" key below and which every fire overwrites.
 
-**Tags** (filterable in Langfuse UI):
-- `claude-code` — always present
-- repo/project name — derived from `cwd` (e.g., `langfuse-observability`)
-- model family — `opus`, `sonnet`, or `haiku`
+**Tags** (filterable in Langfuse UI). A tag earns its place by splitting sessions:
+values every session shares, and values unique to one session (titles, names,
+counts), stay in metadata. Removed 2026-10-26 after a census of 97 local sessions
+(131 distinct tags → 67): `claude-code` (every trace), `opus`/`sonnet`/`haiku`
+(`model:<id>` says it), `permission:<mode>` (only ever `auto`; `permission_mode`
+metadata), `agent-name:<title>` (48 values in 49 sessions; `agent_name` metadata),
+`subagents:<n>` (`subagent_costs`), `worktree:<name>` (now `worktree`) and
+`has-background-tasks` (live fires only, lost on reprocess; `background_tasks`
+metadata). The bare repo and entrypoint tags became `repo:` / `entrypoint:`. Traces
+sent before keep their old tags until `--delete-traces` + `--reprocess`.
+- `repo:<name>` — derived from `cwd` (e.g., `repo:langfuse-observability`)
 - `model:<id>` — one per distinct exact model ID in the batch (e.g. `model:claude-opus-5-5`), so Opus 5 and Opus 5.5 sessions can be filtered apart
 - `refusal:<category>` — one per distinct `stop_details.category` on refused turns (`cyber`, `bio`, `reasoning_extraction`, ...; null category → `uncategorized`). Opus 5.5 added `bio` and `reasoning_extraction` classifiers
-- entrypoint — `cli` or other launch method
+- `entrypoint:<name>` — `cli`, `sdk-cli` or other launch method
 - `fast` — present if any turn used `/fast` mode
 - `has-errors` — present if API errors occurred during the session (`system/api_error` entries)
 - `has-api-error-messages` — present when the session had assistant-channel API-error/auto-retry stubs (`isApiErrorMessage`); see `api_error_messages` metadata
 - `has-interrupts` — present when the user interrupted (ESC) at least one assistant turn (`interruptedMessageId`)
 - `model-fallback` — present when any turn was answered by a different model than its `requestedModel` (CC 2.1.295+)
 - `has-truncated-output` — present when any turn carried `truncatedAfterOutput`
-- `has-queued-prompts` — present when the user queued at least one follow-up prompt mid-turn (`queue-operation` entries); see `queue_operations` metadata
+- `has-queued-prompts` — present when a prompt the user typed waited in the queue (≥ `QUEUE_MIN_WAIT_MS`) while the agent was busy; harness messages and instant delivery do not count. See `queue_operations` metadata
 - `model-missing` — present when any turn had **billable tokens but no `model` field**; that turn's cost is reported as `$0` (never defaulted to a priced model) and a `[WARN]` is logged. Filter on this to find sessions with under-reported cost from upstream transcript gaps.
-- `permission:<mode>` — current permission mode (`default`, `acceptEdits`, `plan`, `bypassPermissions`)
 - `pr:<N>` — one tag per PR linked from the session (via `pr-link` transcript entries)
-- `agent-name:{slug}` — present when `type: "agent-name"` entry exists (e.g., `agent-name:langfuse-usagedetails-fix`)
-- `session-kind:{bg|fg}` — background job vs interactive foreground session (from `sessionKind` field on transcript entries; defaults to `fg` when absent on older transcripts)
+- `session-kind:{bg|fg}` — background job vs interactive foreground session. Claude Code writes only `sessionKind: "bg"`, so a `cli` session without it is `fg`; SDK runs (`sdk-cli`) and transcripts with no entrypoint get no kind (they used to default to `fg`)
 - `effort:<level>` — effort level for the session (`low`/`medium`/`high`/`xhigh`/`max`). Sourced from the per-turn transcript `effort` field (CC 2.1.220+, last turn that carried one), so it is present on reprocessed sessions too
 - `skill:<slug>` — one per distinct `attributionSkill` observed in the session (e.g., `skill:superpowers:brainstorming`)
 - `plugin:<name>` — one per distinct `attributionPlugin` observed (e.g., `plugin:superpowers`)
@@ -570,9 +576,8 @@ Session-wide rollups are not on the traces: they ride on the session-level
 - `compact-trigger:<trigger>` — one per distinct compaction trigger (`manual`/`auto`; `unknown` omitted)
 - `remote-control` — present when the session was bridged to claude.ai (Remote Control / `/remote-control`)
 - `permission-bypass` — present when `bypassPermissions` was active at any point in the session
-- `worktree:<name>` — present when the session ran inside a Claude Code worktree (from the last `worktree-state` entry)
-- `has-background-tasks` — present when the Stop payload carried running background tasks
-- `has-subagents`, `subagents:<count>` — present when the session dispatched subagents
+- `worktree` — present when the session ran inside a Claude Code worktree (from the last `worktree-state` entry; its name is in `worktree` metadata)
+- `has-subagents` — present when the session dispatched subagents
 - `nested-subagents` — present when any ingested subagent was spawned by another subagent (depth ≥ 2; CC 2.1.172+)
 - `subagent-usage-partial` — present when a subagent message's transcript entries stop before its final one (CC 2.1.289+); its output tokens, and so the subagent cost, are a lower bound. See `subagent_costs.partial_messages`
 - `cost-overcount` — the hook bills more tokens of some model than Claude Code's own `cost-state` counted (worth > `OVERCOUNT_TOLERANCE_USD`). Always a hook bug: the CLI also counts calls the transcript never records. See `cost_check`
@@ -613,7 +618,7 @@ also repeats the session state listed above and the full `tags` list.
 - `api_errors` — error summary from `system/api_error` entries: `total_count`, `by_status` (HTTP codes), `first_error_at`, `last_error_at`
 - `api_error_messages` — **separate** assistant-channel error/retry summary from `isApiErrorMessage` entries (CC 2.1.179+/2.1.181 auto-retry): `{count, by_status (apiErrorStatus, e.g. 404/429/529), by_error (e.g. model_not_found/rate_limit), first_at, last_at}`, plus `by_api_error` (the specific `apiError`, e.g. `usage_limit_reached` behind `rate_limit`) when any entry carries one and `max_retry_attempt` when any entry carries `retryAttempt`. Null when none. From `extract_api_error_messages()`. Distinct channel from `api_errors`; these stubs are skipped by `build_turns` so they don't pollute turn output.
 - `interrupts` — `{count}` of user interrupts (ESC mid-turn) from `interruptedMessageId` on `user` entries. A friction / misalignment signal. Null when none. From `extract_interrupts()`.
-- `queue_operations` — prompt-queue activity from `type:"queue-operation"` entries (prompts the user queued while the assistant was busy): `{operations: {<op>: n}, queued, executed, removed, total_wait_ms, max_wait_ms}`. `executed` = prompts pulled from the queue to run (`dequeue`/`popAll`); `removed` = queued prompts the user cancelled. Wait = time a prompt sat queued (enqueue→dequeue/popAll), matched **FIFO** (no per-prompt id → approximate); `remove` is excluded from wait stats. Prompt `content` is **not stored** (PII). Long waits = the user racing ahead of the agent (friction signal). Null when nothing was queued. From `extract_queue_operations()`.
+- `queue_operations` — prompts the user queued while the assistant was busy, from `type:"queue-operation"` entries: `{operations: {<op>: n}, queued, executed, absorbed, removed, harness_messages, total_wait_ms, max_wait_ms}`. `queued` counts typed prompts that waited at least `QUEUE_MIN_WAIT_MS` (1 s): `executed` left by `dequeue`/`popAll` (started a turn), `absorbed` by `remove` with `reason: absorbed_mid_turn` (joined the running turn), `removed` by any other `remove`. Waits cover executed and absorbed prompts. Not counted: `harness_messages` (`<task-notification>` / `<agent-message>` enqueues Claude Code writes itself: 112 of 255 enqueues, 2026-10-26) and prompts delivered within 1 s (SDK and bg sessions deliver their first prompt through the queue). Until 2026-10-26 both counted, and every `absorbed_mid_turn` (123 of 123 `remove`s) was reported as a user cancel, so 75 of 97 sessions were tagged `has-queued-prompts`; now 25. `remove` takes the pending prompt with the same content, `dequeue` the oldest. Prompt `content` is **not stored** (PII). Null when there are no queue operations. From `extract_queue_operations()`.
 - `stop_reasons` — rollup of per-turn terminal `stop_reason` (the API's reason each turn ended): `{by_reason: {<reason>: count}, turns_counted, last}`. `last` = the terminal reason of the session's final turn that carried one (the outcome). Null when no turn carried a stop_reason. Anomalous reasons also surface as `stop-reason:<reason>` tags. When any turn was refused, adds `refusal_categories: {<category>: count}` from the API's `stop_details.category` (null → `uncategorized`), also tagged `refusal:<category>`. From `build_stop_reasons_summary()`.
 - `cost_by_model` — per exact model ID: `{turns, input_tokens, output_tokens, cache_read_tokens, cache_create_tokens, cost_usd, by_effort: {<effort|unset>: {turns, cost_usd}}}`. Turns with no model go to `_missing`. From `build_model_cost_breakdown()`.
 - `opus_5_5_savings` — Opus 5.5 turns re-priced at Opus 5 rates: `{turns, actual_cost_usd, opus_5_equivalent_cost_usd, saved_usd}`. An estimate: same token counts assumed (same tokenizer, but a different model and default effort would not spend exactly the same). Null without Opus 5.5 turns. From `build_opus_5_5_savings()`.
@@ -624,7 +629,7 @@ also repeats the session state listed above and the full `tags` list.
 - `away_summaries` — list of `{content, timestamp}` from `system/away_summary` entries
 - `agent_name` — auto-generated session slug from `type: "agent-name"` entry (null when absent)
 - `ai_title` — Claude-generated short title from `type: "ai-title"` entry (null when absent)
-- `session_kind` — `bg` or `fg` from `sessionKind` field (defaults to `fg`)
+- `session_kind` — `bg` or `fg` (see the `session-kind` tag); omitted for SDK runs
 - `attachments` — `{count, by_type}` summary of `type: "attachment"` entries (hook outputs, file/image attachments). Only counts + types are captured; payloads are not (PII + size). Null when no attachments.
 - `local_commands` — list of `{content, timestamp}` from `system/local_command` entries (slash-command stdout, e.g. `/compact` summaries). Wrapper tags stripped, content truncated to 200 chars and run through `redact_secrets`. Capped at 20 entries. Null when none.
 - `file_snapshots` — `{snapshot_count, tracked_files_count}` from `file-history-snapshot` entries (null when no snapshots)
@@ -635,7 +640,7 @@ also repeats the session state listed above and the full `tags` list.
 - `effort_level` — session effort level (`low`/`medium`/`high`/`xhigh`/`max`), last-observed. From the per-turn transcript `effort` field (CC 2.1.220+), so it survives `--reprocess`. See per-generation `effort` for the per-turn value.
 - `compaction` — rollup of `system/compact_boundary` events: `{count, triggers: {<trigger>: n}, total_tokens_reclaimed (Σ preTokens−postTokens), total_pre_tokens, total_post_tokens, total_duration_ms, events: [{trigger, pre_tokens, post_tokens, tokens_reclaimed, duration_ms, timestamp}]}`. Surfaces context-window pressure and the token/time cost of compaction. Legacy `type:"summary"` entries (pre-`compactMetadata`) count with `trigger:"legacy"` and no token fields. Unknown triggers pass through verbatim. Omitted when never compacted. From `extract_compaction()`.
 - `remote_control` — `{bridge_session_id, url}` from `bridge-session` + `system/bridge_status` entries (the Remote Control / phone-web bridge). Either field may be absent independently; `url` correlates with the claude.ai session. **No timestamps** on these entries. Null when the session was never bridged. From `extract_bridge()`.
-- `permission_timeline` — `{modes_used (sorted distinct), sequence (file-order, consecutive dups collapsed), transition_count, ever_bypass, ever_accept_edits}` from `permission-mode` entries. Complements the last-observed `permission_mode`/`permission:<mode>` tag with the full transition history. **No timestamps** on these entries → sequence is order-only, not timed. Null when no `permission-mode` entries. From `extract_permission_timeline()`.
+- `permission_timeline` — `{modes_used (sorted distinct), sequence (file-order, consecutive dups collapsed), transition_count, ever_bypass, ever_accept_edits}` from `permission-mode` entries. Complements the last-observed `permission_mode` with the full transition history. **No timestamps** on these entries → sequence is order-only, not timed. Null when no `permission-mode` entries. From `extract_permission_timeline()`.
 - `worktree` — `{name, branch, original_cwd, original_branch, original_head_commit}` from the last `type: "worktree-state"` entry. Null when the session never entered a worktree. From `extract_worktree_state()`.
 - `background_tasks` / `session_crons` — raw lists from the Stop hook stdin payload (v2.1.145+). Live fires only; omitted on reprocess.
 - `cli_cost_state` — Claude Code's own totals from the last `cost-state` entry: `{total_cost_usd, hook_cost_usd (parent + subagents, = the session_cost_usd score), gap_usd (total − hook; omitted when partial), side_model_cost_usd (cost of models that answered no message, main or subagent: mostly the WebFetch/WebSearch Haiku), covers_from (process startTime, ISO), partial (startTime > COST_STATE_PARTIAL_S = 120 s after the first entry), api_duration_ms, api_duration_without_retries_ms, tool_duration_ms, wall_duration_ms, lines_added, lines_removed, has_unknown_model_cost, by_model: {<model>: {cost_usd, input_tokens, output_tokens, thinking_tokens, cache_read_tokens, cache_create_tokens, web_search_requests}}}`. A positive `gap_usd` is spend the transcript never records (see the v2.1.300 census note for its four parts); a negative one is the hook over-counting. Retry time = `api_duration_ms − api_duration_without_retries_ms`. Absent until the CLI writes the entry on exit. In a continuation (same CLI process: equal cost-state `startTime`) the CLI total carries on from the predecessor's, so `predecessor_cost_usd` (its total as of its `continued-in`) is subtracted for `gap_usd` and the `cli_cost_usd` score, and its per-model cost for `side_model_cost_usd`. From `extract_cost_state()`.
@@ -813,7 +818,7 @@ flags these as missing; it is the session-wide count that must match.
 
 **State:** Subagent offsets stored in `~/.claude/langfuse-state/<session_id>.subagents.json`. Both state files are saved only after a successful send — so a timeout retry re-ingests subagent events rather than skipping them. The parent's own cost is recomputed from the whole transcript each fire (`session_cost_usd` rollup).
 
-**Tags:** Turn traces of a session with subagents get `has-subagents` and `subagents:{count}` tags.
+**Tags:** Turn traces of a session with subagents get the `has-subagents` tag (the count is `len(subagent_costs.agents)`).
 
 ## Important Notes
 

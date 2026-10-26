@@ -729,14 +729,18 @@ def extract_ai_title(transcript_path: str) -> str:
 def extract_session_kind(transcript_path: str) -> str:
     """First non-empty sessionKind value.
 
-    'bg' (background job) vs 'fg' (interactive foreground). Defaults to 'fg'
-    when no entry carries the field (older transcripts).
+    'bg' (background job) vs 'fg' (interactive foreground). Claude Code
+    writes only 'bg', so a `cli` session without it is 'fg'. Anything else
+    (SDK runs: entrypoint `sdk-cli`, 33 of 105 local transcripts; no
+    entrypoint at all) is "", not a guessed 'fg'.
     """
+    entrypoint = ""
     for entry in _entries(transcript_path):
         kind = entry.get("sessionKind", "")
         if kind:
             return kind
-    return "fg"
+        entrypoint = entrypoint or entry.get("entrypoint", "")
+    return "fg" if entrypoint == "cli" else ""
 
 
 _LOCAL_CMD_WRAPPER_RE = re.compile(
@@ -2718,8 +2722,8 @@ def check_cost(tokens: dict, cli_by_model: dict, side_calls: dict, partial_messa
 def build_model_cost_breakdown(turns: list[dict]) -> dict | None:
     """Per-model rollup of turns, tokens and cost, split by effort level.
 
-    `model_families` tags lump every Opus together, so a mid-session switch
-    (Opus 5 -> Opus 5.5) is invisible without this. `by_effort` exists because
+    `model:<id>` tags say which models a session used, not how much each
+    cost, so a mid-session switch (Opus 5 -> Opus 5.5) needs this. `by_effort` exists because
     Opus 5.5 defaults to effort `medium` where Opus 5 defaults to `high`:
     comparing the two models without it mixes a price change with an effort
     change. Turns without an effort field land in "unset". Turns without a
@@ -2951,55 +2955,82 @@ def build_stop_reasons_summary(turns: list[dict]) -> dict | None:
     return summary
 
 
+# Queue entries Claude Code writes itself (a background task finishing, a
+# message from another agent), not prompts the user queued.
+_HARNESS_QUEUE_PREFIXES = ("<task-notification", "<agent-message")
+# A typed prompt delivered faster than this never waited on the agent: SDK and
+# background sessions deliver their first prompt through the queue (< 1 s).
+QUEUE_MIN_WAIT_MS = 1000
+
+
 def extract_queue_operations(transcript_path: str) -> dict | None:
-    """Summarise prompt-queue activity from `type:"queue-operation"` entries.
+    """Summarise prompts the user queued while the assistant was busy.
 
-    While the assistant is busy a user can queue follow-up prompts; CC logs each
-    queue mutation as a `queue-operation` with `operation` in
-    {`enqueue`, `dequeue`, `popAll`, `remove`} and a `content` (the prompt text).
-    Wait time a prompt spends queued (enqueue -> dequeue|popAll) is a latency /
-    friction signal: long waits mean the user is racing ahead of the agent.
+    CC logs each queue mutation as a `queue-operation` with `operation` in
+    {`enqueue`, `dequeue`, `popAll`, `remove`}; all but `dequeue` carry the
+    prompt `content`, and `remove` a `reason`. Every `remove` seen so far
+    (123 of 123, 2026-10-26) is `absorbed_mid_turn`: the prompt was handed to
+    the running turn, not cancelled.
 
-    Waits are matched FIFO — each `dequeue` / `popAll`-flushed slot consumes the
-    oldest pending `enqueue`. `remove` (user cancelled a queued prompt) also pops
-    FIFO but is excluded from execution-wait stats. No id ties an op to a specific
-    queued prompt, so the FIFO pairing is an approximation. `content` is NOT stored
-    (raw prompt text = PII). None when the session queued nothing.
+    A prompt counts as `queued` when the user typed it (harness messages are
+    counted apart as `harness_messages`) and it waited at least
+    QUEUE_MIN_WAIT_MS before it left the queue: `executed` (dequeued or
+    flushed by popAll, starting a turn), `absorbed` (joined the running turn)
+    or `removed` (any other reason). Waits cover executed and absorbed
+    prompts: long waits mean the user is racing ahead of the agent.
+
+    `remove` takes the pending prompt with the same content, else the oldest;
+    `dequeue` takes the oldest. `content` is NOT stored (raw prompt text =
+    PII). None when the transcript has no queue operations.
     """
     operations: dict[str, int] = {}
-    pending: list[datetime] = []   # timestamps of still-queued enqueues
-    waits: list[float] = []        # execution waits in ms (dequeue / popAll)
-    removed = 0
+    pending: list[dict] = []   # still-queued enqueues: {"ts", "content", "harness"}
+    harness = 0
+    counts = {"executed": 0, "absorbed": 0, "removed": 0}
+    waits: list[float] = []
+
+    def settle(item: dict, ts, outcome: str) -> None:
+        if item["harness"] or not (ts and item["ts"] and ts >= item["ts"]):
+            return
+        wait = (ts - item["ts"]).total_seconds() * 1000
+        if wait < QUEUE_MIN_WAIT_MS:
+            return
+        counts[outcome] += 1
+        if outcome != "removed":
+            waits.append(wait)
+
     for entry in _entries(transcript_path):
         if entry.get("type") != "queue-operation":
             continue
         op = entry.get("operation") or "unknown"
         operations[op] = operations.get(op, 0) + 1
         ts = parse_ts(entry.get("timestamp", ""))
+        content = entry.get("content")
+        if not isinstance(content, str):
+            content = "" if content is None else json.dumps(content)
         if op == "enqueue":
-            if ts:
-                pending.append(ts)
+            is_harness = content.lstrip().startswith(_HARNESS_QUEUE_PREFIXES)
+            harness += is_harness
+            pending.append({"ts": ts, "content": content, "harness": is_harness})
         elif op == "dequeue":
             if pending:
-                e = pending.pop(0)
-                if ts and e and ts >= e:
-                    waits.append((ts - e).total_seconds() * 1000)
+                settle(pending.pop(0), ts, "executed")
         elif op == "popAll":
-            for e in pending:
-                if ts and ts >= e:
-                    waits.append((ts - e).total_seconds() * 1000)
+            for item in pending:
+                settle(item, ts, "executed")
             pending = []
         elif op == "remove":
-            removed += 1
             if pending:
-                pending.pop(0)
+                i = next((i for i, p in enumerate(pending) if p["content"] == content), 0)
+                outcome = "absorbed" if entry.get("reason") == "absorbed_mid_turn" else "removed"
+                settle(pending.pop(i), ts, outcome)
     if not operations:
         return None
     return {
         "operations": operations,
-        "queued": operations.get("enqueue", 0),
-        "executed": len(waits),
-        "removed": removed,
+        "queued": sum(counts.values()),
+        **counts,
+        "harness_messages": harness,
         "total_wait_ms": round(sum(waits)),
         "max_wait_ms": round(max(waits)) if waits else 0,
     }
@@ -3520,16 +3551,6 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
     # Last turn that carried a per-turn `effort` (transcript field, CC 2.1.220+).
     effort = next((t["effort"] for t in reversed(own_turns) if t.get("effort")), "")
 
-    model_families = set()
-    for t in own_turns:
-        m = (t.get("model") or "").lower()
-        if "haiku" in m:
-            model_families.add("haiku")
-        elif "opus" in m:
-            model_families.add("opus")
-        elif m and m != "<synthetic>":
-            model_families.add("sonnet")
-
     # A turn with billable tokens but no model would otherwise be silently
     # mispriced (was: defaulted to Opus). Surface it as a filterable tag.
     has_missing_model = any(
@@ -3574,31 +3595,27 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
     refusal_tags = [
         f"refusal:{c}" for c in sorted((stop_reasons or {}).get("refusal_categories", {}))
     ]
-    # Exact model IDs alongside the family tags, so Opus 5 and Opus 5.5
-    # sessions can be filtered apart.
+    # Exact model IDs, so Opus 5 and Opus 5.5 sessions can be filtered apart.
     model_tags = sorted({f"model:{t['model']}" for t in own_turns if t.get("model")})
 
     # Session state as of this fire, repeated on every turn trace so each one
-    # filters on its own. Tags reflect the session so far.
+    # filters on its own. Tags reflect the session so far. A tag earns its
+    # place by splitting sessions: values unique to one session (titles,
+    # counts, names) and values every session shares stay in metadata.
     session_tags = [t for t in [
-        "claude-code",
-        repo_name or None,
-        *sorted(model_families),
+        f"repo:{repo_name}" if repo_name else None,
         *model_tags,
-        session_meta.get("entrypoint") or None,
+        f"entrypoint:{session_meta['entrypoint']}" if session_meta.get("entrypoint") else None,
         "fast" if has_fast else None,
         "has-errors" if has_errors else None,
         "has-api-error-messages" if api_error_messages else None,
         "has-interrupts" if interrupts else None,
         "model-fallback" if (turn_signals or {}).get("model_fallback_turns") else None,
         "has-truncated-output" if (turn_signals or {}).get("truncated_turns") else None,
-        "has-queued-prompts" if queue_operations else None,
-        "has-background-tasks" if background_tasks else None,
+        "has-queued-prompts" if (queue_operations or {}).get("queued") else None,
         "model-missing" if has_missing_model else None,
-        f"permission:{permission_mode}" if permission_mode else None,
-        f"agent-name:{agent_name}" if agent_name else None,
         f"session-kind:{session_kind}" if session_kind else None,
-        f"worktree:{worktree_state['name']}" if worktree_state and worktree_state.get("name") else None,
+        "worktree" if worktree_state else None,
         f"effort:{effort}" if effort else None,
         "compacted" if compaction else None,
         "remote-control" if remote_control else None,
@@ -3821,7 +3838,7 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
             "partial_messages": partial_messages,
         }
         # In place: every turn trace in this batch holds this same list.
-        session_tags += ["has-subagents", f"subagents:{len(summaries)}"]
+        session_tags.append("has-subagents")
         if any(s.get("depth", 1) >= 2 for s in summaries):
             session_tags.append("nested-subagents")
         # Their output tokens are a lower bound (see count_partial_messages).
