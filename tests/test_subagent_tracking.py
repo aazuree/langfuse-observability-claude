@@ -757,6 +757,9 @@ def test_build_meta_index_maps_tool_use_id(tmp_path):
         "path": str(sa_dir / "agent-abc123.jsonl"),
         "agent_type": "Explore",
         "description": "probe",
+        "tool_use_id": "toolu_X1",
+        "mode": "",
+        "finished": False,
     }}
 
 
