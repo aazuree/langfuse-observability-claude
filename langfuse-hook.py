@@ -274,10 +274,14 @@ def build_subagent_meta_index(search_dirs: list) -> dict:
     Each agent-<id>.meta.json carries {"agentType", "description", "toolUseId"}
     where toolUseId is the Agent tool_use id in the *spawner's* transcript
     (main session at depth 1, the parent agent's transcript at depth 2+).
-    The subagents/ dir is flat at every nesting depth.
+    The subagents/ dir is flat at every nesting depth. Newer Claude Code also
+    writes `requestShape` (`foreground` / `background`) and, once the agent is
+    done, `finished: true`.
 
-    Returns {toolUseId: {"agent_id", "path", "agent_type", "description"}}.
-    Earlier search_dirs win on duplicates. aside_question agents are skipped.
+    Returns {toolUseId: {"agent_id", "path", "agent_type", "description",
+    "tool_use_id", "mode", "finished"}}; `mode` is "" when `requestShape` is
+    absent. Earlier search_dirs win on duplicates. aside_question agents are
+    skipped.
     """
     index = {}
     for sdir in search_dirs:
@@ -305,8 +309,23 @@ def build_subagent_meta_index(search_dirs: list) -> dict:
                     "path": jsonl_path,
                     "agent_type": meta.get("agentType", ""),
                     "description": meta.get("description", ""),
+                    "tool_use_id": tool_use_id,
+                    "mode": meta.get("requestShape") or "",
+                    "finished": meta.get("finished") is True,
                 }
     return index
+
+
+def _spawned_agent_metadata(meta: dict) -> dict:
+    """Agent tool span metadata naming the agent the call spawned."""
+    out = {
+        "spawned_agent_id": meta["agent_id"],
+        "spawned_agent_type": meta["agent_type"],
+        "spawned_agent_description": redact_secrets(meta["description"]),
+    }
+    if meta.get("mode"):
+        out["spawned_agent_mode"] = meta["mode"]
+    return out
 
 
 def _file_size(path: str) -> int | None:
@@ -431,6 +450,8 @@ def ingest_subagent(
     visited: set = None,
     sa_state: dict = None,
     final: bool = False,
+    meta: dict = None,
+    parent_agent_id: str = "",
 ) -> tuple:
     """Parse a subagent transcript and build events for its finished turns.
 
@@ -447,12 +468,17 @@ def ingest_subagent(
     meta_index, up to MAX_SUBAGENT_DEPTH levels; `visited` guards cycles.
     Nested children are recorded in sa_state with depth/parent lineage.
 
+    `meta` is this agent's own meta_index entry (type, spawning tool_use id,
+    mode, finished) and `parent_agent_id` the agent that spawned it ("" for
+    the main thread); both label its generations.
+
     Returns: (events, cost_summary, new_offset, new_turn_count, status)
     """
     if visited is None:
         visited = set()
     visited.add(agent_id)
     meta_index = meta_index or {}
+    meta = meta or {}
 
     empty_cost = {"agent_id": agent_id, "total_cost": 0, "total_tokens": 0,
                   "turns": 0, "status": "partial",
@@ -474,7 +500,7 @@ def ingest_subagent(
     # Complete when the last assistant entry ended its turn. stop_reason lives
     # inside `message`; reading it off the entry itself never matched, so
     # every subagent used to report "partial".
-    status = "complete" if handed_back else "partial"
+    status = "complete" if handed_back or meta.get("finished") else "partial"
     for entry in reversed(entries):
         if entry.get("type") == "assistant" and not entry.get("isApiErrorMessage"):
             if (entry.get("message") or {}).get("stop_reason") == "end_turn":
@@ -482,6 +508,17 @@ def ingest_subagent(
             break
 
     user_id = _user_id()
+    agent_type = meta.get("agent_type", "")
+    label = f"Subagent ({agent_type})" if agent_type else "Subagent"
+    identity = {"subagent_id": agent_id, "subagent_depth": depth}
+    if agent_type:
+        identity["subagent_type"] = agent_type
+    if parent_agent_id:
+        identity["parent_agent_id"] = parent_agent_id
+    if meta.get("tool_use_id"):
+        identity["spawn_tool_use_id"] = meta["tool_use_id"]
+    if meta.get("mode"):
+        identity["subagent_mode"] = meta["mode"]
     events = []
     total_cost = 0.0
     total_tokens = 0
@@ -508,7 +545,7 @@ def ingest_subagent(
             "parentObservationId": parent_span_id,
             "sessionId": session_id,
             "userId": user_id,
-            "name": f"Subagent Turn {turn_idx + 1}: {redact_secrets(truncate(turn['display_prompt'], 80))}",
+            "name": f"{label} Turn {turn_idx + 1}: {redact_secrets(truncate(turn['display_prompt'], 80))}",
             "model": model,
             "input": redact_secrets(truncate(turn["user_input"], MAX_TEXT)) or None,
             "output": redact_secrets(truncate(turn["assistant_output"], MAX_TEXT)) or None,
@@ -517,9 +554,7 @@ def ingest_subagent(
             "usageDetails": _usage_details(turn),
             "costDetails": cost_details if cost_details else None,
             "metadata": {
-                "subagent_id": agent_id,
-                "agent_id": agent_id,
-                "subagent_depth": depth,
+                **identity,
                 "tools_used": [tc["name"] for tc in turn["tool_calls"]],
                 "tool_count": len(turn["tool_calls"]),
                 "speed": turn.get("speed", ""),
@@ -543,6 +578,10 @@ def ingest_subagent(
         for tc_idx, tc in enumerate(turn["tool_calls"]):
             span_id = f"span-subagent-{agent_id}-{turn_idx}-{tc_idx}"
             span_start = tc.get("start_time", start_time)
+            child = meta_index.get(tc["id"]) if tc["name"] == "Agent" else None
+            span_metadata = {"tool_use_id": tc["id"], "subagent_id": agent_id}
+            if child:
+                span_metadata.update(_spawned_agent_metadata(child))
             events.append({"type": "span-create", "body": {
                 "id": span_id,
                 "traceId": trace_id,
@@ -554,10 +593,9 @@ def ingest_subagent(
                 "endTime": tc.get("end_time", span_start),
                 "input": _tool_input(tc["input"]),
                 "output": _tool_output(tc["output"]) or None,
-                "metadata": {"tool_use_id": tc["id"], "subagent_id": agent_id},
+                "metadata": span_metadata,
             }})
 
-            child = meta_index.get(tc["id"]) if tc["name"] == "Agent" else None
             if child and depth < MAX_SUBAGENT_DEPTH and child["agent_id"] not in visited:
                 child_id = child["agent_id"]
                 child_prev = (sa_state or {}).get(child_id, {})
@@ -575,6 +613,8 @@ def ingest_subagent(
                     visited=visited,
                     sa_state=sa_state,
                     final=final,
+                    meta=child,
+                    parent_agent_id=agent_id,
                 )
                 events.extend(c_events)
                 # Nested-child cost stays out of this agent's own cost_summary;
@@ -587,6 +627,7 @@ def ingest_subagent(
                         path=child["path"], size=c_size,
                         parent_span_id=span_id, trace_id=trace_id,
                         depth=depth + 1, parent_agent_id=agent_id,
+                        tool_use_id=child["tool_use_id"], mode=child["mode"],
                     )
 
     cost_summary = {
@@ -3675,6 +3716,12 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
         agent_calls = []
         for tc_idx, tc in enumerate(turn["tool_calls"]):
             span_id = f"span-{turn_id}-{tc_idx}"
+            # Each subagent's .meta.json names the Agent tool_use that spawned it.
+            spawned = sa_meta_index.get(tc["id"]) if tc["name"] == "Agent" else None
+            span_metadata = {"tool_use_id": tc["id"]}
+            if spawned:
+                span_metadata.update(_spawned_agent_metadata(spawned))
+                agent_calls.append((tc_idx, spawned))
             batch.append({"type": "span-create", "body": {
                 "id": span_id,
                 "traceId": trace_id,
@@ -3684,11 +3731,8 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
                 "endTime": tc.get("end_time", tc.get("start_time", start_time)),
                 "input": _tool_input(tc["input"]),
                 "output": _tool_output(tc["output"]) or None,
-                "metadata": {"tool_use_id": tc["id"]},
+                "metadata": span_metadata,
             }})
-            # Each subagent's .meta.json names the Agent tool_use that spawned it.
-            if tc["name"] == "Agent" and tc["id"] in sa_meta_index:
-                agent_calls.append((tc_idx, sa_meta_index[tc["id"]]))
 
         for sa_tc_idx, meta in agent_calls:
             sa_id, sa_path = meta["agent_id"], meta["path"]
@@ -3712,6 +3756,7 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
                 visited=sa_visited,
                 sa_state=sa_state,
                 final=final,
+                meta=meta,
             )
             batch.extend(sa_events)
             sa_state[sa_id] = _subagent_record(
@@ -3719,22 +3764,20 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
                 description=sa_desc, subagent_type=sa_type,
                 path=sa_path, size=sa_size, parent_span_id=sa_parent_span,
                 trace_id=trace_id, depth=1,
+                tool_use_id=meta["tool_use_id"], mode=meta["mode"],
             )
-            for evt in batch:
-                if evt["type"] == "span-create" and evt["body"]["id"] == sa_parent_span:
-                    evt["body"]["metadata"].update({
-                        "subagent_id": sa_id,
-                        "subagent_type": sa_type,
-                        "subagent_description": sa_desc,
-                    })
-                    break
 
     # Agents whose Agent call is in a turn sent by an earlier fire. A background
     # agent keeps writing after the parent turn that launched it ended; its
     # recorded trace and parent span let its new turns join that trace.
+    sa_meta_by_agent = {m["agent_id"]: m for m in sa_meta_index.values()}
     for sa_id, prev in list(sa_state.items()):
         if sa_id in sa_visited or not isinstance(prev, dict):
             continue
+        sa_meta = sa_meta_by_agent.get(sa_id)
+        # Agents recorded before the link was kept get it on any fire.
+        if sa_meta and "tool_use_id" not in prev:
+            prev.update(tool_use_id=sa_meta["tool_use_id"], mode=sa_meta["mode"])
         sa_path, sa_parent_span, sa_trace = prev.get("path"), prev.get("parent_span_id"), prev.get("trace_id")
         if not (sa_path and sa_parent_span and sa_trace):
             continue
@@ -3754,6 +3797,8 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
             visited=sa_visited,
             sa_state=sa_state,
             final=final,
+            meta=sa_meta,
+            parent_agent_id=prev.get("parent_agent_id", ""),
         )
         batch.extend(sa_events)
         sa_state[sa_id] = _subagent_record(

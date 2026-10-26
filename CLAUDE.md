@@ -144,6 +144,7 @@ tests/
   test_hook_scores.py            # Session score classifier tests
   test_subagent_tracking.py      # Subagent cost tracking tests
   test_subagent_resume.py        # Background subagents resumed after their parent turn was sent
+  test_subagent_identity.py      # subagent_id = owner, spawned_agent_* on Agent spans, at every depth
   test_session_rollups.py        # Session rollups cover the whole session; each turn sent once; unfinished turns held
   test_turn_merging.py           # Consecutive user entries before a reply form one turn
   test_session_lock.py           # Per-session lock for overlapping (async) fires
@@ -645,7 +646,7 @@ also repeats the session state listed above and the full `tags` list.
 - `continued_in` — id of the session this one was continued in, from `continued-in`. From `extract_continued_in()`.
 - `continued_from` — `{session_id, copied_turns, copied_messages}` when this session continues another: the predecessor and how much of this transcript is its copy (turns sent and billed by the predecessor, skipped here). From `resolve_continuation()`.
 - `relocations` — `{count, cwds (distinct, first-seen order, max 10), last_cwd}` from `relocated` entries. From `extract_relocations()`.
-- `subagent_costs` — see Subagent Cost Tracking. Each agent also carries `models`, `classifier_requests` and `partial_messages` (read from its whole transcript on every full read), and the rollup sums the last as `partial_messages`.
+- `subagent_costs` — see Subagent Cost Tracking. Each agent also carries `models`, `classifier_requests` and `partial_messages` (read from its whole transcript on every full read), and the rollup sums the last as `partial_messages`. `tool_use_id` (its spawning Agent call) and `mode` link it to its Agent span.
 - `classifier_requests` — distinct auto-mode classifier calls (`serverClassifierRequest`) across the main and subagent transcripts. Their cost is only in cost-state. From `count_classifier_requests()`.
 
 Extracted from the first `type: "user"` entry in the JSONL transcript via `extract_session_metadata()`.
@@ -775,6 +776,26 @@ Trace (one parent turn; session.id groups the turns)
 │                   └── Span (Bash tool)
 ```
 Session score `session_cost_usd` → metadata `subagent_costs` summary
+
+**Identity metadata** (one meaning per key, at every depth; `tests/test_subagent_identity.py`):
+- `subagent_id` — the agent that **owns** the observation: on its generations and its
+  tool spans. Absent on the main thread's observations.
+- Agent tool spans name the agent they **spawned**: `spawned_agent_id`,
+  `spawned_agent_type`, `spawned_agent_description`, `spawned_agent_mode`. Until
+  2026-10-26 the main thread's Agent span carried the child as `subagent_id`
+  (+ `subagent_type`, `subagent_description`), while a nested Agent span carried its
+  spawner there and no child at all.
+- Subagent generations: `subagent_id`, `subagent_type`, `subagent_depth`,
+  `parent_agent_id` (depth ≥ 2), `spawn_tool_use_id` (the Agent call; = the Agent
+  span's `tool_use_id`), `subagent_mode`. Named `Subagent (<type>) Turn N: <prompt>`.
+  The duplicate `agent_id` key was dropped.
+- `subagent_costs.agents[]` entries carry `tool_use_id` and `mode`, so the rollup
+  joins back to the Agent span.
+- From `.meta.json`: `requestShape` (`foreground` / `background`) → `mode`;
+  `finished: true` marks the agent `complete` (status only — it never releases an
+  unfinished last turn, which still waits for its stop_reason or handback). Both are
+  absent on older Claude Code (census 2026-10-26: `requestShape` 61/70,
+  `finished` 12/70).
 
 **Exclusions:** `aside_question` subagents are skipped (internal sidechain queries).
 
