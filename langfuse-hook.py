@@ -3600,10 +3600,15 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
 
     # Session state as of this fire, repeated on every turn trace so each one
     # filters on its own. Tags reflect the session so far. A tag earns its
-    # place by splitting sessions: values unique to one session (titles,
-    # counts, names) and values every session shares stay in metadata.
+    # place by splitting sessions: values unique to one session (counts,
+    # names) and values every session shares stay in metadata. The one
+    # exception is `title:`, which makes the tag filter a pick-list of
+    # sessions by title. Each fire tags only the turns it sends, so a turn
+    # sent before Claude Code wrote the ai-title keeps the fallback title.
+    title_tag = truncate(" ".join(session_title.split()), 60)
     session_tags = [t for t in [
         f"repo:{repo_name}" if repo_name else None,
+        f"title:{title_tag}",
         *model_tags,
         f"entrypoint:{session_meta['entrypoint']}" if session_meta.get("entrypoint") else None,
         "fast" if has_fast else None,

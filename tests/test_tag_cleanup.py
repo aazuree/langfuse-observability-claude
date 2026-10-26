@@ -9,6 +9,9 @@ fires only, so a reprocess lost it). `worktree:<name>` became `worktree`;
 the bare repo and entrypoint tags got `repo:` / `entrypoint:` prefixes;
 `session-kind:fg` is no longer given to SDK runs. `has-queued-prompts` counts
 only typed prompts that waited, not harness messages or instant delivery.
+
+Added back the same day: `title:<session_title>`, so the tag filter lists
+sessions by title (one value per session, kept on purpose).
 """
 import json
 
@@ -66,6 +69,38 @@ def test_repo_and_entrypoint_are_prefixed(tmp_path, monkeypatch):
     assert "entrypoint:cli" in tags
     assert "myrepo" not in tags
     assert "cli" not in tags
+
+
+def _title_tags(tags):
+    return [t for t in tags if t.startswith("title:")]
+
+
+def test_title_tag_prefers_ai_title(tmp_path, monkeypatch):
+    tags, meta = _run(tmp_path, monkeypatch, [
+        {"type": "agent-name", "agentName": "agent-slug"},
+        {"type": "ai-title", "aiTitle": "Fix Langfuse tags"},
+    ])
+    assert _title_tags(tags) == ["title:Fix Langfuse tags"]
+    assert meta["session_title"] == "Fix Langfuse tags"
+
+
+def test_title_tag_falls_back_to_agent_name_then_prompt(tmp_path, monkeypatch):
+    tags, _ = _run(tmp_path, monkeypatch, [
+        {"type": "agent-name", "agentName": "agent-slug"},
+    ], sid="t-agent")
+    assert _title_tags(tags) == ["title:agent-slug"]
+    tags, _ = _run(tmp_path, monkeypatch, sid="t-prompt")
+    assert _title_tags(tags) == ["title:do a thing"]
+
+
+def test_title_tag_is_one_line_and_capped(tmp_path, monkeypatch):
+    tags, _ = _run(tmp_path, monkeypatch, [
+        {"type": "ai-title", "aiTitle": "Two\n  lines " + "x" * 80},
+    ])
+    (tag,) = _title_tags(tags)
+    assert "\n" not in tag
+    assert tag.startswith("title:Two lines xxx")
+    assert len(tag) == len("title:") + 60 + len("...")
 
 
 def test_permission_bypass_alert_stays(tmp_path, monkeypatch):

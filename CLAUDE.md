@@ -142,7 +142,7 @@ tests/
   test_file_history_delta.py     # file-history-delta rollup (edits, distinct files, versions)
   test_log_isolation.py          # LOG_FILE env override + production-log isolation
   test_hook_scores.py            # Session score classifier tests
-  test_tag_cleanup.py            # Tags carry signal only; queued prompts = typed prompts that waited
+  test_tag_cleanup.py            # Tags carry signal only (+ title: pick-list); queued prompts = typed prompts that waited
   test_subagent_tracking.py      # Subagent cost tracking tests
   test_subagent_resume.py        # Background subagents resumed after their parent turn was sent
   test_subagent_identity.py      # subagent_id = owner, spawned_agent_* on Agent spans, at every depth
@@ -546,8 +546,9 @@ Session-wide rollups are not on the traces: they ride on the session-level
 "Session Rollups" key below and which every fire overwrites.
 
 **Tags** (filterable in Langfuse UI). A tag earns its place by splitting sessions:
-values every session shares, and values unique to one session (titles, names,
-counts), stay in metadata. Removed 2026-10-26 after a census of 97 local sessions
+values every session shares, and values unique to one session (names, counts),
+stay in metadata. The one exception is `title:` (below), kept so the tag filter
+works as a pick-list of sessions by title. Removed 2026-10-26 after a census of 97 local sessions
 (131 distinct tags → 67): `claude-code` (every trace), `opus`/`sonnet`/`haiku`
 (`model:<id>` says it), `permission:<mode>` (only ever `auto`; `permission_mode`
 metadata), `agent-name:<title>` (48 values in 49 sessions; `agent_name` metadata),
@@ -556,6 +557,7 @@ metadata), `agent-name:<title>` (48 values in 49 sessions; `agent_name` metadata
 metadata). The bare repo and entrypoint tags became `repo:` / `entrypoint:`. Traces
 sent before keep their old tags until `--delete-traces` + `--reprocess`.
 - `repo:<name>` — derived from `cwd` (e.g., `repo:langfuse-observability`)
+- `title:<session_title>` — the session's title, so Aazuree can pick a session from the tag filter by name instead of by session ID. Same source order as `session_title` metadata: custom title → `ai_title` → `agent_name` → first real prompt (redacted) → `repo/branch`. Whitespace collapsed to single spaces, cut to 60 chars + `...`. One value per session by design (added back 2026-10-26, the day `agent-name:` was dropped). Each fire tags only the turns it sends, so a turn sent before Claude Code wrote the `ai-title` keeps the fallback title (census of 108 local sessions: `ai_title` is present by user-turn 1 in 64 of 70, by turn 2 in the other 6)
 - `model:<id>` — one per distinct exact model ID in the batch (e.g. `model:claude-opus-5-5`), so Opus 5 and Opus 5.5 sessions can be filtered apart
 - `refusal:<category>` — one per distinct `stop_details.category` on refused turns (`cyber`, `bio`, `reasoning_extraction`, ...; null category → `uncategorized`). Opus 5.5 added `bio` and `reasoning_extraction` classifiers
 - `entrypoint:<name>` — `cli`, `sdk-cli` or other launch method
