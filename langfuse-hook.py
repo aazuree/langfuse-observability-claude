@@ -2251,6 +2251,22 @@ def _has_billable_tokens(usage: dict) -> bool:
 # is a date snapshot, not a version, so claude-opus-5-20260401 is Opus 5.
 _OPUS_ID_RE = re.compile(r"opus-(\d+)(?:-(\d{1,2}))?(?![0-9])")
 
+# A dot between two digits is a version separator: LLM gateways spell
+# claude-opus-4-8 as claude-opus-4.8 (Claude Code reads both since 2.1.314).
+_DOTTED_VERSION_RE = re.compile(r"(?<=\d)\.(?=\d)")
+
+
+def _normalise_model_id(model: str) -> str:
+    """Lowercase a model ID and write a dotted version with dashes
+    (claude-opus-5.5 -> claude-opus-5-5). Provider prefixes such as
+    "us.anthropic." keep their dots: they do not sit between digits.
+
+    Without this, claude-opus-5.5 parsed as Opus 5 (billed $5/$25 instead of
+    $4/$20), claude-sonnet-5.5 as Sonnet 5 (cache reads 2x) and
+    claude-opus-4.8 / claude-haiku-5.5 as unrecognised ($0).
+    """
+    return _DOTTED_VERSION_RE.sub("-", model.lower())
+
 
 def _opus_family(model: str) -> str:
     """Pricing family key for an Opus model ID ("opus-5-5", "opus-5",
@@ -2260,7 +2276,7 @@ def _opus_family(model: str) -> str:
     Opus 4.0 ID (claude-opus-4-20250514) return "opus-<major>" and are handled
     by the legacy branch of calculate_turn_cost().
     """
-    match = _OPUS_ID_RE.search(model.lower())
+    match = _OPUS_ID_RE.search(_normalise_model_id(model))
     if not match:
         return ""
     major, minor = match.groups()
@@ -2276,7 +2292,7 @@ def _model_family(model: str, name: str) -> str:
     version-before-name (claude-3-5-sonnet-20241022). As in _opus_family, the
     minor is 1-2 digits and an 8-digit group is a date snapshot.
     """
-    m = model.lower()
+    m = _normalise_model_id(model)
     old = re.search(rf"(\d+)-(?:(\d)-)?{name}(?![a-z])", m)
     if old:
         major, minor = old.groups()
@@ -2387,7 +2403,7 @@ def calculate_turn_cost(
 
     Returns: (turn_cost, input_cost, output_cost, cost_details)
     """
-    m = model.lower()
+    m = _normalise_model_id(model)
     if not m:
         # No model on the turn. Do NOT fabricate a default — report $0 so the
         # dashboard shows an obvious gap. Warn only when tokens are actually

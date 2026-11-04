@@ -154,6 +154,7 @@ tests/
   test_split_message_usage.py    # A message whose entries span two turns is counted once
   test_continued_sessions.py     # A continued session's copy of its predecessor is sent and billed once
   test_mixed_model_turns.py      # A turn answered by several models prices each model's share at its rates
+  test_dotted_model_ids.py       # claude-opus-4.8 (gateway spelling) bills exactly like claude-opus-4-8
   test_robustness.py             # Atomic state writes, logged crashes
   test_delete_traces.py          # --delete-traces (every per-turn trace, the old session trace, session scores)
   test_setup_tools.py            # tools/render_env.py and tools/configure_hooks.py
@@ -236,6 +237,10 @@ Opus IDs resolve through `_opus_family()`, which parses `opus-<major>[-<minor>]`
 8-digit group as a date snapshot. It replaced substring matching: `"opus-5" in m` also
 matched `claude-opus-5-5` and billed it at $5/$25. An unknown minor (e.g. `claude-opus-5-6`)
 now hits the `[WARN]` + `$0` path instead of inheriting its predecessor's rate.
+Both parsers first run `_normalise_model_id()`, which writes a dot between two digits as a
+dash: LLM gateways send `claude-opus-4.8`. Until 2026-11-04 `claude-opus-5.5` parsed as Opus 5
+($5/$25), `claude-sonnet-5.5` as Sonnet 5 (cache reads 2x) and `claude-opus-4.8` /
+`claude-haiku-5.5` as unrecognised ($0). Provider prefixes (`us.anthropic.`) keep their dots.
 Sonnet, Haiku, Fable and Mythos work the same way: `_model_family()` parses both the
 `claude-sonnet-4-5` and the Claude-3-era `claude-3-5-sonnet` schemes, and the result is
 looked up in `_SONNET_RATES` / `_HAIKU_RATES` / `_TOP_TIER_RATES`. `claude-sonnet-6` or
@@ -255,6 +260,7 @@ These stack multiplicatively on the base rates above (and apply uniformly across
 
 - **Fast mode (`speed="fast"`)**: per-model premium — **2x** on Opus 5.5 ($8/$40), Opus 5 and Opus 4.8 ($10/$50), **6x** on Opus 4.6 / 4.7 ($30/$150). Opus 4.5 and Sonnet/Haiku are ineligible and keep base rates. Multipliers live in `FAST_MODE_MULTIPLIERS` in `langfuse-hook.py`.
   - Fast mode is now offered on **Opus 5.5 / 5 / 4.8 only** — `speed="fast"` on Opus 4.7 returns an API error, and the Opus 4.6 `-fast` model ID was retired (requests silently fall back to standard). The 4.6/4.7 entries stay in the table on purpose: turns recorded while fast mode was live on those generations *were* billed at 6x, and reprocessing must keep billing them that way.
+  - **Opus 4.8 fast mode is deprecated** (2026-10-30) and **removed 2026-11-30** (CC 2.1.316 changelog): after that, `speed="fast"` on Opus 4.8 returns an error, with no fallback to standard. Keep its 2x entry for the same reason as 4.6/4.7.
 - **Fable 5 / Mythos 5**: ineligible for fast mode (no `/fast` variant) and data residency (`inference_geo` multiplier unverified) — always billed at base $10/$50. Update `calculate_turn_cost` if Anthropic publishes multipliers for them.
 - **Data residency (`inference_geo="us"`)**: 1.1x on Opus 4.6+ (including Opus 5 and 5.5) / Sonnet 4.6+ (including Sonnet 5 and 5.5) / Haiku 5.5 (both prompt-length tiers). Other models do not support the `inference_geo` parameter; multiplier is not applied.
 - **Fast + US-geo stack**: 2x × 1.1x = 2.2x (Opus 5.5 / 5 / 4.8); 6x × 1.1x = 6.6x (Opus 4.6/4.7).
@@ -473,6 +479,28 @@ checked against aws.amazon.com/bedrock/pricing.
 > tool schemas and auto-mode classifier context — large, and `api-request-blob` holds
 > message bodies).
 >
+> Changelog **v2.1.301–v2.1.318** reviewed (2026-11-04), plus a small census of the 3
+> transcripts (1 main, 2 subagents) a 2.1.318 cloud session wrote. What matters here:
+> - **2.1.307 fixed "subagent transcripts recording placeholder token usage and an empty
+>   stop reason for streamed responses"** — the cause of `subagent-usage-partial`. In the
+>   2.1.318 census every subagent message (6/6) ends on a final entry with full usage.
+>   Sessions from before 2.1.307 keep the tag; newer ones should not raise it.
+> - A `claude -p` run inside a session now gets its own session ID and transcript
+>   (`CLAUDE_CODE_DISABLE_NESTED_SESSION_ID=1` restores the old behaviour); before, it
+>   wrote into the enclosing session's transcript.
+> - 2.1.312: transcript `effort` now names the level in force, not one picked mid-task
+>   that the model had not applied yet.
+> - Gateways send dotted model IDs (`claude-opus-4.8`); see `_normalise_model_id()`.
+> - Opus 4.8 fast mode deprecated, removed 2026-11-30 (Pricing Multipliers).
+>
+> Seen in the 2.1.318 census, **not captured yet** (one session is too few to design from):
+> `attributionMcpServer` / `attributionMcpTool` on assistant entries (the MCP counterpart
+> of `attributionSkill`), `permissionDecision` on tool results (`{decision, source,
+> reasonType: classifier|rule, ruleSource}` — how a call was approved, complementing
+> `toolDenialKind`), `promptCacheRequested` (`5m`/`1h`), and on Agent tool results
+> `resolvedModel`, `toolStats`, `totalTokens`, `totalDurationMs`. New entry types
+> `tools-used` (cumulative tool-name list) and `atis-latch` carry no signal.
+>
 > Changelog v2.1.253–v2.1.286 reviewed for new transcript-JSONL fields or hook-input changes — nothing
 > found (changes were fixes to redaction, subagents, retries and model fallback). One behaviour
 > to note: since 2.1.286 a refused default model is retried once on the previous model of the
@@ -581,7 +609,7 @@ sent before keep their old tags until `--delete-traces` + `--reprocess`.
 - `worktree` — present when the session ran inside a Claude Code worktree (from the last `worktree-state` entry; its name is in `worktree` metadata)
 - `has-subagents` — present when the session dispatched subagents
 - `nested-subagents` — present when any ingested subagent was spawned by another subagent (depth ≥ 2; CC 2.1.172+)
-- `subagent-usage-partial` — present when a subagent message's transcript entries stop before its final one (CC 2.1.289+); its output tokens, and so the subagent cost, are a lower bound. See `subagent_costs.partial_messages`
+- `subagent-usage-partial` — present when a subagent message's transcript entries stop before its final one (CC 2.1.289+); its output tokens, and so the subagent cost, are a lower bound. See `subagent_costs.partial_messages`. Fixed upstream in CC 2.1.307
 - `cost-overcount` — the hook bills more tokens of some model than Claude Code's own `cost-state` counted (worth > `OVERCOUNT_TOLERANCE_USD`). Always a hook bug: the CLI also counts calls the transcript never records. See `cost_check`
 - `cost-unreconciled` — Claude Code counted more output tokens than the transcript records, beyond what its unrecorded side calls explain: a message the transcript (or the hook) lost. See `cost_check`
 - `duplicate-billing` — an API message is billed by more than one of the parent and its subagents. See `cost_check.duplicate_messages`
