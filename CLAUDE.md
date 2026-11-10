@@ -37,6 +37,10 @@ LANGFUSE_PUBLIC_KEY=$PK LANGFUSE_SECRET_KEY=$SK python3 langfuse-hook.py --repro
 export LANGFUSE_HOST=http://<remote-ip>:3100 LANGFUSE_PUBLIC_KEY=pk-lf-... LANGFUSE_SECRET_KEY=sk-lf-...
 python3 langfuse-hook.py --delete-traces   # then wait for the deletes
 python3 langfuse-hook.py --reprocess
+
+# Send what ended sessions still hold back (hourly timer; see "Catch-up" below).
+# Host and keys from the Stop hook command, as for a remote --reprocess.
+python3 langfuse-hook.py --catch-up
 ```
 
 > **Reprocessing against a remote stack:** `--delete-traces` and `--reprocess` take
@@ -149,6 +153,7 @@ tests/
   test_session_rollups.py        # Session rollups cover the whole session; each turn sent once; unfinished turns held
   test_turn_merging.py           # Consecutive user entries before a reply form one turn
   test_session_lock.py           # Per-session lock for overlapping (async) fires
+  test_lost_final_turns.py       # Stop waits for the final reply's flush; --catch-up
   test_cli_signals_2_1_300.py    # cost-state, async hook responses, rate limits, scheduled tasks, continued-in, relocated
   test_fork_context_copy.py      # A fork's copy of its spawning message is billed once, by the spawner
   test_split_message_usage.py    # A message whose entries span two turns is counted once
@@ -180,6 +185,9 @@ uv run pytest tests/ -k "subagent" -v  # Run tests matching pattern
 - The hook wraps its entry point: an unexpected exception is logged as `[ERROR] … crashed` with its traceback instead of vanishing to stderr. `--reprocess` logs and skips a failing session rather than aborting the run
 - Incremental processing: state files track the processed line offset and the number of turns sent per session. A fire with no new lines sends nothing (unless it is a `SessionEnd`)
 - **One trace per turn, sent once.** Each finished turn is its own trace (`id = uuid5(session:turn:<index>).hex`), grouped by `session.id`. Every turn but the last is finished; the last is finished when its reply ended for a terminal reason (`TERMINAL_STOP_REASONS`: `end_turn`, `stop_sequence`, `max_tokens`, `refusal`) — on a Stop fire the turn that just ended has one. Otherwise it is held for a later fire: an async fire can read the transcript after a queued prompt has already opened the next turn. `SessionEnd` and `--reprocess` of a transcript idle > `REPROCESS_IDLE_S` (1 h) send it anyway (`complete_turn_count`)
+- **The final turn needs two safety nets** (added 2026-11-10). Claude Code can run the async Stop hook *before* it has flushed the reply that ended the turn: three sessions' fires stopped reading 1–2 lines short of the final `end_turn` entries, held the turn, and lost it ($10.90). And the async `SessionEnd` fire does not complete for interactive sessions: none of 7 `/exit`s (CC 2.1.310–2.1.322) logged a line, and all 33 interactive sessions ended 2026-10-27..11-10 still had their exit-time `cost-state` unread (6 also an unsent reply). The ones that were read are scripted `sdk-cli` runs, which send `SessionEnd` synchronously (README Gotchas). So:
+  - a `Stop` fire first waits (`wait_for_final_reply`, up to `STOP_FLUSH_WAIT_S` = 5 s; the hook is async, so nobody waits on it) until the transcript tail's last main-thread reply has a terminal `stop_reason`. A timeout (a queued prompt already opened the next turn) is logged and the fire goes ahead as before. `StopFailure` does not wait.
+  - `--catch-up` sends, with `final=True`, every session that neither it nor its subagents has written for `REPROCESS_IDLE_S` and whose saved line offset is behind its line count (or that has no state). Nothing to do costs one stat and one line count per transcript (~0.5 s for 110), no request. An hourly systemd user timer runs it (see Catch-up timer below)
 - **Every session rollup covers the whole session.** Each fire reads the transcript once, builds every turn and recomputes all session rollups from all of them; they ride on the session-level `session_cost_usd` score, which upserts by id. A rollup built from only the new lines would overwrite the session's numbers with one fire's worth
 - `system/turn_duration` is written *after* the Stop hook runs, so a live fire usually misses it; it is captured when already present (re-ingest) and rolled up in `active_duration`
 - Deterministic IDs (UUID5 → hex trace/span IDs in `langfuse_otlp`) make a re-ingest after `--delete-traces` reproduce the same traces
@@ -362,6 +370,15 @@ python3 tools/cost_diff.py                                # origin/main vs this 
   [Service]
   Type=oneshot
   ExecStart=/usr/bin/python3 %h/<REPO_ROOT>/tools/audit_costs.py --langfuse --from-settings
+  ```
+- **Catch-up timer:** a second systemd user timer runs `--catch-up` hourly, with the host
+  and keys taken from the Stop hook command in `~/.claude/settings.json`
+  (`tools/catch_up.sh`). Units, also in `~/.config/systemd/user`:
+  ```ini
+  # langfuse-catch-up.service (+ a .timer with OnCalendar=hourly, Persistent=true)
+  [Service]
+  Type=oneshot
+  ExecStart=/bin/sh %h/<REPO_ROOT>/tools/catch_up.sh
   ```
 - The Langfuse check skips sessions written to in the last hour and needs the stored
   sessions to fit one metrics query (1,000 rows over the local transcripts' window).

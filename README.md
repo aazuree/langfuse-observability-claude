@@ -217,6 +217,7 @@ Each turn reports what it would cost at Anthropic API rates (model-aware, cache 
 - **Langfuse init vars**: `LANGFUSE_INIT_USER_EMAIL` must be valid email format, `LANGFUSE_INIT_PROJECT_NAME` must not have spaces. Validation errors are generic with no detail.
 - **First login**: If the browser shows an error, try an incognito window (stale CSRF tokens).
 - **Hook does not block Claude Code** when registered with `"async": true` (setup does this); if Langfuse is down, errors go to `~/.claude/langfuse-hook.log`.
+- **The final turn of an interactive session is sent by `--catch-up`.** The async `SessionEnd` fire does not complete after `/exit`, and a `Stop` fire can read the transcript before the final reply is flushed (the hook now waits up to 5 s for it). An hourly timer running `python3 langfuse-hook.py --catch-up` (`tools/catch_up.sh`) sends what ended sessions still hold back. See CLAUDE.md, "The final turn needs two safety nets".
 - **Headless runs (`claude --print`) can lose the export.** An async `Stop` hook is killed when the CLI exits; the async `SessionEnd` one survives the exit, but a systemd unit (`KillMode=control-group`, the default) or a cron job that tears down its process group kills it too. Nothing reaches Langfuse and nothing is logged. After a scripted run, send the session synchronously as a `SessionEnd`, using the hook command from `settings.json`:
 
   ```bash

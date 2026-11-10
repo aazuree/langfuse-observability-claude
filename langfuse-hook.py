@@ -4091,10 +4091,118 @@ def reprocess_all() -> None:
     print(f"\nDone. Reprocessed {total} session(s).")
 
 
+def _count_lines(path: Path) -> int:
+    """Line count as parse_transcript() counts it (a partial last line counts)."""
+    with open(path, "rb") as f:
+        return sum(1 for _ in f)
+
+
+def _last_write(transcript: Path) -> float:
+    """Newest mtime of a transcript and its subagent transcripts."""
+    newest = transcript.stat().st_mtime
+    for sub in (transcript.parent / transcript.stem / "subagents").glob("*.jsonl"):
+        newest = max(newest, sub.stat().st_mtime)
+    return newest
+
+
+def catch_up_sessions() -> list[Path]:
+    """Ended sessions with lines no fire has read, oldest first.
+
+    A session counts as ended once neither it nor its subagents has been
+    written for REPROCESS_IDLE_S. It needs a send when its saved line offset
+    is behind its line count: a Stop fire that read the transcript before
+    Claude Code flushed the final reply held that turn, and no later fire
+    came (SessionEnd runs async and is cut off when the CLI exits). Sessions
+    with no state at all were never sent.
+    """
+    now = time.time()
+    due = []
+    for transcript in (Path.home() / ".claude" / "projects").glob("*/*.jsonl"):
+        try:
+            last = _last_write(transcript)
+            if now - last <= REPROCESS_IDLE_S:
+                continue
+            offset, _turns = load_state(sanitize_id(transcript.stem))
+            if offset < _count_lines(transcript):
+                due.append((last, transcript))
+        except OSError:
+            continue
+    return [t for _, t in sorted(due)]
+
+
+def catch_up() -> int:
+    """Send what ended sessions still hold back (--catch-up). Returns the
+    number of sessions that failed, for the exit code.
+
+    Cheap when there is nothing to do: one stat and one line count per
+    transcript, and no request. Meant for a timer; see setup.sh.
+    """
+    if not LANGFUSE_PUBLIC_KEY or not LANGFUSE_SECRET_KEY:
+        log("LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY must be set")
+        return 1
+    failures = 0
+    for transcript in catch_up_sessions():
+        session_id = sanitize_id(transcript.stem)
+        log(f"Catch-up: session {session_id} has unread lines")
+        try:
+            process_session(session_id, str(transcript), extract_cwd(str(transcript)), final=True)
+        except Exception as e:
+            failures += 1
+            log(f"[ERROR] Catch-up failed for {session_id}: {type(e).__name__}: {e}\n"
+                + traceback.format_exc())
+    return failures
+
+
+# How long a Stop fire waits for Claude Code to flush the reply that ended the
+# turn. The hook runs async, so the wait delays nothing the user sees.
+STOP_FLUSH_WAIT_S = 5.0
+STOP_FLUSH_POLL_S = 0.1
+_FLUSH_TAIL_BYTES = 256 * 1024
+
+
+def _last_reply_stop_reason(transcript_path: str):
+    """stop_reason of the last main-thread assistant entry in the transcript
+    tail, or None when the tail holds none (a partial last line is skipped)."""
+    try:
+        with open(transcript_path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - _FLUSH_TAIL_BYTES))
+            lines = f.read().splitlines()
+    except OSError:
+        return None
+    for raw in reversed(lines):
+        try:
+            entry = json.loads(raw)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue
+        if (isinstance(entry, dict) and entry.get("type") == "assistant"
+                and not entry.get("isSidechain")):
+            return ((entry.get("message") or {}).get("stop_reason")) or ""
+    return None
+
+
+def wait_for_final_reply(transcript_path: str, timeout: float = None) -> bool:
+    """On a Stop fire, wait until the transcript's last reply has a terminal
+    stop_reason. Claude Code can run the Stop hook before it has written the
+    reply that ended the turn; read then, the turn looks unfinished, is held,
+    and is lost if no later fire comes. Returns False on timeout (e.g. a
+    queued prompt already opened the next turn), and the fire goes ahead.
+    """
+    deadline = time.monotonic() + (STOP_FLUSH_WAIT_S if timeout is None else timeout)
+    while True:
+        if _last_reply_stop_reason(transcript_path) in TERMINAL_STOP_REASONS:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(STOP_FLUSH_POLL_S)
+
+
 def main() -> None:
     if len(sys.argv) > 1 and sys.argv[1] == "--reprocess":
         reprocess_all()
         return
+    if len(sys.argv) > 1 and sys.argv[1] == "--catch-up":
+        sys.exit(1 if catch_up() else 0)
     if len(sys.argv) > 1 and sys.argv[1] == "--delete-traces":
         sys.exit(1 if delete_all_traces() else 0)
 
@@ -4143,6 +4251,10 @@ def run_stop_hook(hook_input: dict) -> None:
     if not transcript_path:
         log("No transcript_path provided")
         return
+
+    if hook_input.get("hook_event_name") == "Stop" and not wait_for_final_reply(transcript_path):
+        log(f"Stop fire for {session_id}: last reply not terminal after "
+            f"{STOP_FLUSH_WAIT_S:.0f}s; its turn is held for a later fire")
 
     process_session(session_id, transcript_path, cwd, last_assistant_message,
                     final=hook_input.get("hook_event_name") == "SessionEnd",
