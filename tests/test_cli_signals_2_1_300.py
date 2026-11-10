@@ -193,6 +193,35 @@ class TestExtractCostState:
             [_user("hi"), _cost_state(start_ms=_START_MS + 90 * 1000)], tmp_path))
         assert out["partial"] is False
 
+    def test_stale_when_a_reply_follows_the_last_entry(self, tmp_path):
+        # Resumed after an exit: the total does not count the resumed part
+        # until the next exit (2026-11-10: a false $3.31 cost-overcount).
+        out = hook.extract_cost_state(_write(
+            [_user("hi"), _asst("m1"), _cost_state(), _user("more"), _asst("m2")], tmp_path))
+        assert out["stale"] is True
+
+    def test_not_stale_when_only_bookkeeping_follows(self, tmp_path):
+        out = hook.extract_cost_state(_write(
+            [_user("hi"), _asst("m1"), _cost_state(), _user("more")], tmp_path))
+        assert "stale" not in out
+
+    def test_a_later_entry_clears_stale(self, tmp_path):
+        out = hook.extract_cost_state(_write(
+            [_user("hi"), _cost_state(), _asst("m1"), _cost_state(total=0.5)], tmp_path))
+        assert "stale" not in out
+
+    def test_sidechain_and_error_stubs_do_not_make_it_stale(self, tmp_path):
+        side = {**_asst("m2"), "isSidechain": True}
+        stub = {**_asst("m3"), "isApiErrorMessage": True}
+        out = hook.extract_cost_state(_write([_user("hi"), _cost_state(), side, stub], tmp_path))
+        assert "stale" not in out
+
+    def test_stale_cost_state_is_not_compared(self):
+        out = hook.build_cost_check([], {}, {"total_cost_usd": 1.0, "stale": True, "by_model": {}},
+                                    {"total_cost_usd": 1.0}, None, [], 0, frozenset())
+        assert out["status"] == "unchecked: session resumed after the last cost-state"
+        assert out["tags"] == []
+
 
 # ------------------------------------------------------------ async hooks
 

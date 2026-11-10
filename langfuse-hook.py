@@ -1926,18 +1926,28 @@ def extract_cost_state(transcript_path: str) -> dict | None:
     COST_STATE_PARTIAL_S after the first entry. It counts API calls the
     transcript never records — the Haiku requests behind WebFetch and
     WebSearch, auto-mode classifier calls — so it can exceed the hook's cost.
+    `stale` is set when a main-thread reply follows the last entry: the
+    session was resumed after that exit, and the total does not count the
+    resumed part until the next exit writes a new entry.
     None without an entry that carries a total.
     """
     last = None
     first_ts = ""
+    replies_after = False
     for entry in _entries(transcript_path):
         if not first_ts and entry.get("timestamp"):
             first_ts = entry["timestamp"]
         if entry.get("type") == "cost-state" and isinstance(entry.get("totalCostUSD"), (int, float)):
             last = entry
+            replies_after = False
+        elif (last is not None and entry.get("type") == "assistant"
+              and not entry.get("isSidechain") and not entry.get("isApiErrorMessage")):
+            replies_after = True
     if last is None:
         return None
     out = {"total_cost_usd": round(last["totalCostUSD"], 6)}
+    if replies_after:
+        out["stale"] = True
     for src, dst in _COST_STATE_KEYS:
         if isinstance(last.get(src), (int, float)):
             out[dst] = last[src]
@@ -3249,6 +3259,8 @@ def build_cost_check(own_turns: list[dict], agents: dict, cost_state: dict | Non
         out["status"] = "unchecked: no cost-state yet"
     elif cost_state.get("partial"):
         out["status"] = "unchecked: cost-state covers part of the session"
+    elif cost_state.get("stale"):
+        out["status"] = "unchecked: session resumed after the last cost-state"
     elif "predecessor_cost_usd" in (cli_cost_state or {}):
         out["status"] = "unchecked: continuation"
     elif any("tokens_by_model" not in a for a in agents.values()):
@@ -3906,7 +3918,7 @@ def _process_session_locked(session_id: str, transcript_path: str, cwd: str, las
         cli_cost_state["side_model_cost_usd"] = round(
             sum(c for m, c in model_cost.items() if m not in used_models), 6)
         # Only meaningful when cost-state covers the whole transcript.
-        if not cost_state.get("partial"):
+        if not cost_state.get("partial") and not cost_state.get("stale"):
             cli_cost_state["gap_usd"] = round(cli_cost - hook_cost, 6)
     cost_check = build_cost_check(own_turns, agents, cost_state, cli_cost_state, compaction,
                                   away_summaries, classifier_requests,
