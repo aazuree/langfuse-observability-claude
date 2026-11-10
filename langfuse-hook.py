@@ -2188,14 +2188,18 @@ def extract_cwd(transcript_path) -> str:
 # reprocessing must keep billing them that way (reprocess determinism).
 # Source: platform.claude.com/docs/en/about-claude/pricing#fast-mode-pricing (verified 2026-08-01)
 #
-# Keys are the family keys returned by _opus_family(), not substrings: a
-# substring lookup let "opus-5" claim claude-opus-5-5.
+# Fable 5.2 and Mythos 5.2 = 2x ($16/$80); earlier Fable/Mythos have none.
+#
+# Keys are the family keys returned by _opus_family() / _model_family(), not
+# substrings: a substring lookup let "opus-5" claim claude-opus-5-5.
 FAST_MODE_MULTIPLIERS = {
     "opus-4-6": 6.0,
     "opus-4-7": 6.0,
     "opus-4-8": 2.0,
     "opus-5": 2.0,
     "opus-5-5": 2.0,   # $8/$40
+    "fable-5-2": 2.0,  # $16/$80 (verified 2026-11-10)
+    "mythos-5-2": 2.0,
 }
 # Data residency: inference_geo="us" on Opus 4.6+/Sonnet 4.6+. 1.1x all categories.
 # Source: platform.claude.com/docs/en/about-claude/pricing#data-residency-pricing
@@ -2344,14 +2348,20 @@ _LONG_CONTEXT_RATES = {
 def _has_long_context_tier(model: str) -> bool:
     m = model.lower()
     return "haiku" in m and _model_family(m, "haiku") in _LONG_CONTEXT_RATES
-# Fable 5 / Mythos 5 (Project Glasswing sibling): identical pricing. The 5.1
-# releases cut cache reads to $0.25 (0.025x input). Neither has a /fast
-# variant, and their data-residency multiplier is unverified.
+# Fable / Mythos (Project Glasswing sibling): identical pricing per version.
+# 5.1 cut cache reads to $0.25 (0.025x input); 5.2 is $8/$40 with cache reads
+# $0.20 (0.025x). Every version accepts inference_geo (data-residency page,
+# Messages API row) and pays the Claude 4.6+ 1.1x. Only 5.2 has fast mode
+# (FAST_MODE_MULTIPLIERS, 2x).
+# Source: platform.claude.com/docs/en/about-claude/pricing and
+# /docs/en/manage-claude/data-residency (verified 2026-11-10)
 _TOP_TIER_RATES = {
-    "fable-5":    ((10.00, 50.00, 1.00, 12.50, 20.00), False),
-    "fable-5-1":  ((10.00, 50.00, 0.25, 12.50, 20.00), False),
-    "mythos-5":   ((10.00, 50.00, 1.00, 12.50, 20.00), False),
-    "mythos-5-1": ((10.00, 50.00, 0.25, 12.50, 20.00), False),
+    "fable-5":    ((10.00, 50.00, 1.00, 12.50, 20.00), True),
+    "fable-5-1":  ((10.00, 50.00, 0.25, 12.50, 20.00), True),
+    "fable-5-2":  (( 8.00, 40.00, 0.20, 10.00, 16.00), True),
+    "mythos-5":   ((10.00, 50.00, 1.00, 12.50, 20.00), True),
+    "mythos-5-1": ((10.00, 50.00, 0.25, 12.50, 20.00), True),
+    "mythos-5-2": (( 8.00, 40.00, 0.20, 10.00, 16.00), True),
 }
 
 
@@ -2418,8 +2428,8 @@ def calculate_turn_cost(
     # Every family is an explicit whitelist. A new model ID — including a new
     # version of a known family — reports $0 and logs a [WARN]; update this
     # function and the CLAUDE.md Cost Model table when that happens.
-    supports_inference_geo = False  # Only Opus 4.6+/Sonnet 4.6+ accept inference_geo
-    supports_fast_mode = False      # Only Opus 4.6+ (excluding 4.5) support /fast
+    supports_inference_geo = False  # Claude 4.6+ (Opus/Sonnet 4.6+, Haiku 5.5, Fable/Mythos) accept inference_geo
+    supports_fast_mode = False      # Opus 4.6+ (excluding 4.5) and Fable/Mythos 5.2 support /fast
     long_rates = None               # Prompt-length tier; only Haiku 5.5 has one
     if "haiku" in m:
         family = _model_family(m, "haiku")
@@ -2464,13 +2474,15 @@ def calculate_turn_cost(
         if rates is None:
             return _unrecognised_model(model)
         (p_in, p_out, p_cr, p_cc5, p_cc1), supports_inference_geo = rates
+        supports_fast_mode = family in FAST_MODE_MULTIPLIERS
     else:
         return _unrecognised_model(model)
 
-    # Fast mode premium (per-model: Opus 4.6/4.7 = 6x; 4.8, 5, 5.5 = 2x).
-    # Multipliers stack on top per spec. supports_fast_mode guarantees a key match.
+    # Fast mode premium (per-model: Opus 4.6/4.7 = 6x; Opus 4.8, 5, 5.5 and
+    # Fable/Mythos 5.2 = 2x). Multipliers stack on top per spec.
+    # supports_fast_mode guarantees a key match.
     if speed == "fast" and supports_fast_mode:
-        fast_mult = FAST_MODE_MULTIPLIERS.get(_opus_family(m), 1.0)
+        fast_mult = FAST_MODE_MULTIPLIERS.get(family, 1.0)
         p_in *= fast_mult
         p_out *= fast_mult
         p_cr *= fast_mult

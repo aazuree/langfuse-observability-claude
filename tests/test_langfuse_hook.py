@@ -1072,6 +1072,44 @@ class TestCalculateTurnCost:
         _c, _i, _o, details = hook.calculate_turn_cost(usage, "claude-fable-5")
         assert abs(details["cache_read_input_tokens"] - 1.00) < 0.001
 
+    def test_fable_5_2_pricing(self):
+        """Fable 5.2 / Mythos 5.2: $8/$40, cache read $0.20, writes $10/$16."""
+        usage = self._usage(inp=1_000_000, out=1_000_000, cache_read=1_000_000,
+                            cache_creation=2_000_000)
+        for model in ("claude-fable-5-2", "claude-mythos-5-2"):
+            _c, _i, _o, d = hook.calculate_turn_cost(
+                usage, model, cache_5m=1_000_000, cache_1h=1_000_000)
+            assert abs(d["input"] - 8.0) < 1e-6, model
+            assert abs(d["output"] - 40.0) < 1e-6, model
+            assert abs(d["cache_read_input_tokens"] - 0.20) < 1e-6, model
+            assert abs(d["cache_creation_input_tokens"] - 26.0) < 1e-6, model
+
+    def test_fable_5_2_fast_mode_is_2x(self):
+        usage = self._usage(inp=1_000_000, out=1_000_000)
+        for model in ("claude-fable-5-2", "claude-mythos-5-2"):
+            _c, inp_cost, out_cost, _d = hook.calculate_turn_cost(usage, model, speed="fast")
+            assert abs(inp_cost - 16.0) < 1e-6, model
+            assert abs(out_cost - 80.0) < 1e-6, model
+
+    def test_fable_fast_and_us_geo_stack(self):
+        usage = self._usage(inp=1_000_000)
+        _c, inp_cost, _o, _d = hook.calculate_turn_cost(
+            usage, "claude-fable-5-2", speed="fast", inference_geo="us")
+        assert abs(inp_cost - 8.0 * 2 * 1.1) < 1e-6
+
+    def test_every_fable_and_mythos_takes_us_geo(self):
+        """The data-residency page lists every Fable/Mythos version."""
+        usage = self._usage(inp=1_000_000)
+        for model, base in (("claude-fable-5", 10.0), ("claude-fable-5-1", 10.0),
+                            ("claude-fable-5-2", 8.0), ("claude-mythos-5", 10.0),
+                            ("claude-mythos-5-1", 10.0), ("claude-mythos-5-2", 8.0)):
+            _c, inp_cost, _o, _d = hook.calculate_turn_cost(usage, model, inference_geo="us")
+            assert abs(inp_cost - base * 1.1) < 1e-6, model
+
+    def test_fable_5_3_is_unrecognised(self):
+        cost, *_ = hook.calculate_turn_cost(self._usage(inp=1_000_000), "claude-fable-5-3")
+        assert cost == 0.0
+
     def test_opus_pricing_new(self):
         # Opus 4.5 / 4.6: $5 input, $25 output
         usage = self._usage(inp=1_000_000, out=1_000_000)

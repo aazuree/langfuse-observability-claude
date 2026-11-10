@@ -200,10 +200,12 @@ uv run pytest tests/ -k "subagent" -v  # Run tests matching pattern
 
 ## Cost Model
 
-Pricing is model-aware (per 1M tokens). Source: [platform.claude.com/docs/en/about-claude/pricing](https://platform.claude.com/docs/en/about-claude/pricing) (last verified 2026-10-09).
+Pricing is model-aware (per 1M tokens). Source: [platform.claude.com/docs/en/about-claude/pricing](https://platform.claude.com/docs/en/about-claude/pricing) (last verified 2026-11-10).
 
 | Model | Input | Output | Cache Read | Cache Write 5m | Cache Write 1h |
 |-------|-------|--------|------------|----------------|----------------|
+| Fable 5.2 / Mythos 5.2 | $8.00 | $40.00 | $0.20 | $10.00 | $16.00 |
+| Fable 5.1 / Mythos 5.1 | $10.00 | $50.00 | $0.25 | $12.50 | $20.00 |
 | Fable 5 / Mythos 5 | $10.00 | $50.00 | $1.00 | $12.50 | $20.00 |
 | Opus 5.5 | $4.00 | $20.00 | $0.20 | $5.00 | $8.00 |
 | Opus 5 / 4.8 / 4.7 / 4.6 / 4.5 | $5.00 | $25.00 | $0.50 | $6.25 | $10.00 |
@@ -221,7 +223,7 @@ Pricing is model-aware (per 1M tokens). Source: [platform.claude.com/docs/en/abo
 
 **Haiku 5.5** (`claude-haiku-5-5`, default Haiku since CC 2.1.293) is priced by **prompt length per request**: a request whose prompt (input + cache reads + cache writes) is over 100,000 tokens pays the higher rates for *all* its tokens, output included, even when part of the prompt is a cache hit. Because a turn sums several API requests, the tier cannot be decided from turn totals: `build_turns` puts each request over `LONG_CONTEXT_THRESHOLD` into a per-turn `usage_long` bucket (and counts them in `long_context_requests` metadata), and `calculate_turn_cost(long_context_usage=...)` bills that part at `_LONG_CONTEXT_RATES`. Models without an entry there ignore the bucket. Data residency 1.1x applies to both tiers; no fast mode.
 
-**Fable 5.1 / Mythos 5.1** cache reads are $0.25 (0.025x input), not the $1.00 of Fable 5 / Mythos 5. Other rates are identical.
+**Fable 5.1 / Mythos 5.1** cache reads are $0.25 (0.025x input), not the $1.00 of Fable 5 / Mythos 5. Other rates are identical. **Fable 5.2 / Mythos 5.2** (`claude-fable-5-2`, default Fable since CC 2.1.321) drop to $8/$40 with cache reads $0.20 (also 0.025x). Until 2026-11-10 the hook billed 5.2 at $0 + `[WARN]`; no local transcript had used it yet.
 
 **Opus 5** (`claude-opus-5`) bills at the same $5/$25 schedule as Opus 4.8 — a drop-in
 upgrade on price. It is a **separate rate-limit bucket** from the combined Opus 4.x pool,
@@ -261,9 +263,9 @@ These stack multiplicatively on the base rates above (and apply uniformly across
 - **Fast mode (`speed="fast"`)**: per-model premium — **2x** on Opus 5.5 ($8/$40), Opus 5 and Opus 4.8 ($10/$50), **6x** on Opus 4.6 / 4.7 ($30/$150). Opus 4.5 and Sonnet/Haiku are ineligible and keep base rates. Multipliers live in `FAST_MODE_MULTIPLIERS` in `langfuse-hook.py`.
   - Fast mode is now offered on **Opus 5.5 / 5 / 4.8 only** — `speed="fast"` on Opus 4.7 returns an API error, and the Opus 4.6 `-fast` model ID was retired (requests silently fall back to standard). The 4.6/4.7 entries stay in the table on purpose: turns recorded while fast mode was live on those generations *were* billed at 6x, and reprocessing must keep billing them that way.
   - **Opus 4.8 fast mode is deprecated** (2026-10-30) and **removed 2026-11-30** (CC 2.1.316 changelog): after that, `speed="fast"` on Opus 4.8 returns an error, with no fallback to standard. Keep its 2x entry for the same reason as 4.6/4.7.
-- **Fable 5 / Mythos 5**: ineligible for fast mode (no `/fast` variant) and data residency (`inference_geo` multiplier unverified) — always billed at base $10/$50. Update `calculate_turn_cost` if Anthropic publishes multipliers for them.
-- **Data residency (`inference_geo="us"`)**: 1.1x on Opus 4.6+ (including Opus 5 and 5.5) / Sonnet 4.6+ (including Sonnet 5 and 5.5) / Haiku 5.5 (both prompt-length tiers). Other models do not support the `inference_geo` parameter; multiplier is not applied.
-- **Fast + US-geo stack**: 2x × 1.1x = 2.2x (Opus 5.5 / 5 / 4.8); 6x × 1.1x = 6.6x (Opus 4.6/4.7).
+- **Fable / Mythos**: fast mode on **5.2 only**, 2x ($16/$80). Fable 5 / 5.1 and Mythos 5 / 5.1 have no `/fast` variant. Every Fable/Mythos version accepts `inference_geo` (data-residency page, Messages API row, verified 2026-11-10) and pays the 1.1x; the hook skipped it until then.
+- **Data residency (`inference_geo="us"`)**: 1.1x on Opus 4.6+ (including Opus 5 and 5.5) / Sonnet 4.6+ (including Sonnet 5 and 5.5) / Haiku 5.5 (both prompt-length tiers) / every Fable and Mythos. Other models do not support the `inference_geo` parameter; multiplier is not applied.
+- **Fast + US-geo stack**: 2x × 1.1x = 2.2x (Opus 5.5 / 5 / 4.8, Fable/Mythos 5.2); 6x × 1.1x = 6.6x (Opus 4.6/4.7).
 
 ### Server-side Tool Billing
 
@@ -478,6 +480,15 @@ checked against aws.amazon.com/bedrock/pricing.
 > `api-request` / `api-request-blob` / `api-request-shape` entries (raw request params,
 > tool schemas and auto-mode classifier context — large, and `api-request-blob` holds
 > message bodies).
+>
+> Changelog **v2.1.319–v2.1.322** reviewed (2026-11-10). What matters here:
+> - 2.1.321 added **Claude Fable 5.2** (`claude-fable-5-2`) as the default Fable model; see
+>   Cost Model. Saved Fable 5.1 picks move to `fable`, so new Fable sessions bill at 5.2 rates.
+> - 2.1.321: fast mode under rate limits now retries at standard speed on the same model
+>   first. Each reply's `speed` is still per message, so the per-turn price follows it.
+> - 2.1.319: PostToolUse hooks run (10 s budget) on tool calls that finish after a new
+>   message interrupts the turn. Not used by this repo.
+> - The changelog names no new transcript-JSONL fields or Stop/SessionEnd input changes (no census this pass).
 >
 > Changelog **v2.1.301–v2.1.318** reviewed (2026-11-04), plus a small census of the 3
 > transcripts (1 main, 2 subagents) a 2.1.318 cloud session wrote. What matters here:
