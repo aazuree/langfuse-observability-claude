@@ -68,8 +68,10 @@ MODELS = [
     "claude-haiku-4-5",
     "claude-fable-5",
     "claude-fable-5-1",
+    "claude-fable-5-2",
     "claude-mythos-5",
     "claude-mythos-5-1",
+    "claude-mythos-5-2",
 ]
 
 # Our axis name -> the feed's per-token field name.
